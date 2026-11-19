@@ -478,6 +478,7 @@ struct exynos5_usbdrd_phy {
 
 	struct typec_switch_dev *sw;
 	enum typec_orientation orientation;
+	bool usb3phy_isolation;
 };
 
 static inline
@@ -1567,8 +1568,25 @@ static void exynos850_usbdrd_utmi_init(struct exynos5_usbdrd_phy *phy_drd)
 	reg &= ~HSP_FSV_OUT_EN;
 	writel(reg, regs_base + EXYNOS850_DRD_HSP);
 
-	if (ss_ports)
+	/*
+	 * POR-low can reset the HS tuning block, so program it again after
+	 * the PHY clock is guaranteed.
+	 */
+	if (phy_drd->drv_data->phy_tunes)
+		exynos5_usbdrd_apply_phy_tunes(phy_drd,
+					       PTS_UTMI_POSTINIT);
+
+	if (ss_ports || phy_drd->usb3phy_isolation)
 		exynos5_usbdrd_usb_v3p1_pipe_override(phy_drd);
+
+	dev_info(phy_drd->dev,
+		 "PHY state: CLKRST=%08x UTMI=%08x HSP=%08x HSPPARACON=%08x TEST=%08x SSPPLL=%08x\n",
+		 readl(regs_base + EXYNOS850_DRD_CLKRST),
+		 readl(regs_base + EXYNOS850_DRD_UTMI),
+		 readl(regs_base + EXYNOS850_DRD_HSP),
+		 readl(regs_base + EXYNOS850_DRD_HSPPARACON),
+		 readl(regs_base + EXYNOS850_DRD_HSP_TEST),
+		 readl(regs_base + EXYNOS850_DRD_SSPPLLCTL));
 }
 
 static int exynos850_usbdrd_phy_init(struct phy *phy)
@@ -1580,6 +1598,9 @@ static int exynos850_usbdrd_phy_init(struct phy *phy)
 	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
 	if (ret)
 		return ret;
+
+	/* Power-on PHY before programming it, as the vendor driver does. */
+	inst->phy_cfg->phy_isol(inst, false);
 
 	/* UTMI or PIPE3 specific init */
 	scoped_guard(mutex, &phy_drd->phy_mutex)
@@ -2042,6 +2063,82 @@ static const struct exynos5_usbdrd_phy_tuning *exynos990_tunes[PTS_MAX] = {
 	[PTS_UTMI_POSTINIT] = exynos990_tunes_utmi_postinit,
 };
 
+static void exynos9610_usbdrd_phy_isol(struct phy_usb_instance *inst,
+				       bool isolate)
+{
+	u32 mask = BIT(0) | BIT(1);
+
+	if (!inst->reg_pmu)
+		return;
+
+	regmap_update_bits(inst->reg_pmu, inst->pmu_offset, mask,
+			   isolate ? 0 : mask);
+	regmap_update_bits(inst->reg_pmu, inst->pmu_offset, BIT(16),
+			   isolate ? 0 : BIT(16));
+
+	{
+		unsigned int val;
+
+		if (!regmap_read(inst->reg_pmu, inst->pmu_offset, &val))
+			dev_info(to_usbdrd_phy(inst)->dev,
+				 "PMU USBDEV PHY isolate=%d value=%08x\n",
+				 isolate, val);
+	}
+}
+
+static const struct exynos5_usbdrd_phy_config phy_cfg_exynos9610[] = {
+	{
+		.id		= EXYNOS5_DRDPHY_UTMI,
+		.phy_isol	= exynos9610_usbdrd_phy_isol,
+		.phy_init	= exynos850_usbdrd_utmi_init,
+	},
+};
+
+static const char * const exynos9610_phy_clk_names[] = {
+	"hsdrd", "usb20", "usb30_0", "usb30_1",
+};
+
+static const char * const exynos9610_phy_core_clk_names[] = {
+	"ref",
+};
+
+static const struct exynos5_usbdrd_phy_tuning exynos9610_tunes_utmi_postinit[] = {
+	PHY_TUNING_ENTRY_PHY(EXYNOS850_DRD_HSPPARACON,
+			     (HSPPARACON_TXVREF | HSPPARACON_TXRISE |
+			      HSPPARACON_TXRES | HSPPARACON_TXPREEMPPULSE |
+			      HSPPARACON_TXPREEMPAMP | HSPPARACON_TXHSXV |
+			      HSPPARACON_TXFSLS | HSPPARACON_SQRX |
+			      HSPPARACON_OTG | HSPPARACON_COMPDIS),
+			     (FIELD_PREP_CONST(HSPPARACON_TXVREF, 0xf) |
+			      FIELD_PREP_CONST(HSPPARACON_TXRISE, 3) |
+			      FIELD_PREP_CONST(HSPPARACON_TXRES, 3) |
+			      FIELD_PREP_CONST(HSPPARACON_TXPREEMPPULSE, 0) |
+			      FIELD_PREP_CONST(HSPPARACON_TXPREEMPAMP, 3) |
+			      FIELD_PREP_CONST(HSPPARACON_TXHSXV, 3) |
+			      FIELD_PREP_CONST(HSPPARACON_TXFSLS, 3) |
+			      FIELD_PREP_CONST(HSPPARACON_SQRX, 7) |
+			      FIELD_PREP_CONST(HSPPARACON_OTG, 2) |
+			      FIELD_PREP_CONST(HSPPARACON_COMPDIS, 7))),
+	PHY_TUNING_ENTRY_LAST
+};
+
+static const struct exynos5_usbdrd_phy_tuning *exynos9610_tunes[PTS_MAX] = {
+	[PTS_UTMI_POSTINIT] = exynos9610_tunes_utmi_postinit,
+};
+
+static const struct exynos5_usbdrd_phy_drvdata exynos9610_usbdrd_phy = {
+	.phy_cfg		= phy_cfg_exynos9610,
+	.phy_ops		= &exynos850_usbdrd_phy_ops,
+	.phy_tunes		= exynos9610_tunes,
+	.pmu_offset_usbdrd0_phy	= 0x704,
+	.clk_names		= exynos9610_phy_clk_names,
+	.n_clks			= ARRAY_SIZE(exynos9610_phy_clk_names),
+	.core_clk_names		= exynos9610_phy_core_clk_names,
+	.n_core_clks		= ARRAY_SIZE(exynos9610_phy_core_clk_names),
+	.regulator_names	= exynos5_regulator_names,
+	.n_regulators		= ARRAY_SIZE(exynos5_regulator_names),
+};
+
 static const struct exynos5_usbdrd_phy_drvdata exynos990_usbdrd_phy = {
 	.phy_cfg		= phy_cfg_exynos850,
 	.phy_ops		= &exynos850_usbdrd_phy_ops,
@@ -2259,6 +2356,9 @@ static const struct of_device_id exynos5_usbdrd_phy_of_match[] = {
 		.compatible = "samsung,exynos850-usbdrd-phy",
 		.data = &exynos850_usbdrd_phy
 	}, {
+		.compatible = "samsung,exynos9610-usbdrd-phy",
+		.data = &exynos9610_usbdrd_phy
+	}, {
 		.compatible = "samsung,exynos990-usbdrd-phy",
 		.data = &exynos990_usbdrd_phy
 	},
@@ -2278,6 +2378,8 @@ static int exynos5_usbdrd_phy_probe(struct platform_device *pdev)
 	int i, ret;
 	int channel;
 
+	dev_info(dev, "exynos-usbdrd-phy probe\n");
+
 	phy_drd = devm_kzalloc(dev, sizeof(*phy_drd), GFP_KERNEL);
 	if (!phy_drd)
 		return -ENOMEM;
@@ -2289,6 +2391,8 @@ static int exynos5_usbdrd_phy_probe(struct platform_device *pdev)
 	if (!drv_data)
 		return -EINVAL;
 	phy_drd->drv_data = drv_data;
+	phy_drd->usb3phy_isolation =
+		of_property_read_bool(dev->of_node, "samsung,usb3phy-isolation");
 
 	ret = devm_mutex_init(dev, &phy_drd->phy_mutex);
 	if (ret)

@@ -632,6 +632,14 @@ config TOUCHSCREEN_MAX11801
 	  To compile this driver as a module, choose M here: the
 	  module will be called max11801_ts.
 
+config TOUCHSCREEN_MSS100
+	tristate "Melfas MSS100 touchscreen"
+	depends on I2C
+	help
+	  Say Y here to enable support for the Melfas MSS100 touchscreen
+	  controller found in Samsung Galaxy A51 and similar devices.  It
+	  speaks the MIP protocol over a bare I2C byte stream.
+
 config TOUCHSCREEN_MMS114
 	tristate "MELFAS MMS114 touchscreen"
 	depends on I2C

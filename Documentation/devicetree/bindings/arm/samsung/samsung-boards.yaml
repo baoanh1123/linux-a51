@@ -238,6 +238,11 @@ properties:
               - samsung,dreamlte                # Samsung Galaxy S8 (SM-G950F)
           - const: samsung,exynos8895
 
+      - description: Exynos9611 Galaxy A51 using verified generic compatibles
+        items:
+          - const: samsung,armv8
+          - const: samsung,exynos9610
+
       - description: Exynos9810 based boards
         items:
           - enum:

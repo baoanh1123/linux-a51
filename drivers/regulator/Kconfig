@@ -1408,6 +1408,14 @@ config REGULATOR_S2MPA01
 	 This driver controls Samsung S2MPA01 voltage output regulator
 	 via I2C bus. S2MPA01 has 10 Bucks and 26 LDO outputs.
 
+config REGULATOR_S2MPU09
+	tristate "Samsung S2MPU09 voltage regulator (ACPM)"
+	depends on EXYNOS_ACPM_PROTOCOL || COMPILE_TEST
+	help
+	 This driver provides a minimal set of S2MPU09 regulators accessed
+	 through the Exynos ACPM PMIC protocol. It is currently limited to
+	 the microSD vmmc/vqmmc rails used during Exynos 9611 bring-up.
+
 config REGULATOR_S2MPS11
 	tristate "Samsung S2MPS11/13/14/15/S2MPU02/05 voltage regulator"
 	depends on MFD_SEC_CORE || COMPILE_TEST

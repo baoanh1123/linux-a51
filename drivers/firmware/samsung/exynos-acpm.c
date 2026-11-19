@@ -10,6 +10,7 @@
 #include <linux/bits.h>
 #include <linux/cleanup.h>
 #include <linux/container_of.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/firmware/samsung/exynos-acpm-protocol.h>
@@ -18,6 +19,7 @@
 #include <linux/ktime.h>
 #include <linux/mailbox/exynos-message.h>
 #include <linux/mailbox_client.h>
+#include <linux/mailbox/exynos-message.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/math.h>
@@ -28,10 +30,27 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 
+static const struct file_operations acpm_sram_dump_fops;
+
 #include "exynos-acpm.h"
 #include "exynos-acpm-pmic.h"
 
+/*
+ * The sequence number lives in bits 21:16 of the message's first word, which
+ * is exactly what the vendor 9610 driver does before queueing a request
+ * (DOWNSTREAM_READONLY/drivers/soc/samsung/acpm/acpm_ipc.c:
+ *  cfg->cmd[0] |= (seq & 0x3f) << ACPM_IPC_PROTOCOL_SEQ_NUM).
+ *
+ * The OWN/RSP/ID/INDIRECTION bits that acpm_ipc_ctrl.h defines are *not* part
+ * of a request: the vendor never sets them, and adding them corrupts the
+ * payload word - for DVFS the firmware then sees domain id 0xa0000002 instead
+ * of 2 and silently ignores the request (no response, no rate change).
+ */
 #define ACPM_PROTOCOL_SEQNUM		GENMASK(21, 16)
+
+/* Channel memory model (vendor fw_header/framework.h: enum channel_type). */
+#define ACPM_CHAN_TYPE_QUEUE		1
+#define ACPM_CHAN_TYPE_BUFFER		2
 
 #define ACPM_POLL_TIMEOUT_US		(100 * USEC_PER_MSEC)
 #define ACPM_TX_TIMEOUT_US		500000
@@ -71,7 +90,9 @@ struct acpm_shmem {
  */
 struct acpm_chan_shmem {
 	u32 id;
-	u32 reserved[3];
+	u32 field;
+	u32 owner;
+	u32 type;
 	u32 rx_rear;
 	u32 rx_front;
 	u32 rx_base;
@@ -113,6 +134,9 @@ struct acpm_rx_data {
 
 #define ACPM_SEQNUM_MAX    64
 
+/* Interrupt driven channels answer within a few microseconds at most. */
+#define ACPM_IRQ_TIMEOUT_MS	100
+
 /**
  * struct acpm_chan - driver internal representation of a channel.
  * @cl:		mailbox client.
@@ -131,8 +155,10 @@ struct acpm_rx_data {
  * @mlen:	message length. Applies to both TX/RX queues.
  * @seqnum:	sequence number of the last message enqueued on TX queue.
  * @id:		channel ID.
+ * @type:		channel memory model: queue or single buffer.
  * @poll_completion:	indicates if the transfer needs to be polled for
  *			completion or interrupt mode is used.
+ * @irq_done:	completed when the firmware signals an RX for this channel.
  * @bitmap_seqnum: bitmap that tracks the messages on the TX/RX queues.
  * @rx_data:	internal buffer used to drain the RX queue.
  */
@@ -147,9 +173,11 @@ struct acpm_chan {
 
 	unsigned int qlen;
 	unsigned int mlen;
+	unsigned int type;
 	u8 seqnum;
 	u8 id;
 	bool poll_completion;
+	struct completion irq_done;
 
 	DECLARE_BITMAP(bitmap_seqnum, ACPM_SEQNUM_MAX - 1);
 	struct acpm_rx_data rx_data[ACPM_SEQNUM_MAX];
@@ -167,10 +195,12 @@ struct acpm_chan {
 struct acpm_info {
 	struct acpm_shmem __iomem *shmem;
 	void __iomem *sram_base;
+	struct dentry *debugfs;
 	struct acpm_chan *chans;
 	struct device *dev;
 	struct acpm_handle handle;
 	u32 num_chans;
+	u32 num_chans_offset;
 };
 
 /**
@@ -179,7 +209,10 @@ struct acpm_info {
  */
 struct acpm_match_data {
 	loff_t initdata_base;
+	u32 num_chans_offset;
 };
+
+static void acpm_rx_callback(struct mbox_client *cl, void *mssg);
 
 #define client_to_acpm_chan(c) container_of(c, struct acpm_chan, cl)
 #define handle_to_acpm_info(h) container_of(h, struct acpm_info, handle)
@@ -237,6 +270,22 @@ static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer)
 	base = achan->rx.base;
 	mlen = achan->mlen;
 
+	/*
+	 * A TYPE_BUFFER channel keeps a single message at rx.base and never
+	 * moves the front/rear indices, so the queue walk below can never
+	 * match a response there.  DVFS (channel 5) is such a channel.
+	 */
+	if (achan->type == ACPM_CHAN_TYPE_BUFFER) {
+		val = readl(base);
+		if (FIELD_GET(ACPM_PROTOCOL_SEQNUM, val) == tx_seqnum) {
+			__ioread32_copy(xfer->rxd, base, xfer->rxlen / 4);
+			clear_bit(tx_seqnum - 1, achan->bitmap_seqnum);
+			exynos_mbox_chan_ack(achan->chan, achan->id);
+		}
+
+		return 0;
+	}
+
 	/* Drain RX queue. */
 	do {
 		/* Read RX seqnum. */
@@ -280,6 +329,14 @@ static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer)
 	writel(rx_front, achan->rx.rear);
 
 	/*
+	 * Clear the pending bit and return a credit, as the vendor does after
+	 * draining, but only when our own response was consumed: acking every
+	 * poll of a shared channel raises needless firmware interrupts.
+	 */
+	if (rx_set)
+		exynos_mbox_chan_ack(achan->chan, achan->id);
+
+	/*
 	 * If the response was not in this iteration of the queue, check if the
 	 * RX data was previously saved.
 	 */
@@ -296,6 +353,41 @@ static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer)
  *
  * Return: 0 on success, -errno otherwise.
  */
+/*
+ * Bring-up aid: dump the queue pointers and the raw RX slots of one channel.
+ * Gated by the dump_chan parameter (default: channel 5, the DVFS channel) so
+ * the PMIC channel does not flood the log.
+ */
+static unsigned int acpm_dump_chan_id = 5;
+module_param_named(dump_chan, acpm_dump_chan_id, uint, 0444);
+MODULE_PARM_DESC(dump_chan, "ACPM channel to dump on every transfer");
+
+static void acpm_dump_chan(struct acpm_chan *achan, const char *tag)
+{
+	struct device *dev = achan->acpm->dev;
+	u32 raw[ACPM_SEQNUM_MAX > 8 ? 8 : 8];
+	u32 i;
+
+	if (achan->id != acpm_dump_chan_id)
+		return;
+
+	dev_info(dev, "%s ch%u qlen=%u mlen=%u tx f/r=%u/%u rx f/r=%u/%u\n",
+		 tag, achan->id, achan->qlen, achan->mlen,
+		 readl(achan->tx.front), readl(achan->tx.rear),
+		 readl(achan->rx.front), readl(achan->rx.rear));
+
+	for (i = 0; i < achan->qlen && i < ARRAY_SIZE(raw); i++) {
+		__ioread32_copy(raw, achan->rx.base + achan->mlen * i,
+				achan->mlen / 4);
+		dev_info(dev, "%s ch%u rxslot%u: %8phN\n", tag, achan->id, i,
+			 raw);
+		__ioread32_copy(raw, achan->tx.base + achan->mlen * i,
+				achan->mlen / 4);
+		dev_info(dev, "%s ch%u txslot%u: %8phN\n", tag, achan->id, i,
+			 raw);
+	}
+}
+
 static int acpm_dequeue_by_polling(struct acpm_chan *achan,
 				   const struct acpm_xfer *xfer)
 {
@@ -319,8 +411,10 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
 		udelay(20);
 	} while (ktime_before(ktime_get(), timeout));
 
-	dev_err(dev, "Timeout! ch:%u s:%u bitmap:%lx.\n",
-		achan->id, seqnum, achan->bitmap_seqnum[0]);
+	dev_err(dev, "Timeout! ch:%u s:%u bitmap:%lx intstat:%08x.\n",
+		achan->id, seqnum, achan->bitmap_seqnum[0],
+		exynos_mbox_int_status(achan->chan));
+	acpm_dump_chan(achan, "timeout");
 
 	return -ETIME;
 }
@@ -395,10 +489,31 @@ static void acpm_prepare_xfer(struct acpm_chan *achan,
  *
  * Return: 0 on success, -errno otherwise.
  */
+/**
+ * acpm_rx_callback() - mailbox client callback for interrupt driven channels
+ * @cl:		mailbox client of the channel
+ * @mssg:	unused
+ *
+ * The mailbox controller only signals that a response arrived; the payload is
+ * then read from the shared memory RX queue by the waiter.
+ */
+static void acpm_rx_callback(struct mbox_client *cl, void *mssg)
+{
+	struct acpm_chan *achan = container_of(cl, struct acpm_chan, cl);
+
+	complete(&achan->irq_done);
+}
+
 static int acpm_wait_for_message_response(struct acpm_chan *achan,
 					  const struct acpm_xfer *xfer)
 {
-	/* Just polling mode supported for now. */
+	/*
+	 * Poll the RX queue for every channel.  Linux on this SoC never sees
+	 * the ACPM interrupt (the vendor kernel's mailbox IRQ counter stays at
+	 * zero while CPU DVFS runs), so the firmware is expected to be polled
+	 * even for channels whose shared-memory descriptor advertises
+	 * interrupt completion.
+	 */
 	return acpm_dequeue_by_polling(achan, xfer);
 }
 
@@ -409,6 +524,26 @@ static int acpm_wait_for_message_response(struct acpm_chan *achan,
  *
  * Return: 0 on success, -errno otherwise.
  */
+/*
+ * Raw message exchange used by firmware-owned subsystems (CPU DVFS, ...) that
+ * do not fit the register oriented PMIC model.  The request words are also
+ * used as the response buffer, mirroring what the firmware expects.
+ */
+int acpm_do_cmd(struct acpm_handle *handle, unsigned int acpm_chan_id,
+		u32 *cmd, unsigned int words)
+{
+	struct acpm_xfer xfer = {
+		.txd = cmd,
+		.rxd = cmd,
+		.txlen = words * sizeof(u32),
+		.rxlen = words * sizeof(u32),
+		.acpm_chan_id = acpm_chan_id,
+	};
+
+	return acpm_do_xfer(handle, &xfer);
+}
+EXPORT_SYMBOL_GPL(acpm_do_cmd);
+
 int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 {
 	struct acpm_info *acpm = handle_to_acpm_info(handle);
@@ -425,36 +560,62 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 	if (!xfer->txd || xfer->txlen > achan->mlen || xfer->rxlen > achan->mlen)
 		return -EINVAL;
 
-	if (!achan->poll_completion) {
-		dev_err(achan->acpm->dev, "Interrupt mode not supported\n");
-		return -EOPNOTSUPP;
-	}
-
-	msg.chan_id = xfer->acpm_chan_id;
+	/*
+	 * Use the channel id from shared memory, not the array index: the
+	 * vendor ACPM driver rings the doorbell as 1 << channel->id, and the id
+	 * need not match the position in the channel table.
+	 */
+	msg.chan_id = achan->id;
 	msg.chan_type = EXYNOS_MBOX_CHAN_TYPE_DOORBELL;
+
+	if (!achan->poll_completion)
+		reinit_completion(&achan->irq_done);
 
 	scoped_guard(mutex, &achan->tx_lock) {
 		tx_front = readl(achan->tx.front);
-		idx = (tx_front + 1) % achan->qlen;
 
-		ret = acpm_wait_for_queue_slots(achan, idx);
-		if (ret)
-			return ret;
+		/*
+		 * A single-slot channel has no wrap-around: the slot is always
+		 * index 0 and there is no front/rear gap to maintain, so the
+		 * queue-slot wait cannot be satisfied and must be skipped.
+		 */
+		if (achan->qlen == 1) {
+			idx = 0;
+		} else {
+			idx = (tx_front + 1) % achan->qlen;
 
+			ret = acpm_wait_for_queue_slots(achan, idx);
+			if (ret)
+				return ret;
+		}
+
+		acpm_dump_chan(achan, "pre");
 		acpm_prepare_xfer(achan, xfer);
 
 		/* Write TX command. */
 		__iowrite32_copy(achan->tx.base + achan->mlen * tx_front,
 				 xfer->txd, xfer->txlen / 4);
 
-		/* Advance TX front. */
-		writel(idx, achan->tx.front);
+		/*
+		 * Advance TX front.  A TYPE_BUFFER channel holds exactly one
+		 * message and q_len is 1, so "front = (front + 1) % q_len"
+		 * always leaves front == rear and the firmware, which uses
+		 * equality as the empty marker, never sees a pending message.
+		 * Publish rear + 1 instead: a raw counter the firmware can
+		 * compare, and which is restored when it consumes the slot.
+		 */
+		if (achan->type == ACPM_CHAN_TYPE_BUFFER)
+			writel(readl(achan->tx.rear) + 1, achan->tx.front);
+		else
+			writel(idx, achan->tx.front);
+
 
 		ret = mbox_send_message(achan->chan, (void *)&msg);
 		if (ret < 0)
 			return ret;
 
 		mbox_client_txdone(achan->chan, 0);
+		acpm_dump_chan(achan, "post");
 	}
 
 	return acpm_wait_for_message_response(achan, xfer);
@@ -473,6 +634,7 @@ static void acpm_chan_shmem_get_params(struct acpm_chan *achan,
 	struct acpm_queue *rx = &achan->rx;
 	struct acpm_queue *tx = &achan->tx;
 
+	achan->type = readl(&chan_shmem->type);
 	achan->mlen = readl(&chan_shmem->mlen);
 	achan->poll_completion = readl(&chan_shmem->poll_completion);
 	achan->id = readl(&chan_shmem->id);
@@ -542,6 +704,156 @@ static void acpm_free_mbox_chans(void *data)
  *
  * Return: 0 on success, -errno otherwise.
  */
+/*
+ * Port diagnostic only: read s2mpu09 registers over ACPM to prove the PMIC
+ * channel works. Read-only - no PMIC register is written.
+ *
+ * The request encoding follows the vendor acpm_mfd.h protocol, which matches
+ * mainline's ACPM PMIC fields for this part: cmd[0] = TYPE[15:8] | REG[7:0],
+ * cmd[1] = FUNC[7:0] with FUNC_READ = 0, and the data byte is returned in
+ * bits [15:8] of cmd[1]. The s2mpu09 MFD uses type 0 for the TOP bank and
+ * type 1 for the PMIC bank (DOWNSTREAM_READONLY/drivers/mfd/s2mpu09-core.c:
+ * I2C_ADDR_TOP/I2C_ADDR_PMIC), so the rail registers must be read with type 1.
+ * ACPM channel 2 is the PMIC channel in the live vendor DT; the register
+ * addresses are from the vendor include/linux/mfd/samsung/s2mpu09-regulator.h
+ * (LDO2/vqmmc = 0x3a/0x3b, LDO35/vmmc = 0x5c).
+ */
+#define ACPM_EXYNOS9611_PMIC_CHAN	2
+
+static void acpm_pmic_readout_probe(struct acpm_info *acpm)
+{
+	/*
+	 * PMICID 0x00 identifies the PMIC; B1OUT/B4CTRL/B4OUT are rails the
+	 * boot chain must have programmed, so they prove the read path; then
+	 * LDO2 (vqmmc, 0x3a/0x3b) and LDO35 (vmmc, 0x5c).
+	 */
+	static const struct { u8 type; u8 reg; } regs[] = {
+		{ 0, 0x00 }, { 0, 0x19 }, { 0, 0x1e }, { 0, 0x1f },
+		{ 1, 0x00 }, { 1, 0x3a }, { 1, 0x3b }, { 1, 0x5c },
+	};
+	unsigned int i;
+
+	/*
+	 * The vendor acpm_ipc init programs INTMR1 (the AP->APM doorbell mask)
+	 * from the firmware's per-channel ap_poll flag as
+	 * mask |= polling << channel id, and never relies on the boot chain
+	 * leaving it in that state. Reproduce it here and log the mailbox
+	 * registers so the doorbell path can be checked.
+	 */
+	if (acpm->dev->of_node) {
+		struct device_node *mbox_node;
+		struct resource res;
+		void __iomem *mbox_base;
+		u32 mask = 0;
+
+		mbox_node = of_parse_phandle(acpm->dev->of_node, "mboxes", 0);
+		if (mbox_node) {
+			for (i = 0; i < acpm->num_chans; i++)
+				mask |= (acpm->chans[i].poll_completion ? 1 : 0)
+					<< acpm->chans[i].id;
+
+			if (!of_address_to_resource(mbox_node, 0, &res)) {
+				mbox_base = devm_ioremap(acpm->dev, res.start,
+							 resource_size(&res));
+				if (mbox_base) {
+					/* Exynos9611 compact map: INTMR0 0x10,
+					 * INTGR1 0x1c, INTMR1 0x24, INTSR1 0x28.
+					 */
+					dev_info(acpm->dev,
+						 "mailbox before: INTMR0=%#x INTMR1=%#x INTGR1=%#x INTSR1=%#x\n",
+						 readl(mbox_base + 0x10),
+						 readl(mbox_base + 0x24),
+						 readl(mbox_base + 0x1c),
+						 readl(mbox_base + 0x28));
+					writel(mask, mbox_base + 0x24);
+					dev_info(acpm->dev,
+						 "mailbox after: INTMR1=%#x mask=%#x\n",
+						 readl(mbox_base + 0x24), mask);
+				}
+			}
+			of_node_put(mbox_node);
+		}
+	}
+
+	for (i = 0; i < acpm->num_chans && i < 16; i++)
+		dev_info(acpm->dev,
+			 "ACPM ch%u: id=%u qlen=%u mlen=%u poll=%u\n",
+			 i, acpm->chans[i].id, acpm->chans[i].qlen,
+			 acpm->chans[i].mlen, acpm->chans[i].poll_completion);
+
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		u8 value = 0;
+		int ret;
+
+		ret = acpm_pmic_read_reg(&acpm->handle,
+					 ACPM_EXYNOS9611_PMIC_CHAN, regs[i].type,
+					 regs[i].reg, 0, &value);
+
+		dev_info(acpm->dev, "PMIC read type=%u reg %#04x: ret=%d value=%#04x\n",
+			 regs[i].type, regs[i].reg, ret, value);
+	}
+
+	/*
+	 * Controlled rail test: the readout above shows LDO2 (vqmmc) and
+	 * LDO35 (vmmc) with their enable bits clear. Enable both at 3.3 V
+	 * (vsel 0x3c, enable bits 7:6 = 0x3) so the MMC host can identify
+	 * the card. This is a test-only write, gated by a DT property.
+	 */
+	if (of_property_read_bool(acpm->dev->of_node,
+				  "samsung,pmic-rail-test")) {
+		/*
+		 * Match the stock kernel: vqmmc (LDO2) stays at 1.8 V with
+		 * enable bits 7:6 set (0xc0), vmmc (LDO35) is 3.3 V with
+		 * enable bits set (0xfc). The earlier 0xfc on LDO2 raised
+		 * vqmmc to 3.3 V and did not enumerate.
+		 */
+		static const struct { u8 reg; u8 value; } rails[] = {
+			{ 0x3a, 0xc0 }, { 0x5c, 0xfc },
+		};
+		u8 value;
+
+		for (i = 0; i < ARRAY_SIZE(rails); i++) {
+			int ret;
+
+			ret = acpm_pmic_write_reg(&acpm->handle,
+						  ACPM_EXYNOS9611_PMIC_CHAN,
+						  1, rails[i].reg, 0,
+						  rails[i].value);
+			value = 0;
+			if (!ret)
+				ret = acpm_pmic_read_reg(&acpm->handle,
+							 ACPM_EXYNOS9611_PMIC_CHAN,
+							 1, rails[i].reg, 0, &value);
+			dev_info(acpm->dev,
+				 "PMIC rail write reg %#04x: ret=%d readback=%#04x\n",
+				 rails[i].reg, ret, value);
+		}
+	}
+
+	if (acpm->dev->of_node) {
+		struct device_node *mbox_node;
+		struct resource res;
+		void __iomem *mbox_base;
+
+		mbox_node = of_parse_phandle(acpm->dev->of_node, "mboxes", 0);
+		if (mbox_node) {
+			if (!of_address_to_resource(mbox_node, 0, &res)) {
+				mbox_base = devm_ioremap(acpm->dev, res.start,
+							 resource_size(&res));
+				if (mbox_base)
+					dev_info(acpm->dev,
+						 "mailbox final: INTMR1=%#x INTGR0=%#x INTGR1=%#x INTSR1=%#x INTMSR1=%#x\n",
+						 readl(mbox_base + 0x24),
+						 readl(mbox_base + 0x08),
+						 readl(mbox_base + 0x1c),
+						 readl(mbox_base + 0x28),
+						 readl(mbox_base + 0x2c));
+			}
+			of_node_put(mbox_node);
+		}
+	}
+}
+
 static int acpm_channels_init(struct acpm_info *acpm)
 {
 	struct acpm_shmem __iomem *shmem = acpm->shmem;
@@ -549,7 +861,10 @@ static int acpm_channels_init(struct acpm_info *acpm)
 	struct device *dev = acpm->dev;
 	int i, ret;
 
-	acpm->num_chans = readl(&shmem->num_chans);
+	acpm->num_chans = readl((void __iomem *)shmem + acpm->num_chans_offset);
+	/* Port diagnostic: confirm the boot chain's shared memory is readable. */
+	dev_info(dev, "ACPM shared memory: %u channels at offset %#x\n",
+		 acpm->num_chans, readl(&shmem->chans));
 	acpm->chans = devm_kcalloc(dev, acpm->num_chans, sizeof(*acpm->chans),
 				   GFP_KERNEL);
 	if (!acpm->chans)
@@ -570,15 +885,41 @@ static int acpm_channels_init(struct acpm_info *acpm)
 
 		acpm_chan_shmem_get_params(achan, chan_shmem);
 
+		/*
+		 * Port diagnostic: raw descriptor, to compare a channel that
+		 * works (ch2, PMIC) with one the firmware ignores (ch5, DVFS).
+		 */
+		dev_info(dev,
+			 "ACPM desc ch%u: id=%u txbase=%#x txfront=%#x txrear=%#x rxbase=%#x rxfront=%#x rxrear=%#x qlen=%u mlen=%u poll=%u\n",
+			 i, readl(&chan_shmem->id),
+			 readl(&chan_shmem->tx_base), readl(&chan_shmem->tx_front),
+			 readl(&chan_shmem->tx_rear), readl(&chan_shmem->rx_base),
+			 readl(&chan_shmem->rx_front), readl(&chan_shmem->rx_rear),
+			 readl(&chan_shmem->qlen), readl(&chan_shmem->mlen),
+			 readl(&chan_shmem->poll_completion));
+
 		ret = acpm_achan_alloc_cmds(achan);
 		if (ret)
 			return ret;
 
 		mutex_init(&achan->rx_lock);
 		mutex_init(&achan->tx_lock);
+		/*
+		 * The waitqueue must be initialised before any RX interrupt can
+		 * arrive: acpm_do_xfer() only reinitialises it, and complete()
+		 * on a zeroed completion takes a spinlock on a NULL pointer
+		 * (SError/Oops in complete() from acpm_rx_callback).
+		 */
+		init_completion(&achan->irq_done);
 
 		cl->dev = dev;
+		cl->rx_callback = acpm_rx_callback;
 
+		/*
+		 * One mailbox channel is enough: the doorbell bit comes from
+		 * exynos_mbox_msg.chan_id, which acpm_do_xfer() fills with the
+		 * ACPM channel id from shared memory.
+		 */
 		achan->chan = mbox_request_channel(cl, 0);
 		if (IS_ERR(achan->chan))
 			return PTR_ERR(achan->chan);
@@ -635,6 +976,7 @@ static int acpm_probe(struct platform_device *pdev)
 				     "Failed to get match data.\n");
 
 	acpm->shmem = acpm->sram_base + match_data->initdata_base;
+	acpm->num_chans_offset = match_data->num_chans_offset;
 	acpm->dev = dev;
 
 	ret = acpm_channels_init(acpm);
@@ -643,7 +985,14 @@ static int acpm_probe(struct platform_device *pdev)
 
 	acpm_setup_ops(acpm);
 
+	if (of_property_read_bool(dev->of_node, "samsung,pmic-readout-probe"))
+		acpm_pmic_readout_probe(acpm);
+
 	platform_set_drvdata(pdev, acpm);
+
+	acpm->debugfs = debugfs_create_dir("acpm", NULL);
+	debugfs_create_file("sram", 0444, acpm->debugfs, acpm,
+			    &acpm_sram_dump_fops);
 
 	return devm_of_platform_populate(dev);
 }
@@ -744,14 +1093,130 @@ struct acpm_handle *devm_acpm_get_by_node(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(devm_acpm_get_by_node);
 
+/**
+ * acpm_sram_dump_show() - dump the framework header and channel table.
+ *
+ * The ACPM firmware publishes its own descriptor in shared memory; the header
+ * carries the channel table offset/count and the log ring pointers, so dumping
+ * both is the fastest way to compare our view against the firmware's.
+ */
+static int acpm_sram_dump_show(struct seq_file *s, void *unused)
+{
+	struct acpm_info *acpm = s->private;
+	const struct acpm_info *info = acpm;
+	void __iomem *shmem = info->shmem;
+	u32 chans_off, nchans, ap_max, i, j;
+
+	seq_puts(s, "framework @initdata-base:\n");
+	for (i = 0; i < 0x60; i += 4)
+		seq_printf(s, "  +%02x: %08x\n", i, readl(shmem + i));
+
+	chans_off = readl(shmem + 0x08);
+	nchans = readl(shmem + 0x0c);
+	ap_max = readl(shmem + 0x18);
+	seq_printf(s, "ipc_channels=0x%x num_ipc_channels=%u ipc_ap_max=%u\n",
+		   chans_off, nchans, ap_max);
+
+	/* Firmware log ring: {char str[8]; u32 val; u32 level} entries. */
+	{
+		u32 rear_off = readl(shmem + 0x38);
+		u32 front_off = readl(shmem + 0x3c);
+		u32 data_off = readl(shmem + 0x40);
+		u32 esize = readl(shmem + 0x44);
+		u32 elen = readl(shmem + 0x48);
+		u32 rear, front, n, k, idx;
+
+		seq_printf(s, "\nlog ring: data=0x%x esize=%u elen=%u\n",
+			   data_off, esize, elen);
+		if (!esize || !elen || esize > 64 || elen > 0x1000) {
+			seq_puts(s, "  (not initialised)\n");
+			goto channels;
+		}
+
+		rear = readl(info->sram_base + rear_off);
+		front = readl(info->sram_base + front_off);
+		seq_printf(s, "  rear=%u front=%u\n", rear, front);
+		n = (front + elen - rear) % elen;
+		if (n > 64)
+			n = 64;
+		for (k = 0; k < n; k++) {
+			void __iomem *e;
+			u32 hdr, val;
+			char tag[9];
+
+			idx = (rear + n - 1 - k) % elen;
+			e = info->sram_base + data_off + esize * idx;
+
+			/*
+			 * Entry layout (fw_header/fw: acpm_log_print):
+			 * +0 header: id[31:28] level[27] index[26:22] tick[15:0]
+			 * +4 string, esize - 8 bytes
+			 * +esize-4 value
+			 */
+			hdr = readl(e);
+			val = readl(e + esize - 4);
+			for (i = 0; i < esize - 8 && i < 8; i++) {
+				u8 c = readb(e + 4 + i);
+
+				tag[i] = (c >= 0x20 && c < 0x7f) ? c : '.';
+			}
+			tag[i] = '\0';
+			seq_printf(s, "  [%3u] fw%u lvl%u tick=%u %-8s val=0x%08x\n",
+				   idx, (hdr >> 28) & 0xf, (hdr >> 27) & 1,
+				   hdr & 0xffff, tag, val);
+		}
+	}
+
+channels:
+	for (i = 0; i < min(nchans, 16U); i++) {
+		void __iomem *ch = info->sram_base + chans_off + 0x48 * i;
+
+		seq_printf(s, "ch%u: id=%u field=%u owner=%d type=%u\n", i,
+			   readl(ch + 0x00), readl(ch + 0x04),
+			   (s32)readl(ch + 0x08), readl(ch + 0x0c));
+		seq_puts(s, "   rx: rear/front/base = ");
+		for (j = 0; j < 3; j++)
+			seq_printf(s, "0x%x ", readl(ch + 0x10 + 4 * j));
+		seq_puts(s, "\n   tx: rear/front/base = ");
+		for (j = 0; j < 3; j++)
+			seq_printf(s, "0x%x ", readl(ch + 0x28 + 4 * j));
+		seq_printf(s, "\n   q_len=%u q_elem_size=%u ap_poll=%u\n",
+			   readl(ch + 0x34), readl(ch + 0x38),
+			   readl(ch + 0x44));
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(acpm_sram_dump);
+
 static const struct acpm_match_data acpm_gs101 = {
 	.initdata_base = ACPM_GS101_INITDATA_BASE,
+	.num_chans_offset = offsetof(struct acpm_shmem, num_chans),
+};
+
+/*
+ * Exynos9611: the live vendor DT acpm_ipc has initdata-base = <0x6f00>, and the
+ * firmware's descriptor is struct acpm_framework (see the vendor
+ * drivers/soc/samsung/acpm/fw_header/framework.h):
+ *	+0x00 plugins, +0x04 num_plugins, +0x08 ipc_channels,
+ *	+0x0c num_ipc_channels, +0x10 pid_framework, +0x14 pid_max,
+ *	+0x18 ipc_ap_max ...
+ * so the channel table offset is at 0x08 (same as the gs101 layout) but the
+ * channel count is at 0x0c, while gs101 keeps it at 0x18.
+ */
+static const struct acpm_match_data acpm_exynos9611 = {
+	.initdata_base = 0x6f00,
+	.num_chans_offset = 0x0c,
 };
 
 static const struct of_device_id acpm_match[] = {
 	{
 		.compatible = "google,gs101-acpm-ipc",
 		.data = &acpm_gs101,
+	},
+	{
+		.compatible = "samsung,exynos9611-acpm-ipc",
+		.data = &acpm_exynos9611,
 	},
 	{},
 };

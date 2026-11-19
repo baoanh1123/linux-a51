@@ -1,0 +1,194 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/samsung,exynos9610-clock.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos9610/Exynos9611 Clock Management Units
+
+maintainers:
+  - Krzysztof Kozlowski <krzk@kernel.org>
+  - Sylwester Nawrocki <s.nawrocki@samsung.com>
+  - Chanwoo Choi <cw00.choi@samsung.com>
+  - Alim Akhtar <alim.akhtar@samsung.com>
+
+description: |
+  The initial Linux support describes the TOP, PERI, CORE, APM, and FSYS CMUs separately.
+  The Shared PLLs, bus muxes, and dividers are read-only so the boot firmware's
+  clock configuration is preserved. The TOP PERI bus gate preserves the
+  hardware's manual or automatic gating mode while applying clock enable
+  requests. PERI I2C, SPI, USI, USI I2C, and UART clocks use source-verified
+  rate, divider, and peripheral gate paths. PCLK gates for GPIO_PERI,
+  SYSREG_PERI, both WDT clusters, MCT, the bus-interface TMU, OTP controller,
+  PWM motor, I2C controllers 0 through 6, and camera I2C controllers 0 through
+  3 PCLKs are exposed for registration and rate reporting. The camera I2C
+  functional clocks also use the vendor-defined PERI I2C divider. These gates
+  preserve the hardware's manual or automatic gating mode. PERI I2C, SPI, USI,
+  and UART reset-synchronizer clocks are also exposed with their CAL-defined
+  functional-clock parents. PERI bus reset-sync, AXI2AHB, LHM AXI master, and
+  CMU PCLK gates are exposed for rate reporting with the bus-user parent. I2C
+  controller QCH clocks 0 through 6 are pass-through clocks matching the
+  vendor virtual-clock behavior. TOP CMU CIS clock outputs 0 through 3 are
+  exposed with read-only mux/divider settings and mode-aware gates. The TOP
+  MMC PLL rate is decoded from its fractional register layout without
+  changing it. The TOP CORE bus chain and CORE bus-user mux, divider, and CMU
+  PCLK gate are exposed without changing firmware-selected clock settings.
+  The APM bus path includes the live DLL DCO rate from its CAL-defined N_DCO
+  register, plus the APM bus and PCLK gates; all muxes and dividers are
+  read-only. The CMGP bus gate is sourced by the APM bus divider; CMGP CMU,
+  SYSREG, and GPIO PCLK gates preserve the hardware's manual or automatic
+  gating mode. FSYS exposes the source-mapped MMC-card ACLK and SDCLKIN gates,
+  plus the QCH request clock using the CAL enable/request bit behavior.
+
+properties:
+  compatible:
+    enum:
+      - samsung,exynos9610-cmu-top
+      - samsung,exynos9610-cmu-peri
+      - samsung,exynos9610-cmu-core
+      - samsung,exynos9610-cmu-apm
+      - samsung,exynos9610-cmu-cmgp
+      - samsung,exynos9610-cmu-fsys
+
+  reg:
+    minItems: 1
+    maxItems: 2
+
+  reg-names:
+    minItems: 1
+    maxItems: 2
+
+  "#clock-cells":
+    const: 1
+
+  clocks:
+    minItems: 1
+    maxItems: 3
+
+  clock-names:
+    minItems: 1
+    maxItems: 3
+
+required:
+  - compatible
+  - reg
+  - "#clock-cells"
+  - clocks
+  - clock-names
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: samsung,exynos9610-cmu-top
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        clocks:
+          maxItems: 1
+        clock-names:
+          items:
+            - const: fin_pll
+  - if:
+      properties:
+        compatible:
+          const: samsung,exynos9610-cmu-peri
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        clocks:
+          minItems: 2
+        clock-names:
+          items:
+            - const: fin_pll
+            - const: dout_peri_bus
+  - if:
+      properties:
+        compatible:
+          const: samsung,exynos9610-cmu-core
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        clocks:
+          minItems: 2
+          maxItems: 2
+        clock-names:
+          items:
+            - const: fin_pll
+            - const: dout_core_bus
+  - if:
+      properties:
+        compatible:
+          const: samsung,exynos9610-cmu-apm
+    then:
+      properties:
+        reg:
+          maxItems: 2
+        reg-names:
+          items:
+            - const: cmu
+            - const: dll
+        clocks:
+          minItems: 2
+          maxItems: 2
+        clock-names:
+          items:
+            - const: oscclk_rco_apm
+            - const: dout_apm_bus
+      required:
+        - reg-names
+  - if:
+      properties:
+        compatible:
+          const: samsung,exynos9610-cmu-cmgp
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        clocks:
+          maxItems: 1
+        clock-names:
+          items:
+            - const: clkcmu_cmgp_bus
+  - if:
+      properties:
+        compatible:
+          const: samsung,exynos9610-cmu-fsys
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        clocks:
+          minItems: 3
+          maxItems: 3
+        clock-names:
+          items:
+            - const: oscclk_fsys
+            - const: dout_fsys_bus
+            - const: dout_fsys_mmc_card
+
+additionalProperties: false
+
+examples:
+  - |
+    / {
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        oscclk: oscillator {
+            compatible = "fixed-clock";
+            #clock-cells = <0>;
+            clock-frequency = <26000000>;
+        };
+
+        clock-controller@12100000 {
+            compatible = "samsung,exynos9610-cmu-top";
+            reg = <0x12100000 0x8000>;
+            #clock-cells = <1>;
+            clocks = <&oscclk>;
+            clock-names = "fin_pll";
+        };
+    };

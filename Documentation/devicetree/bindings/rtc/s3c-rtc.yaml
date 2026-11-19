@@ -18,6 +18,7 @@ properties:
           - enum:
               - samsung,exynos7-rtc
               - samsung,exynos850-rtc
+              - samsung,exynos9610-rtc
           - const: samsung,s3c6410-rtc
       - const: samsung,exynos3250-rtc
         deprecated: true

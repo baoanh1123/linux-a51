@@ -2334,6 +2334,12 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
 		goto err_free_event_buffers;
 	}
 
+	dev_info(dev, "dwc3 init: GCTL=%08x DCFG=%08x GUSB2PHYCFG0=%08x GUSB3PIPECTL0=%08x max_speed=%d dr_mode=%d\n",
+		 dwc3_readl(dwc, DWC3_GCTL), dwc3_readl(dwc, DWC3_DCFG),
+		 dwc3_readl(dwc, DWC3_GUSB2PHYCFG(0)),
+		 dwc3_readl(dwc, DWC3_GUSB3PIPECTL(0)),
+		 dwc->maximum_speed, dwc->dr_mode);
+
 	dwc3_check_params(dwc);
 	dwc3_debugfs_init(dwc);
 
@@ -2378,6 +2384,8 @@ static int dwc3_probe(struct platform_device *pdev)
 	struct dwc3_probe_data probe_data = {};
 	struct resource *res;
 	struct dwc3 *dwc;
+
+	dev_info(&pdev->dev, "dwc3 core probe\n");
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {

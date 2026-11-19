@@ -272,6 +272,34 @@ config BATTERY_WM97XX
 	help
 	  Say Y to enable support for battery measured by WM97xx aux port.
 
+config MUIC_SM5713
+	tristate "Silicon Mitus SM5713 MUIC"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y to enable the MUIC found in the Silicon Mitus SM5713.  It
+	  reports the detected cable type (SDP, DCP, CDP or an OTG accessory)
+	  so that charging current can follow the attached source.
+
+config CHARGER_SM5713
+	tristate "Silicon Mitus SM5713 charger"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y to enable the switch-mode charger found in the Silicon Mitus
+	  SM5713.  It reports cable presence, charging state and health, and
+	  re-arms the charger watchdog so that charging does not stop after
+	  the 90 second hardware timeout.
+
+config BATTERY_SM5713
+	tristate "Silicon Mitus SM5713 fuel gauge"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y to enable the fuel gauge found in the Silicon Mitus SM5713,
+	  which is used on Samsung Exynos9610/9611 boards (Galaxy A51).  It
+	  reports battery capacity, voltage, current and temperature.
+
 config BATTERY_SBS
 	tristate "SBS Compliant gas gauge"
 	depends on I2C

@@ -278,3 +278,14 @@ config ARM_PXA2xx_CPUFREQ
 	  This add the CPUFreq driver support for Intel PXA2xx SOCs.
 
 	  If in doubt, say N.
+
+config ARM_EXYNOS_ACPM_DVFS
+	tristate "Exynos ACPM DVFS client"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on EXYNOS_ACPM_PROTOCOL
+	help
+	  Say Y to enable the client that talks to the ACPM firmware for CPU
+	  DVFS on Samsung Exynos9610/9611.  The firmware owns the CPU clocks
+	  and their PMIC voltages, so frequency changes are mailbox requests.
+
+	  If in doubt, say N.

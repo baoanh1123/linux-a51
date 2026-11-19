@@ -688,6 +688,13 @@ config I2C_EXYNOS5
 	  Exynos5433, Exynos7, Exynos850 and ExynosAutoV9.
 	  Choose Y here only if you build for such Samsung SoC.
 
+config I2C_EXYNOS_SPEEDY
+	tristate "Samsung Exynos SPEEDY I2C controller"
+	depends on OF
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	help
+	  Enable polling support for the Samsung Exynos SPEEDY I2C controller.
+
 config I2C_GPIO
 	tristate "GPIO-based bitbanging I2C"
 	depends on GPIOLIB || COMPILE_TEST

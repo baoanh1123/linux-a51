@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/samsung/exynos9611-mshc-snapshot.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos9611 MSHC read-only snapshot diagnostic
+
+maintainers:
+  - Alim Akhtar <alim.akhtar@samsung.com>
+
+description: |
+  Test-only platform device for reading a bounded set of Exynos9611 MSHC
+  identification and clock-state registers during bring-up. The driver
+  temporarily enables the bus and QCH clocks, performs read-only register
+  accesses, then disables the clocks. It does not enable SDCLKIN, reset the
+  block, or issue MMC/SD commands.
+
+properties:
+  compatible:
+    const: samsung,exynos9611-mshc-snapshot
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: MSHC bus interface clock
+      - description: MSHC Q-channel clock
+
+  clock-names:
+    items:
+      - const: aclk
+      - const: qch
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/samsung,exynos9610-cmu.h>
+
+    / {
+        #address-cells = <2>;
+        #size-cells = <1>;
+
+        snapshot@13550000 {
+            compatible = "samsung,exynos9611-mshc-snapshot";
+            reg = <0x0 0x13550000 0x2000>;
+            clocks = <&fsys 3>, <&fsys 5>;
+            clock-names = "aclk", "qch";
+        };
+    };

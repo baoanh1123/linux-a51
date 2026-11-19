@@ -1,0 +1,1345 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Samsung Exynos9611 SoC device tree source
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/clock/samsung,exynos9610-cmu.h>
+
+/*
+ * Root cell sizes and interrupt parent follow
+ * DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/exynos9610.dts:34-40.
+ * The live A51 compatibles are in
+ * notes/device-dump/20261026-1937/live-device-tree.dts:6-10.
+ */
+/ {
+	#address-cells = <2>;
+	#size-cells = <1>;
+
+	interrupt-parent = <&gic>;
+
+	/*
+	 * The pinctrl driver selects per-controller bank data by alias index.
+	 * Match vendor controller order:
+	 * DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/exynos9610.dts:42-48.
+	 */
+	aliases {
+		pinctrl0 = &pinctrl_alive;
+		pinctrl1 = &pinctrl_cmgp;
+		pinctrl2 = &pinctrl_dispaud;
+		pinctrl3 = &pinctrl_fsys;
+		pinctrl4 = &pinctrl_top;
+		pinctrl5 = &pinctrl_shub;
+	};
+
+	/*
+	 * "simple-mfd" is required for the reboot/poweroff children below: the
+	 * OF core only populates children of nodes that match the bus match
+	 * table, and the generic "syscon" driver does not either (it can win
+	 * the bind race against exynos-pmu).  Same compatible ordering as
+	 * exynos5433.dtsi.
+	 */
+	pmu_system_controller: system-controller@11860000 {
+		compatible = "samsung,exynos9610-pmu", "simple-mfd", "syscon";
+		reg = <0x0 0x11860000 0x10000>;
+
+		/*
+		 * The vendor PSCI node only provides cpu_suspend/cpu_off/cpu_on,
+		 * so without these there is no system reset handler and both
+		 * reboot and poweroff hang.  Same PMU registers as downstream
+		 * DOWNSTREAM_READONLY/drivers/soc/samsung/exynos-reboot.c
+		 * (SWRESET 0x400, PS_HOLD_CONTROL 0x330c).
+		 */
+		reboot: syscon-reboot {
+			compatible = "syscon-reboot";
+			regmap = <&pmu_system_controller>;
+			offset = <0x400>;	/* SWRESET */
+			mask = <0x1>;
+			value = <0x1>;
+		};
+
+		/*
+		 * Not "syscon-poweroff": that writes PS_HOLD once, which the
+		 * PMIC does not reliably latch, so the board stays powered.
+		 * The dedicated driver retries forever, like downstream.
+		 */
+		poweroff: poweroff {
+			compatible = "samsung,exynos9610-poweroff";
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			offset = <0x330c>;	/* PS_HOLD_CONTROL */
+			mask = <0x100>;		/* PS_HOLD low */
+		};
+	};
+
+	/*
+	 * The A51 external oscillator is 26 MHz and feeds the Exynos9610
+	 * fin_pll input: DOWNSTREAM_READONLY/arch/arm64/boot/dts/samsung/
+	 * exynos9611-a51_common.dtsi:30-33 and
+	 * DOWNSTREAM_READONLY/drivers/clk/samsung/clk-exynos9610.c:30-33.
+	 */
+	oscclk: oscillator {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <26000000>;
+		clock-output-names = "fin_pll";
+	};
+
+	/*
+	 * ACPM mailbox and shared-memory interface. Addresses, size and interrupt
+	 * are from the live vendor DT: acpm_ipc reg = <0 0x11900000 0x1000
+	 * 0x2039000 0x15000>, interrupts = <0 0x26 0>, initdata-base = <0x6f00>.
+	 * The mailbox register model matches the mainline Exynos mailbox driver
+	 * (INTGR0/INTGR1/INTMR1/INTSR1); the ACPM firmware and shared memory are
+	 * set up by the boot chain, so this is read-only bring-up for now.
+	 */
+	firmware {
+		acpm_ipc: power-management {
+			compatible = "samsung,exynos9611-acpm-ipc";
+			mboxes = <&apm_mailbox>;
+			shmem = <&apm_sram>;
+			/* Read-only PMIC register readout over ACPM (port test). */
+			samsung,pmic-readout-probe;
+
+			/*
+			 * CPU DVFS is firmware owned: channel 5 carries the
+			 * {id, rate, command, arg} requests.  Vendor node:
+			 * DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+			 * exynos9610.dts:688-690.
+			 */
+			acpm_dvfs: dvfs {
+				compatible = "samsung,exynos-acpm-dvfs";
+				acpm-ipc-channel = <5>;
+			};
+
+
+			/*
+			 * Minimal S2MPU09 regulator provider for the A51 microSD slot
+			 * and USB PHY rails. LDO2 is vqmmc (1.8 V I/O) and LDO35 is
+			 * vmmc (3.3 V card power); the values and enable encoding
+			 * match the stock kernel state captured in
+			 * notes/device-dump/20261112-stock-android-mmc.
+			 *
+			 * LDO12/LDO13/LDO14 power the USB PHY at 13200000.usb. The
+			 * stock kernel keeps them enabled at 850 mV, 1.8 V and
+			 * 3.0 V (notes/device-dump/20261113-stock-android-live/
+			 * regulator-summary.txt); mainline had no consumer for
+			 * them, so the PHY was left unpowered.
+			 */
+			pmic {
+				compatible = "samsung,s2mpu09-pmic";
+
+				regulators {
+					/*
+					 * vqmmc must be allowed to drop to 1.8 V for
+					 * UHS signaling; the driver programs 3.3 V at
+					 * probe, so this only widens what the MMC core
+					 * may request later.
+					 */
+					vqmmc_reg: LDO2 {
+						regulator-name = "vqmmc";
+						regulator-min-microvolt = <1800000>;
+						regulator-max-microvolt = <3375000>;
+						regulator-always-on;
+					};
+
+					vmmc_reg: LDO35 {
+						regulator-name = "vmmc";
+						regulator-min-microvolt = <3300000>;
+						regulator-max-microvolt = <3375000>;
+						regulator-always-on;
+					};
+
+					usb_ldo12: LDO12 {
+						regulator-name = "vdd_ldo12";
+						regulator-min-microvolt = <800000>;
+						regulator-max-microvolt = <1300000>;
+						regulator-always-on;
+					};
+
+					usb_ldo13: LDO13 {
+						regulator-name = "vdd_ldo13";
+						regulator-min-microvolt = <800000>;
+						regulator-max-microvolt = <1950000>;
+						regulator-always-on;
+					};
+
+					usb_ldo14: LDO14 {
+						regulator-name = "vdd_ldo14";
+						regulator-min-microvolt = <1800000>;
+						regulator-max-microvolt = <3375000>;
+						regulator-always-on;
+					};
+				};
+			};
+		};
+	};
+
+	apm_mailbox: mailbox@11900000 {
+		compatible = "samsung,exynos9611-mbox";
+		reg = <0x0 0x11900000 0x1000>;
+		interrupts = <GIC_SPI 38 IRQ_TYPE_LEVEL_HIGH>;
+		#mbox-cells = <0>;
+	};
+
+	apm_sram: sram@2039000 {
+		compatible = "mmio-sram";
+		reg = <0x0 0x2039000 0x15000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x0 0x2039000 0x15000>;
+	};
+
+	oscclk_fsys: oscillator-fsys {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <26000000>;
+		clock-output-names = "oscclk_fsys";
+	};
+
+	oscclk_rco_apm: oscillator-rco-apm {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <26000000>;
+		clock-output-names = "oscclk_rco_apm";
+	};
+
+	oscclk_rco_cmgp: oscillator-rco-cmgp {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <30000000>;
+		clock-output-names = "oscclk_rco_cmgp";
+	};
+
+	oscclk_cmgp: oscillator-cmgp {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <26000000>;
+		clock-output-names = "oscclk_cmgp";
+	};
+
+	/*
+	 * TOP CMU base and shared PLL/mux/divider registers:
+	 * DOWNSTREAM_READONLY/drivers/soc/samsung/cal-if/exynos9610/
+	 * cmucal-sfr.c:11-30, 264-303.
+	 */
+	cmu_top: clock-controller@12100000 {
+		compatible = "samsung,exynos9610-cmu-top";
+		reg = <0x0 0x12100000 0x8000>;
+		#clock-cells = <1>;
+
+		clocks = <&oscclk>;
+		clock-names = "fin_pll";
+	};
+
+	/*
+	 * FSYS bus and MMC-card clocks/QCH:
+	 * DOWNSTREAM_READONLY/drivers/soc/samsung/cal-if/exynos9610/
+	 * cmucal-sfr.c:256-260, 767-768, 786-804, 2097-2109, 3707-3709,
+	 * 3755-3784, 3815-3818; cmucal-node.c:123-154, 471-478, 581-585,
+	 * 671-672, 718, 927, 1160, 1169.
+	 */
+	cmu_usb: clock-controller@13030000 {
+		compatible = "samsung,exynos9610-cmu-usb";
+		reg = <0x0 0x13030000 0x8000>;
+		#clock-cells = <1>;
+		clocks = <&cmu_top CLK_TOP_GOUT_USB_USB30DRD>;
+		clock-names = "usb30drd";
+	};
+
+	/*
+	 * FSYS system controller: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:2612-2616.  Offset 0x1010 holds the UFS DMA coherency
+	 * bits used by the driver's "samsung,sysreg" property.
+	 */
+	sysreg_fsys: system-controller@13410000 {
+		compatible = "samsung,exynos9610-sysreg-fsys", "syscon";
+		reg = <0x0 0x13410000 0x1020>;
+	};
+
+	cmu_fsys: clock-controller@13400000 {
+		compatible = "samsung,exynos9610-cmu-fsys";
+		reg = <0x0 0x13400000 0x4000>;
+		#clock-cells = <1>;
+
+		clocks = <&oscclk_fsys>,
+			 <&cmu_top CLK_TOP_DOUT_FSYS_BUS>,
+			 <&cmu_top CLK_TOP_DOUT_FSYS_MMC_CARD>;
+		clock-names = "oscclk_fsys", "dout_fsys_bus",
+			      "dout_fsys_mmc_card";
+	};
+
+	/*
+	 * APM CMU and DLL rate register resources:
+	 * DOWNSTREAM_READONLY/drivers/soc/samsung/cal-if/exynos9610/
+	 * cmucal-sfr.c:11-40,1360-1404 and cal_data.c:351.
+	 */
+	cmu_apm: clock-controller@11800000 {
+		compatible = "samsung,exynos9610-cmu-apm";
+		reg = <0x0 0x11800000 0x8000>,
+		      <0x0 0x118b0000 0x1000>;
+		reg-names = "cmu", "dll";
+		#clock-cells = <1>;
+
+		clocks = <&oscclk_rco_apm>, <&cmu_top CLK_TOP_DOUT_APM_BUS>;
+		clock-names = "oscclk_rco_apm", "dout_apm_bus";
+	};
+
+	/*
+	 * CMGP CMU bus and PCLK gates:
+	 * DOWNSTREAM_READONLY/drivers/soc/samsung/cal-if/exynos9610/
+	 * cmucal-sfr.c:188, 193, 201 and cmucal-node.c:818, 880, 885, 893.
+	 */
+	cmu_cmgp: clock-controller@11c00000 {
+		compatible = "samsung,exynos9610-cmu-cmgp";
+		reg = <0x0 0x11c00000 0x8000>;
+		#clock-cells = <1>;
+
+		clocks = <&oscclk_rco_cmgp>, <&oscclk_cmgp>,
+			 <&cmu_apm CLK_APM_GOUT_CMGP_BUS>;
+		clock-names = "oscclk_rco_cmgp", "oscclk_cmgp",
+			      "clkcmu_cmgp_bus";
+	};
+
+	/*
+	 * Watchdogs.  DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:2839-2860 uses "samsung,exynos7-wdt" for WDT_CPUCL0
+	 * and "samsung,exynos8-wdt" for WDT_CPUCL1.  The reset source bit in
+	 * PMU RST_STAT is 23 for CPUCL0 and 24 for CPUCL1 (the vendor
+	 * drv_data_exynos7/drv_data_exynos8 mask_bit and rst_stat_bit), which
+	 * is the opposite of Exynos850 - hence a dedicated 9610 variant for
+	 * CPUCL1.
+	 */
+	/*
+	 * One TMU block carries four channels, each with its own set of
+	 * sensing points.  The vendor device tree exposes them as four
+	 * controllers at the same address selected by an "id" property; here
+	 * the block is described once and the zones pick a channel through
+	 * the #thermal-sensor-cells index.
+	 */
+	/*
+	 * The CPUCFG power gates live inside the PMU block (which is why the
+	 * vendor calls this PMUCAL), so this driver works through the PMU
+	 * syscon instead of mapping the block a second time.
+	 */
+	cpuhp: cpu-power {
+		compatible = "samsung,exynos9610-cpuhp";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		reg = <0x0 0x10800000 0x1000>;
+	};
+
+	tmu: thermal@10070000 {
+		compatible = "samsung,exynos9610-tmu";
+		reg = <0x0 0x10070000 0x700>;
+		interrupts = <GIC_SPI 231 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&cmu_peri CLK_PERI_GOUT_BUSIF_TMU_PCLK>;
+		clock-names = "tmu";
+		#thermal-sensor-cells = <1>;
+		samsung,tmu-default-temp-offset = <0>;
+	};
+
+	wdt_cluster0: watchdog@10050000 {
+		compatible = "samsung,exynos7-wdt";
+		reg = <0x0 0x10050000 0x100>;
+		interrupts = <GIC_SPI 232 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&cmu_peri CLK_PERI_GOUT_WDT_CLUSTER0_PCLK>, <&oscclk>;
+		clock-names = "watchdog", "watchdog_src";
+		samsung,syscon-phandle = <&pmu_system_controller>;
+		timeout-sec = <30>;
+	};
+
+	wdt_cluster1: watchdog@10060000 {
+		compatible = "samsung,exynos9610-wdt";
+		reg = <0x0 0x10060000 0x100>;
+		interrupts = <GIC_SPI 233 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&cmu_peri CLK_PERI_GOUT_WDT_CLUSTER1_PCLK>, <&oscclk>;
+		clock-names = "watchdog", "watchdog_src";
+		samsung,syscon-phandle = <&pmu_system_controller>;
+		timeout-sec = <30>;
+	};
+
+	/*
+	 * RTC: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/exynos9610.dts
+	 * "rtc@11A20000" uses "samsung,exynos8-rtc" with <0 29 0>,<0 30 0>
+	 * (alarm, tick) and no clock properties at all because the vendor driver
+	 * sets s3c_rtc_data.clock_ctrl_disable, leaving the PCLK always on.  The
+	 * register layout matches s3c6410; the 32.768 kHz reference comes from
+	 * the always-on oscillator, so only the APM RTC PCLK is wired here.
+	 */
+	rtc: rtc@11a20000 {
+		compatible = "samsung,exynos9610-rtc", "samsung,s3c6410-rtc";
+		reg = <0x0 0x11a20000 0x100>;
+		interrupts = <GIC_SPI 29 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&cmu_apm CLK_APM_GOUT_RTC_PCLK>;
+		clock-names = "rtc";
+	};
+
+	/*
+	 * PERI CMU base and bus-user mux:
+	 * DOWNSTREAM_READONLY/drivers/soc/samsung/cal-if/exynos9610/
+	 * cmucal-sfr.c:11-30, 1080-1084, 4701-4703.
+	 */
+	cmu_peri: clock-controller@10030000 {
+		compatible = "samsung,exynos9610-cmu-peri";
+		reg = <0x0 0x10030000 0x8000>;
+		#clock-cells = <1>;
+
+		clocks = <&oscclk>, <&cmu_top CLK_TOP_DOUT_PERI_BUS>;
+		clock-names = "fin_pll", "dout_peri_bus";
+
+		/*
+		 * Downstream Android reports SPI1 at 79.95 MHz and USI_USI at
+		 * 199.875 MHz (from the 399.75 MHz PERI IP parent). Program
+		 * those functional dividers explicitly; they were previously
+		 * read-only and left at the boot value.
+		 */
+		assigned-clocks = <&cmu_peri CLK_PERI_DOUT_SPI1>,
+				  <&cmu_peri CLK_PERI_DOUT_USI_USI>;
+		assigned-clock-rates = <79950000>, <199875000>;
+	};
+
+	/*
+	 * CORE CMU base and bus-user/divider/PCLK registers:
+	 * DOWNSTREAM_READONLY/drivers/soc/samsung/cal-if/exynos9610/
+	 * cmucal-sfr.c:11-30, 393-395, 440.
+	 */
+	cmu_core: clock-controller@120f0000 {
+		compatible = "samsung,exynos9610-cmu-core";
+		reg = <0x0 0x120f0000 0x8000>;
+		#clock-cells = <1>;
+
+		clocks = <&oscclk>, <&cmu_top CLK_TOP_DOUT_CORE_BUS>;
+		clock-names = "fin_pll", "dout_core_bus";
+	};
+
+	/*
+	 * I2C0 is the legacy S3C2440-compatible controller at 0x13830000.
+	 * The address, SPI 247, compatible, and 400 kHz limit match the live
+	 * A51 tree; use the supported mainline "i2c" clock name.
+	 */
+	i2c_0: i2c@13830000 {
+		compatible = "samsung,s3c2440-i2c";
+		reg = <0x0 0x13830000 0x100>;
+		interrupts = <GIC_SPI 247 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		clocks = <&cmu_peri CLK_PERI_I2C_0_QCH>;
+		clock-names = "i2c";
+		samsung,i2c-max-bus-freq = <400000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c0_bus>;
+
+		status = "okay";
+	};
+
+	/*
+	 * Multi Core Timer: live A51 node
+	 * notes/device-dump/20261026-1937/live-device-tree.dts:40-59.
+	 * The vendor exposes four global and eight local timer interrupts;
+	 * mainline needs the explicit CPU-to-local-timer mapping.
+	 */
+	mct: timer@10040000 {
+		compatible = "samsung,exynos4210-mct";
+		reg = <0x0 0x10040000 0x800>;
+		interrupts = <GIC_SPI 234 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 235 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 236 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 237 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 238 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 239 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 240 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 241 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 242 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 243 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 244 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 245 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&oscclk>, <&cmu_peri CLK_PERI_GOUT_MCT_PCLK>;
+		clock-names = "fin_pll", "mct";
+		samsung,local-timers = <0 1 2 3 4 5 6 7>;
+	};
+
+	speedy: i2c@11a10000 {
+		compatible = "samsung,exynos-speedy";
+		reg = <0x0 0x11a10000 0x2000>;
+		interrupts = <GIC_SPI 37 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		clocks = <&cmu_apm CLK_APM_GOUT_SPEEDY_APM_QCH>;
+		clock-names = "speedy";
+		pinctrl-names = "default";
+		pinctrl-0 = <&speedy_bus>;
+		status = "disabled";
+	};
+
+	/*
+	 * CPU topology and MPIDRs:
+	 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+	 */
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		/*
+		 * CPU-map grouping:
+		 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+		 */
+		cpu-map {
+			/*
+			 * Cortex-A53 MPIDRs 0-3:
+			 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+			 */
+			cluster0 {
+				/*
+				 * MPIDR 0 map entry:
+				 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+				 */
+				core0 {
+					cpu = <&cpu0>;
+				};
+				/*
+				 * MPIDR 1 map entry:
+				 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+				 */
+				core1 {
+					cpu = <&cpu1>;
+				};
+				/*
+				 * MPIDR 2 map entry:
+				 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+				 */
+				core2 {
+					cpu = <&cpu2>;
+				};
+				/*
+				 * MPIDR 3 map entry:
+				 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+				 */
+				core3 {
+					cpu = <&cpu3>;
+				};
+			};
+
+			/*
+			 * Cortex-A73 MPIDRs 0x100-0x103:
+			 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+			 */
+			cluster1 {
+				/*
+				 * MPIDR 0x100 map entry:
+				 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+				 */
+				core0 {
+					cpu = <&cpu4>;
+				};
+				/*
+				 * MPIDR 0x101 map entry:
+				 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+				 */
+				core1 {
+					cpu = <&cpu5>;
+				};
+				/*
+				 * MPIDR 0x102 map entry:
+				 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+				 */
+				core2 {
+					cpu = <&cpu6>;
+				};
+				/*
+				 * MPIDR 0x103 map entry:
+				 * notes/device-dump/20261026-1937/live-device-tree.dts:9146-9382.
+				 */
+				core3 {
+					cpu = <&cpu7>;
+				};
+			};
+		};
+
+		/*
+		 * MPIDR 0, Cortex-A53:
+		 * notes/device-dump/20261026-1937/live-device-tree.dts:9361-9370.
+		 */
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53", "arm,armv8";
+			reg = <0x0 0x0>;
+			enable-method = "psci";
+		};
+
+		/*
+		 * MPIDR 1, Cortex-A53:
+		 * notes/device-dump/20261026-1937/live-device-tree.dts:9189-9198.
+		 */
+		cpu1: cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53", "arm,armv8";
+			reg = <0x0 0x1>;
+			enable-method = "psci";
+		};
+
+		/*
+		 * MPIDR 2, Cortex-A53:
+		 * notes/device-dump/20261026-1937/live-device-tree.dts:9350-9359.
+		 */
+		cpu2: cpu@2 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53", "arm,armv8";
+			reg = <0x0 0x2>;
+			enable-method = "psci";
+		};
+
+		/*
+		 * MPIDR 3, Cortex-A53:
+		 * notes/device-dump/20261026-1937/live-device-tree.dts:9161-9170.
+		 */
+		cpu3: cpu@3 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53", "arm,armv8";
+			reg = <0x0 0x3>;
+			enable-method = "psci";
+		};
+
+		/*
+		 * MPIDR 0x100, Cortex-A73:
+		 * notes/device-dump/20261026-1937/live-device-tree.dts:9339-9348.
+		 */
+		cpu4: cpu@100 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a73", "arm,armv8";
+			reg = <0x0 0x100>;
+			enable-method = "psci";
+		};
+
+		/*
+		 * MPIDR 0x101, Cortex-A73:
+		 * notes/device-dump/20261026-1937/live-device-tree.dts:9150-9159.
+		 */
+		cpu5: cpu@101 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a73", "arm,armv8";
+			reg = <0x0 0x101>;
+			enable-method = "psci";
+		};
+
+		/*
+		 * MPIDR 0x102, Cortex-A73:
+		 * notes/device-dump/20261026-1937/live-device-tree.dts:9328-9337.
+		 */
+		cpu6: cpu@102 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a73", "arm,armv8";
+			reg = <0x0 0x102>;
+			enable-method = "psci";
+		};
+
+		/*
+		 * MPIDR 0x103, Cortex-A73:
+		 * notes/device-dump/20261026-1937/live-device-tree.dts:9372-9381.
+		 */
+		cpu7: cpu@103 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a73", "arm,armv8";
+			reg = <0x0 0x103>;
+			enable-method = "psci";
+		};
+	};
+
+	/*
+	 * PSCI method and IDs: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:380-386 and
+	 * notes/device-dump/20261026-1937/live-device-tree.dts:5088-5093.
+	 */
+	psci {
+		compatible = "arm,psci";
+		method = "smc";
+		cpu_suspend = <0xc4000001>;
+		cpu_off = <0x84000002>;
+		cpu_on = <0xc4000003>;
+	};
+
+	/*
+	 * GIC compatible, ranges, and maintenance PPI:
+	 * notes/device-dump/20261026-1937/live-device-tree.dts:3086-3094.
+	 * The vendor register ranges are also in
+	 * DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/exynos9610.dts:585-595.
+	 */
+	gic: interrupt-controller@12301000 {
+		compatible = "arm,gic-400";
+		#interrupt-cells = <3>;
+		#address-cells = <0>;
+		interrupt-controller;
+		reg = <0x0 0x12301000 0x1000>,
+		      <0x0 0x12302000 0x1000>,
+		      <0x0 0x12304000 0x2000>,
+		      <0x0 0x12306000 0x2000>;
+		interrupts = <GIC_PPI 9
+			      (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_HIGH)>;
+	};
+
+	/*
+	 * ARMv8 timer PPIs: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:597-606 and
+	 * notes/device-dump/20261026-1937/live-device-tree.dts:7447-7452.
+	 */
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <GIC_PPI 13
+			      (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 14
+			      (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 11
+			      (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 10
+			      (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>;
+	};
+
+	/*
+	 * ALIVE range: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:701-715.
+	 */
+	pinctrl_alive: pinctrl@11850000 {
+		compatible = "samsung,exynos9610-pinctrl";
+		reg = <0x0 0x11850000 0x1000>;
+
+		/* Bank names: DOWNSTREAM_READONLY/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c:429-435. */
+		etc0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		/*
+		 * Kept a plain gpio-controller: declaring the EINT domain here made
+		 * the touchscreen on i2c-4 defer forever (see notes), so the driver
+		 * polls until that is understood.
+		 */
+		gpa0: gpa0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+		gpa1: gpa1-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 12 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 15 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		gpa2: gpa2-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupts = <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 18 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 22 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 23 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		gpq0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		speedy_bus: speedy-bus-pins {
+			/* Downstream exynos9610-pinctrl.dtsi:78-83. */
+			samsung,pins = "gpq0-2";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <3>;
+			samsung,pin-drv = <0>;
+		};
+
+		wakeup-interrupt-controller {
+			compatible = "samsung,exynos9610-wakeup-eint";
+		};
+
+		/*
+		 * A51 microSD tray card-detect pin:
+		 * DOWNSTREAM_READONLY/arch/arm64/boot/dts/samsung/
+		 * exynos9611-a51_common.dtsi:1117-1122.
+		 */
+		dwmmc2_cd_ext_irq: dwmmc2-cd-ext-irq-pins {
+			samsung,pins = "gpa2-4";
+			samsung,pin-function = <0xf>;
+			samsung,pin-pud = <0>;
+			samsung,pin-drv = <3>;
+		};
+	};
+
+	/*
+	 * CMGP range: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:717-732.
+	 */
+	pinctrl_cmgp: pinctrl@11c20000 {
+		compatible = "samsung,exynos9610-pinctrl";
+		reg = <0x0 0x11c20000 0x1000>;
+
+		/* Bank names: DOWNSTREAM_READONLY/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c:438-466. */
+		gpm0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm1-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm2-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm3-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm4-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm5-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm6-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm7-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm8-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm9-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm10-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm11-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm12-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm13-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm14-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm15-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm16-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm17-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm18-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm19-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm20-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm21-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm22-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm23-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm24-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpm25-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+
+	/*
+	 * DISPAUD range: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:734-738.
+	 */
+	pinctrl_dispaud: pinctrl@14a60000 {
+		compatible = "samsung,exynos9610-pinctrl";
+		reg = <0x0 0x14a60000 0x1000>;
+
+		/* Bank names: DOWNSTREAM_READONLY/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c:469-473. */
+		gpb0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpb1-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpb2-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+
+	/*
+	 * FSYS range: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:740-745.
+	 */
+	pinctrl_fsys: pinctrl@13490000 {
+		compatible = "samsung,exynos9610-pinctrl";
+		reg = <0x0 0x13490000 0x1000>;
+
+		/* Bank names: DOWNSTREAM_READONLY/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c:476-480. */
+		gpf0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpf1-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpf2-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		/*
+		 * A51 microSD signals: DOWNSTREAM_READONLY/arch/arm64/boot/dts/
+		 * exynos/exynos9610-pinctrl.dtsi:800-825.
+		 */
+		sd2_clk: sd2-clk-pins {
+			samsung,pins = "gpf2-0";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <0>;
+			samsung,pin-drv = <4>;
+		};
+
+		sd2_cmd: sd2-cmd-pins {
+			samsung,pins = "gpf2-1";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <3>;
+			samsung,pin-drv = <4>;
+		};
+
+		sd2_bus1: sd2-bus-width1-pins {
+			samsung,pins = "gpf2-2";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <3>;
+			samsung,pin-drv = <4>;
+		};
+
+		sd2_bus4: sd2-bus-width4-pins {
+			samsung,pins = "gpf2-3", "gpf2-4", "gpf2-5";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <3>;
+			samsung,pin-drv = <4>;
+		};
+
+		/* UFS reset (gpf0-1) and reference clock out (gpf0-0). */
+		ufs_rst_n: ufs-rst-n {
+			samsung,pins = "gpf0-1";
+			samsung,pin-function = <3>;
+			samsung,pin-pud = <0>;
+			samsung,pin-con-pdn = <3>;
+		};
+
+		ufs_refclk_out: ufs-refclk-out {
+			samsung,pins = "gpf0-0";
+			samsung,pin-function = <3>;
+			samsung,pin-pud = <0>;
+			samsung,pin-con-pdn = <3>;
+		};
+	};
+
+	/*
+	 * TOP range: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:747-752.
+	 */
+	pinctrl_top: pinctrl@139b0000 {
+		compatible = "samsung,exynos9610-pinctrl";
+		reg = <0x0 0x139b0000 0x1000>;
+
+		/* Bank names: DOWNSTREAM_READONLY/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c:483-495. */
+		gpp0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpp1-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpp2-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpc0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpc1-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpc2-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpg0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpg1: gpg1-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpg2: gpg2-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpg3: gpg3-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gpg4: gpg4-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		/*
+		 * Vendor A51 I2C0 pinmux:
+		 * DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+		 * exynos9610-pinctrl.dtsi:1097-1102.
+		 * This group is not selected until an I2C0 consumer requests it.
+		 */
+		i2c0_bus: i2c0-bus-pins {
+			samsung,pins = "gpp0-1", "gpp0-0";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <0>;
+			samsung,pin-drv = <0>;
+		};
+
+		i2c1_bus: i2c1-bus-pins {
+			samsung,pins = "gpp0-3", "gpp0-2";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <0>;
+			samsung,pin-drv = <0>;
+		};
+
+		i2c2_bus: i2c2-bus-pins {
+			samsung,pins = "gpp0-5", "gpp0-4";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <0>;
+			samsung,pin-drv = <0>;
+		};
+
+		i2c3_bus: i2c3-bus-pins {
+			samsung,pins = "gpp0-7", "gpp0-6";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <0>;
+			samsung,pin-drv = <0>;
+		};
+
+		i2c4_bus: i2c4-bus-pins {
+			samsung,pins = "gpp1-1", "gpp1-0";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <0>;
+			samsung,pin-drv = <0>;
+		};
+
+		i2c5_bus: i2c5-bus-pins {
+			samsung,pins = "gpp1-3", "gpp1-2";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <0>;
+			samsung,pin-drv = <0>;
+		};
+
+		i2c6_bus: i2c6-bus-pins {
+			samsung,pins = "gpp1-5", "gpp1-4";
+			samsung,pin-function = <2>;
+			samsung,pin-pud = <0>;
+			samsung,pin-drv = <0>;
+		};
+	};
+
+	/*
+	 * SHUB range: DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:754-759.
+	 */
+	pinctrl_shub: pinctrl@11080000 {
+		compatible = "samsung,exynos9610-pinctrl";
+		reg = <0x0 0x11080000 0x1000>;
+
+		/* Bank names: DOWNSTREAM_READONLY/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c:499-507. */
+		gph0-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		gph1-gpio-bank {
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+
+	/*
+	 * Legacy (s3c2440-style) I2C controllers.  Addresses, interrupts and pin
+	 * groups come from DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+	 * exynos9610.dts:1667+ and exynos9610-pinctrl.dtsi:1083-1141.  The
+	 * controller clock is the PERI PCLK gate, as in the vendor tree and in
+	 * exynos7870.dtsi (the driver derives its clock divider from it).
+	 */
+	i2c_1: i2c@13840000 {
+		compatible = "samsung,exynos9610-i2c", "samsung,s3c2440-i2c";
+		reg = <0x0 0x13840000 0x100>;
+		interrupts = <GIC_SPI 248 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		samsung,i2c-sda-delay = <100>;
+		samsung,i2c-max-bus-freq = <100000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c1_bus>;
+		clock-names = "i2c";
+		clocks = <&cmu_peri CLK_PERI_I2C_1_QCH>;
+		status = "disabled";
+	};
+
+	i2c_2: i2c@13850000 {
+		compatible = "samsung,exynos9610-i2c", "samsung,s3c2440-i2c";
+		reg = <0x0 0x13850000 0x100>;
+		interrupts = <GIC_SPI 249 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		samsung,i2c-sda-delay = <100>;
+		samsung,i2c-max-bus-freq = <100000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c2_bus>;
+		clock-names = "i2c";
+		clocks = <&cmu_peri CLK_PERI_I2C_2_QCH>;
+		status = "disabled";
+	};
+
+	i2c_3: i2c@13860000 {
+		compatible = "samsung,exynos9610-i2c", "samsung,s3c2440-i2c";
+		reg = <0x0 0x13860000 0x100>;
+		interrupts = <GIC_SPI 250 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		samsung,i2c-sda-delay = <100>;
+		samsung,i2c-max-bus-freq = <100000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c3_bus>;
+		clock-names = "i2c";
+		clocks = <&cmu_peri CLK_PERI_I2C_3_QCH>;
+		status = "disabled";
+	};
+
+	i2c_4: i2c@13870000 {
+		compatible = "samsung,exynos9610-i2c", "samsung,s3c2440-i2c";
+		reg = <0x0 0x13870000 0x100>;
+		interrupts = <GIC_SPI 251 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		samsung,i2c-sda-delay = <100>;
+		samsung,i2c-max-bus-freq = <100000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c4_bus>;
+		clock-names = "i2c";
+		clocks = <&cmu_peri CLK_PERI_I2C_4_QCH>;
+		status = "disabled";
+	};
+
+	i2c_5: i2c@13880000 {
+		compatible = "samsung,exynos9610-i2c", "samsung,s3c2440-i2c";
+		reg = <0x0 0x13880000 0x100>;
+		interrupts = <GIC_SPI 252 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		samsung,i2c-sda-delay = <100>;
+		samsung,i2c-max-bus-freq = <100000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c5_bus>;
+		clock-names = "i2c";
+		clocks = <&cmu_peri CLK_PERI_I2C_5_QCH>;
+		status = "disabled";
+	};
+
+	i2c_6: i2c@13890000 {
+		compatible = "samsung,exynos9610-i2c", "samsung,s3c2440-i2c";
+		reg = <0x0 0x13890000 0x100>;
+		interrupts = <GIC_SPI 253 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		samsung,i2c-sda-delay = <100>;
+		samsung,i2c-max-bus-freq = <100000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c6_bus>;
+		clock-names = "i2c";
+		clocks = <&cmu_peri CLK_PERI_I2C_6_QCH>;
+		status = "disabled";
+	};
+
+	/*
+	 * Display processing unit, "DPU 2.0".  Addresses and the window 0
+	 * IDMA channel mapping are from
+	 * DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/exynos9610.dts:2890-2996
+	 * and were confirmed against the live register state of the running
+	 * pipeline: DECON window 0 is fed by IDMA G0 at 0x14881000.
+	 *
+	 * Only the blocks the Linux handoff driver takes over are described:
+	 * DSIM, the DSI PHY and the panel stay under boot chain control.
+	 */
+	/*
+	 * SYSREG_DISPAUD: display subsystem glue registers.  Bit 0/1 of the
+	 * MIPI PHY control register at +0x8 hold the M4S4 D-PHY resets and
+	 * bit 4/5 select whether DSIM or the SYSREG drives them.
+	 */
+	disp_ss: syscon@14811000 {
+		compatible = "samsung,exynos9-disp_ss", "syscon";
+		reg = <0x0 0x14811000 0x10>;
+	};
+
+	/*
+	 * MIPI DSIM master.  The Samsung boot chain brings this link up (PLL,
+	 * D-PHY, command mode) before Linux starts; until the mainline driver
+	 * learns to do that itself it only reads the inherited state.
+	 */
+	dsim: dsi@148e0000 {
+		compatible = "samsung,exynos9610-dsim";
+		reg = <0x0 0x148e0000 0x100>;
+		interrupts = <GIC_SPI 204 IRQ_TYPE_LEVEL_HIGH>;
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		samsung,disp-sysreg = <&disp_ss>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	/*
+	 * Mali-G72 power domain (vendor DT: pd-g3d@11864060, i.e. PMU + 0x4060).
+	 * The domain is secure-world managed: every transition has to be wrapped
+	 * in the vendor's TZPC save/restore SMC or the interconnect answers with a
+	 * SError (see notes/gpu.md).  The vendor also keeps PLL_G3D running and
+	 * only stops clocks, so the driver restores the CMU_G3D register file on
+	 * power-up.
+	 */
+	pd_g3d: power-domain@11860000 {
+		compatible = "samsung,exynos9610-g3d-pd";
+		reg = <0x0 0x11860000 0x8000>,	/* PMU */
+		      <0x0 0x11430000 0x4000>,	/* CMU_G3D */
+		      <0x0 0x11410000 0x1000>;	/* CMU_PWR (LPP/DRCG) */
+		reg-names = "pmu", "cmu-g3d", "cmu-pwr";
+		#power-domain-cells = <0>;
+	};
+
+	decon: display-controller@148b0000 {
+		compatible = "samsung,exynos9610-decon";
+		reg = <0x0 0x148b0000 0x10000>,
+		      <0x0 0x14881000 0x1000>;
+		reg-names = "decon", "idma";
+		/*
+		 * SPI 199 is frame start, 203 the error/timeout summary, 266 the
+		 * panel TE (the same signal the vendor wires to DECON's hardware
+		 * trigger): the panel tells us when it is ready for a new frame.
+		 */
+		interrupts = <GIC_SPI 200 IRQ_TYPE_LEVEL_HIGH>,	/* frame done */
+			     <GIC_SPI 266 IRQ_TYPE_LEVEL_HIGH>;	/* panel TE */
+		interrupt-names = "done", "te";
+		samsung,dsi-controller = <&dsim>;
+		status = "disabled";
+	};
+
+	/*
+	 * Mali-G72 MP3.  Panfrost builds its page tables with the GPU's own MMU
+	 * (io-pgtable), so no system MMU is needed here - the vendor device tree
+	 * has none either.  Power domain and clocks are still inherited from the
+	 * boot loader: pd-g3d sits at PMU+0x4060 and the G3D CMU gates are not
+	 * modelled yet, so a fixed clock reports the nominal rate until they are.
+	 */
+	gpu_clk: gpu-clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <1053000000>;
+	};
+
+	gpu: gpu@11500000 {
+		compatible = "arm,mali-bifrost";
+		reg = <0x0 0x11500000 0x5000>;
+		interrupts = <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>,	/* GPU */
+			     <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>,	/* JOB */
+			     <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH>;	/* MMU */
+		interrupt-names = "gpu", "job", "mmu";
+		clocks = <&gpu_clk>;
+		status = "okay";
+		power-domains = <&pd_g3d>;
+	};
+};

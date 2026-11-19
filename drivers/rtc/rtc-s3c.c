@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/of.h>
 #include <linux/uaccess.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 
 #include <asm/irq.h>
@@ -48,6 +49,8 @@ struct s3c_rtc {
 
 struct s3c_rtc_data {
 	bool needs_src_clk;
+	/* keep the bus clock running instead of gating it per access */
+	bool keep_clk_enabled;
 
 	void (*irq_handler) (struct s3c_rtc *info, int mask);
 	void (*enable) (struct s3c_rtc *info);
@@ -57,6 +60,9 @@ struct s3c_rtc_data {
 static int s3c_rtc_enable_clk(struct s3c_rtc *info)
 {
 	int ret;
+
+	if (info->data->keep_clk_enabled)
+		return 0;
 
 	ret = clk_enable(info->rtc_clk);
 	if (ret)
@@ -74,6 +80,9 @@ static int s3c_rtc_enable_clk(struct s3c_rtc *info)
 
 static void s3c_rtc_disable_clk(struct s3c_rtc *info)
 {
+	if (info->data->keep_clk_enabled)
+		return;
+
 	if (info->data->needs_src_clk)
 		clk_disable(info->rtc_src_clk);
 	clk_disable(info->rtc_clk);
@@ -385,7 +394,7 @@ static void s3c_rtc_remove(struct platform_device *pdev)
 static int s3c_rtc_probe(struct platform_device *pdev)
 {
 	struct s3c_rtc *info = NULL;
-	int ret;
+	int ret, retry;
 
 	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
 	if (!info)
@@ -439,6 +448,30 @@ static int s3c_rtc_probe(struct platform_device *pdev)
 	/* check to see if everything is setup correctly */
 	if (info->data->enable)
 		info->data->enable(info);
+
+	/*
+	 * The BCD image is not trustworthy for a while after RTCEN has been
+	 * toggled by the sequence above: Exynos9610 returns an all-zero date
+	 * until the 32.768 kHz divider has settled, which makes the RTC core
+	 * hctosys() read fail early in boot.  Wait for the first consistent
+	 * read instead of registering a device that cannot be read yet.  The
+	 * window is usually around a second but has been observed longer, so
+	 * allow up to 3 s and report how long it actually took.
+	 */
+	for (retry = 0; retry < 150; retry++) {
+		struct rtc_time tm;
+
+		if (!s3c_rtc_read_time(info, &tm)) {
+			tm.tm_year += 100;
+			tm.tm_mon -= 1;
+			if (!rtc_valid_tm(&tm))
+				break;
+		}
+		msleep(20);
+	}
+
+	if (retry)
+		dev_info(&pdev->dev, "RTC settled after %d ms\n", retry * 20);
 
 	dev_dbg(&pdev->dev, "s3c2410_rtc: RTCCON=%02x\n",
 		readw(info->base + S3C2410_RTCCON));
@@ -538,6 +571,21 @@ static const struct s3c_rtc_data s3c6410_rtc_data = {
 	.disable		= s3c6410_rtc_disable,
 };
 
+/*
+ * Exynos9610 keeps the s3c6410 register layout but derives the 32.768 kHz
+ * reference from its always-on oscillator, so there is no gateable source
+ * clock.  The bus clock is enabled once and left running: the RTC lives in
+ * the always-on APM block that the ACPM firmware also reaches, so gating the
+ * clock around every access can make that access time out and reset the SoC.
+ * The vendor driver does the same (s3c_rtc_data.clock_ctrl_disable).
+ */
+static const struct s3c_rtc_data exynos9610_rtc_data = {
+	.keep_clk_enabled	= true,
+	.irq_handler		= s3c6410_rtc_irq,
+	.enable			= s3c6410_rtc_enable,
+	.disable		= s3c6410_rtc_disable,
+};
+
 static const __maybe_unused struct of_device_id s3c_rtc_dt_match[] = {
 	{
 		.compatible = "samsung,s3c6410-rtc",
@@ -545,6 +593,9 @@ static const __maybe_unused struct of_device_id s3c_rtc_dt_match[] = {
 	}, {
 		.compatible = "samsung,exynos3250-rtc",
 		.data = &s3c6410_rtc_data,
+	}, {
+		.compatible = "samsung,exynos9610-rtc",
+		.data = &exynos9610_rtc_data,
 	},
 	{ /* sentinel */ },
 };

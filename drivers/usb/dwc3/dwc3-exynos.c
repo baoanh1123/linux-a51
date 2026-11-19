@@ -45,6 +45,8 @@ static int dwc3_exynos_probe(struct platform_device *pdev)
 	const struct dwc3_exynos_driverdata *driver_data;
 	int			i, ret;
 
+	dev_info(dev, "dwc3-exynos probe\n");
+
 	exynos = devm_kzalloc(dev, sizeof(*exynos), GFP_KERNEL);
 	if (!exynos)
 		return -ENOMEM;
@@ -181,6 +183,12 @@ static const struct dwc3_exynos_driverdata exynos850_drvdata = {
 	.suspend_clk_idx = -1,
 };
 
+static const struct dwc3_exynos_driverdata exynos9610_drvdata = {
+	.clk_names = { "hsdrd" },
+	.num_clks = 1,
+	.suspend_clk_idx = -1,
+};
+
 static const struct dwc3_exynos_driverdata gs101_drvdata = {
 	.clk_names = { "bus_early", "susp_clk", "link_aclk", "link_pclk" },
 	.num_clks = 4,
@@ -212,6 +220,9 @@ static const struct of_device_id exynos_dwc3_match[] = {
 	}, {
 		.compatible = "samsung,exynos850-dwusb3",
 		.data = &exynos850_drvdata,
+	}, {
+		.compatible = "samsung,exynos9610-dwusb3",
+		.data = &exynos9610_drvdata,
 	}, {
 		.compatible = "samsung,exynosautov920-dwusb3",
 		.data = &exynosautov920_drvdata,

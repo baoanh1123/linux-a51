@@ -34,6 +34,7 @@ properties:
           - samsung,s5pv210-wakeup-eint
           - samsung,exynos4210-wakeup-eint
           - samsung,exynos7-wakeup-eint
+          - samsung,exynos9610-wakeup-eint
           - samsung,exynosautov920-wakeup-eint
       - items:
           - enum:

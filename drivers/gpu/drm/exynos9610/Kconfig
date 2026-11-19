@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config DRM_EXYNOS9610
+	tristate "DRM Support for Samsung Exynos 9610/9611 DPU 2.0"
+	depends on DRM && OF && ARM64
+	select DRM_CLIENT_SELECTION
+	select DRM_GEM_DMA_HELPER
+	select DRM_KMS_HELPER
+	select VIDEOMODE_HELPERS
+	help
+	  DRM/KMS driver for the display processing unit (DPU 2.0,
+	  "exynos9-decon") found in the Samsung Exynos 9610/9611 SoCs.
+
+	  The driver takes over the display pipeline that the Samsung boot
+	  chain already initialised through uniLoader: DECON and its IDMA
+	  channel are reprogrammed to scan out a kernel framebuffer while
+	  DSIM and the panel keep running untouched.
+
+	  If M is selected the module will be called exynos9610_dpu.
+
+config DRM_EXYNOS9610_DSIM
+	tristate "Samsung Exynos 9610/9611 DSIM (MIPI DSI master) support"
+	depends on OF && ARM64 && DRM_EXYNOS9610
+	default DRM_EXYNOS9610
+	select DRM_MIPI_DSI
+	help
+	  MIPI DSIM (DSI master) support for the Samsung Exynos 9610/9611
+	  SoCs, in handoff mode: the Samsung boot loader initialises the link
+	  and the D-PHY, and this driver keeps that configuration while
+	  providing a MIPI DSI host for the panel driver, plus DCS read/write
+	  and link debug helpers.
+
+	  If M is selected the module will be called exynos9610_dsim.

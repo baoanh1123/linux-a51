@@ -10,6 +10,11 @@
 
 #define SDMMC_CLKSEL			0x09C
 #define SDMMC_CLKSEL64			0x0A8
+#define SDMMC_FORCE_CLK_STOP		0x0B0
+#define SDMMC_AXI_BURST_LEN		0x0B4
+
+#define SDMMC_SAMPLE_PATH_SEL		BIT(31)
+#define SDMMC_HWACG_CONTROL		BIT(4)
 
 /* Extended Register's Offset */
 #define SDMMC_HS400_DQS_EN		0x180

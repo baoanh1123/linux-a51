@@ -889,9 +889,14 @@ try_again:
 	 * the CCS bit is set as well. We deliberately deviate from the spec in
 	 * regards to this, which allows UHS-I to be supported for SDSC cards.
 	 */
+	pr_info("%s: SD get_cid ocr=%#x rocr=%#x can_uhs=%d caps=%#x\n",
+		mmc_hostname(host), ocr, rocr ? *rocr : 0,
+		mmc_host_can_uhs(host), host->caps);
 	if (!mmc_host_is_spi(host) && (ocr & SD_OCR_S18R) &&
 	    rocr && (*rocr & SD_ROCR_S18A)) {
 		err = mmc_set_uhs_voltage(host, pocr);
+		pr_info("%s: SD UHS voltage switch err=%d\n",
+			mmc_hostname(host), err);
 		if (err == -EAGAIN) {
 			retries--;
 			goto try_again;
@@ -902,6 +907,8 @@ try_again:
 	}
 
 	err = mmc_send_cid(host, cid);
+	if (err)
+		pr_info("%s: SD send_cid err=%d\n", mmc_hostname(host), err);
 	return err;
 }
 
@@ -912,6 +919,7 @@ int mmc_sd_get_csd(struct mmc_card *card, bool is_sduc)
 	/*
 	 * Fetch CSD from card.
 	 */
+	mmc_delay(10);
 	err = mmc_send_csd(card, card->raw_csd);
 	if (err)
 		return err;
@@ -953,8 +961,11 @@ int mmc_sd_setup_card(struct mmc_host *host, struct mmc_card *card,
 		 * Fetch SCR from card.
 		 */
 		err = mmc_app_send_scr(card);
-		if (err)
+		if (err) {
+			pr_info("%s: SD app_send_scr err=%d\n",
+				mmc_hostname(host), err);
 			return err;
+		}
 
 		err = mmc_decode_scr(card);
 		if (err)
@@ -1492,9 +1503,13 @@ retry:
 	 * Select card, as all following commands rely on that.
 	 */
 	if (!mmc_host_is_spi(host)) {
+		mmc_delay(10);
 		err = mmc_select_card(card);
-		if (err)
+		if (err) {
+			pr_info("%s: SD select_card err=%d\n",
+				mmc_hostname(host), err);
 			goto free_card;
+		}
 	}
 
 	/* Apply quirks prior to card setup */
@@ -1503,6 +1518,21 @@ retry:
 	err = mmc_sd_setup_card(host, card, oldcard != NULL);
 	if (err)
 		goto free_card;
+
+	pr_info("%s: SD v18=%d can_uhs=%d signal=%d\n",
+		mmc_hostname(host), mmc_sd_card_using_v18(card),
+		mmc_host_can_uhs(host), host->ios.signal_voltage);
+
+	/*
+	 * Bring-up diagnostic: explicitly set the block length before block
+	 * I/O, in case this card does not default to 512 bytes.
+	 */
+	err = mmc_set_blocklen(card, 512);
+	if (err) {
+		pr_err("%s: failed to set block length: %d\n",
+		       mmc_hostname(host), err);
+		goto free_card;
+	}
 
 	/*
 	 * If the card has not been power cycled, it may still be using 1.8V

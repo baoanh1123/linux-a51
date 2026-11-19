@@ -75,4 +75,32 @@ config SAMSUNG_PM_CHECK_CHUNKSIZE
 config EXYNOS_REGULATOR_COUPLER
 	bool "Exynos SoC Regulator Coupler" if COMPILE_TEST
 	depends on ARCH_EXYNOS || COMPILE_TEST
+
+config EXYNOS9611_MSHC_SNAPSHOT
+	bool "Exynos9611 MSHC read-only snapshot diagnostic"
+	depends on ARCH_EXYNOS && COMMON_CLK && OF
+	help
+	  Enable a test-only, read-only register snapshot endpoint for the
+	  Exynos9611 MSHC. It enables the controller's bus clocks briefly,
+	  reads identification and clock-state registers, and exposes the
+	  captured values through a read-only misc device. It does not reset
+	  the controller or issue MMC/SD commands.
 endif
+
+config EXYNOS9610_CPUHP
+	bool "Exynos 9610/9611 CPU hotplug power sequencing"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	help
+	  Program the CPUCFG power gates around CPU hotplug on Samsung
+	  Exynos 9610/9611 SoCs.  The PSCI implementation of the bootloader
+	  cannot power a core back up after CPU_OFF, so the power gate has to
+	  be handled by Linux before PSCI is asked to start the core.
+
+config EXYNOS9610_G3D_PD
+	tristate "Exynos 9610 G3D power-domain experiment"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	help
+	  Experimental driver for the Mali-G72 power domain (PMU + 0x4060).
+	  It exposes debugfs knobs to power the domain down and back up with the
+	  vendor register sequences, so the sequence can be validated by hand
+	  before any device is attached to the domain.

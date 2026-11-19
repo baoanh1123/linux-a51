@@ -9,3 +9,13 @@ config EXYNOS_THERMAL
 	  the TMU, reports temperature and handles cooling action if defined.
 	  This driver uses the Exynos core thermal APIs and TMU configuration
 	  data from the supported SoCs.
+
+config EXYNOS9610_TMU
+	tristate "Samsung Exynos 9610/9611 TMU driver"
+	depends on THERMAL_OF
+	depends on HAS_IOMEM
+	help
+	  Support for the multi channel TMU block found on the Samsung
+	  Exynos 9610 and 9611 SoCs.  One thermal zone is registered per
+	  channel (BIG, LITTLE, G3D, ISP) and reports the hottest of its
+	  sensing points.

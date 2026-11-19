@@ -2814,7 +2814,13 @@ static int dwc3_gadget_soft_connect(struct dwc3 *dwc)
 
 	dwc3_event_buffers_setup(dwc);
 	__dwc3_gadget_start(dwc);
-	return dwc3_gadget_run_stop(dwc, true);
+	ret = dwc3_gadget_run_stop(dwc, true);
+	dev_info(dwc->dev, "soft_connect: ret=%d GCTL=%08x DCFG=%08x DCTL=%08x DSTS=%08x GUSB2PHYCFG0=%08x GUSB3PIPECTL0=%08x\n",
+		 ret, dwc3_readl(dwc, DWC3_GCTL), dwc3_readl(dwc, DWC3_DCFG),
+		 dwc3_readl(dwc, DWC3_DCTL), dwc3_readl(dwc, DWC3_DSTS),
+		 dwc3_readl(dwc, DWC3_GUSB2PHYCFG(0)),
+		 dwc3_readl(dwc, DWC3_GUSB3PIPECTL(0)));
+	return ret;
 }
 
 static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)

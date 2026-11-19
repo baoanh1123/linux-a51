@@ -541,6 +541,7 @@ exynos_pinctrl_set_eint_wakeup_mask(struct samsung_pinctrl_drv_data *drvdata,
 				    struct exynos_irq_chip *irq_chip)
 {
 	struct regmap *pmu_regs;
+	int ret;
 
 	if (!drvdata->retention_ctrl || !drvdata->retention_ctrl->priv) {
 		dev_warn(drvdata->dev,
@@ -550,11 +551,15 @@ exynos_pinctrl_set_eint_wakeup_mask(struct samsung_pinctrl_drv_data *drvdata,
 
 	pmu_regs = drvdata->retention_ctrl->priv;
 	dev_info(drvdata->dev,
-		 "Setting external wakeup interrupt mask: 0x%x\n",
-		 eint_wake_mask_values[0]);
+		 "Setting external wakeup interrupt mask at %#x: %#x\n",
+		 irq_chip->eint_wake_mask_reg, eint_wake_mask_values[0]);
 
-	regmap_write(pmu_regs, irq_chip->eint_wake_mask_reg,
-		     eint_wake_mask_values[0]);
+	ret = regmap_write(pmu_regs, irq_chip->eint_wake_mask_reg,
+			   eint_wake_mask_values[0]);
+	if (ret)
+		dev_err(drvdata->dev,
+			"Failed to set external wakeup interrupt mask at %#x: %d\n",
+			irq_chip->eint_wake_mask_reg, ret);
 }
 
 static void
@@ -638,6 +643,25 @@ static const struct exynos_irq_chip exynos7_wkup_irq_chip __initconst = {
 	.set_eint_wakeup_mask = exynos_pinctrl_set_eint_wakeup_mask,
 };
 
+static const struct exynos_irq_chip exynos9610_wkup_irq_chip __initconst = {
+	.chip = {
+		.name = "exynos9610_wkup_irq_chip",
+		.irq_unmask = exynos_irq_unmask,
+		.irq_mask = exynos_irq_mask,
+		.irq_ack = exynos_irq_ack,
+		.irq_set_type = exynos_irq_set_type,
+		.irq_set_wake = exynos_wkup_irq_set_wake,
+		.irq_request_resources = exynos_irq_request_resources,
+		.irq_release_resources = exynos_irq_release_resources,
+	},
+	.eint_con = EXYNOS7_WKUP_ECON_OFFSET,
+	.eint_mask = EXYNOS7_WKUP_EMASK_OFFSET,
+	.eint_pend = EXYNOS7_WKUP_EPEND_OFFSET,
+	.eint_num_wakeup_reg = 1,
+	.eint_wake_mask_reg = EXYNOS9610_EINT_WAKEUP_MASK,
+	.set_eint_wakeup_mask = exynos_pinctrl_set_eint_wakeup_mask,
+};
+
 static const struct exynos_irq_chip exynosautov920_wkup_irq_chip __initconst = {
 	.chip = {
 		.name = "exynosautov920_wkup_irq_chip",
@@ -677,6 +701,8 @@ static const struct exynos_irq_chip gs101_wkup_irq_chip __initconst = {
 static const struct of_device_id exynos_wkup_irq_ids[] = {
 	{ .compatible = "google,gs101-wakeup-eint",
 			.data = &gs101_wkup_irq_chip },
+	{ .compatible = "samsung,exynos9610-wakeup-eint",
+			.data = &exynos9610_wkup_irq_chip },
 	{ .compatible = "samsung,s5pv210-wakeup-eint",
 			.data = &s5pv210_wkup_irq_chip },
 	{ .compatible = "samsung,exynos4210-wakeup-eint",

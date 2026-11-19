@@ -283,6 +283,15 @@ config POWER_RESET_KEYSTONE
 	help
 	  Reboot support for the KEYSTONE SoCs.
 
+config POWER_RESET_EXYNOS9610
+	bool "Samsung Exynos 9610/9611 power off"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	select MFD_SYSCON
+	help
+	  Power off Exynos 9610/9611 boards by repeatedly pulling PS_HOLD low.
+	  The generic syscon-poweroff writes the register once, which the PMIC
+	  does not always latch, leaving the board powered.
+
 config POWER_RESET_SYSCON
 	bool "Generic SYSCON regmap reset driver"
 	depends on OF

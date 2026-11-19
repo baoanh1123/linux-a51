@@ -352,6 +352,11 @@ int mmc_app_send_scr(struct mmc_card *card)
 
 	kfree(scr);
 
+	if (cmd.error || data.error)
+		pr_info("%s: SCR read cmd_err=%d data_err=%d blksz=%u blocks=%u\n",
+			mmc_hostname(card->host), cmd.error, data.error,
+			data.blksz, data.blocks);
+
 	if (cmd.error)
 		return cmd.error;
 	if (data.error)
@@ -409,6 +414,11 @@ int mmc_app_sd_status(struct mmc_card *card, void *ssr)
 	mmc_set_data_timeout(&data, card);
 
 	mmc_wait_for_req(card->host, &mrq);
+
+	if (cmd.error || data.error)
+		pr_info("%s: SCR read cmd_err=%d data_err=%d blksz=%u blocks=%u\n",
+			mmc_hostname(card->host), cmd.error, data.error,
+			data.blksz, data.blocks);
 
 	if (cmd.error)
 		return cmd.error;

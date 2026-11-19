@@ -43,4 +43,18 @@ struct device;
 struct acpm_handle *devm_acpm_get_by_node(struct device *dev,
 					  struct device_node *np);
 
+/**
+ * acpm_do_cmd() - exchange one raw message with the ACPM firmware
+ * @handle: ACPM handle
+ * @acpm_chan_id: ACPM channel id
+ * @cmd: message words, also used for the response in place
+ * @words: number of 32-bit words in @cmd
+ *
+ * Sends @cmd to the firmware and waits for the reply, which is written back
+ * into @cmd.  The firmware expects the request words to start with a
+ * command-specific payload ({id, value, command, arg} for the DVFS channel).
+ */
+int acpm_do_cmd(struct acpm_handle *handle, unsigned int acpm_chan_id,
+		u32 *cmd, unsigned int words);
+
 #endif /* __EXYNOS_ACPM_PROTOCOL_H */

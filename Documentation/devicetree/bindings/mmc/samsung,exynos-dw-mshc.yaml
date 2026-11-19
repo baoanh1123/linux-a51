@@ -19,6 +19,7 @@ properties:
           - axis,artpec8-dw-mshc
           - samsung,exynos4210-dw-mshc
           - samsung,exynos4412-dw-mshc
+          - samsung,exynos9611-dw-mshc
           - samsung,exynos5250-dw-mshc
           - samsung,exynos5420-dw-mshc
           - samsung,exynos5420-dw-mshc-smu
@@ -42,15 +43,23 @@ properties:
     maxItems: 1
 
   clocks:
-    maxItems: 2
+    minItems: 2
+    maxItems: 4
     description:
       Handle to "biu" and "ciu" clocks for the
-      bus interface unit clock and the card interface unit clock.
+      bus interface unit clock and the card interface unit clock. Exynos9611
+      additionally requires the SDCLKIN and QCH clocks.
 
   clock-names:
-    items:
-      - const: biu
-      - const: ciu
+    oneOf:
+      - items:
+          - const: biu
+          - const: ciu
+      - items:
+          - const: biu
+          - const: ciu
+          - const: sdclkin
+          - const: qch
 
   samsung,dw-mshc-ciu-div:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -131,10 +140,28 @@ allOf:
             enum:
               - samsung,exynos5250-dw-mshc
               - samsung,exynos5420-dw-mshc
+              - samsung,exynos9611-dw-mshc
               - samsung,exynos7-dw-mshc
               - samsung,exynos7-dw-mshc-smu
               - axis,artpec8-dw-mshc
     then:
+      required:
+        - samsung,dw-mshc-ciu-div
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: samsung,exynos9611-dw-mshc
+    then:
+      properties:
+        clocks:
+          minItems: 4
+        clock-names:
+          items:
+            - const: biu
+            - const: ciu
+            - const: sdclkin
+            - const: qch
       required:
         - samsung,dw-mshc-ciu-div
 

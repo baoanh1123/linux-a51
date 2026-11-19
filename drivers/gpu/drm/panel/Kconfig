@@ -783,6 +783,16 @@ config DRM_PANEL_SAMSUNG_S6E3FA7
 	  Say Y here if you want to enable support for the Samsung S6E3FA7
 	  1920x2220 panel.
 
+config DRM_PANEL_SAMSUNG_EA8076
+	tristate "Samsung EA8076 AMOLED panel (Galaxy A51)"
+	depends on OF
+	depends on BACKLIGHT_CLASS_DEVICE
+	depends on DRM_MIPI_DSI
+	help
+	  Say Y here to enable the driver for the Samsung EA8076 AMOLED panel
+	  found in the Galaxy A51 (SM-A515F).  The panel runs in MIPI command
+	  mode and takes its brightness through DCS 0x51.
+
 config DRM_PANEL_SAMSUNG_S6D16D0
 	tristate "Samsung S6D16D0 DSI video mode panel"
 	depends on OF

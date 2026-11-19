@@ -24,6 +24,7 @@ properties:
           - samsung,exynos5250-wdt                # for Exynos5250
           - samsung,exynos5420-wdt                # for Exynos5420
           - samsung,exynos7-wdt                   # for Exynos7
+          - samsung,exynos9610-wdt                # for Exynos9610 CPUCL1
           - samsung,exynos850-wdt                 # for Exynos850
           - samsung,exynos990-wdt                 # for Exynos990
           - samsung,exynosautov9-wdt              # for Exynosautov9
@@ -77,6 +78,7 @@ allOf:
               - samsung,exynos5250-wdt
               - samsung,exynos5420-wdt
               - samsung,exynos7-wdt
+              - samsung,exynos9610-wdt
               - samsung,exynos850-wdt
               - samsung,exynos990-wdt
               - samsung,exynosautov9-wdt

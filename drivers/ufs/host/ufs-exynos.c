@@ -101,6 +101,8 @@
 #define UFS_GS101_RD_SHARABLE		BIT(0)
 #define UFS_GS101_SHARABLE		(UFS_GS101_WR_SHARABLE | \
 					 UFS_GS101_RD_SHARABLE)
+/* Exynos9610: downstream ufs-dma-coherency mask/val are BIT(8)|BIT(9) */
+#define UFS_EXYNOS9610_SHARABLE	(BIT(8) | BIT(9))
 #define UFS_SHAREABILITY_OFFSET		0x710
 
 /* Multi-host registers */
@@ -388,6 +390,119 @@ static int exynos7_ufs_post_link(struct exynos_ufs *ufs)
 	exynos_ufs_enable_dbg_mode(hba);
 	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_SAVECONFIGTIME), 0xbb8);
 	exynos_ufs_disable_dbg_mode(hba);
+
+	return 0;
+}
+
+/*
+ * Exynos9610 UIC/MIB programming for the pre-link and post-link steps.
+ *
+ * 9610 does not use the Exynos7 "override test mode" (PA_DBG_OV_TM) trick:
+ * the vendor CAL writes the UIC attributes from a plain table instead, and
+ * every PA_DBG_OV_TM write is rejected by the MPHY, which in turn makes the
+ * link startup that follows fail.  These are the UIC (UniPro) halves of
+ * init_cfg/post_init_cfg from
+ * DOWNSTREAM_READONLY/drivers/scsi/ufs/ufs-cal-9610.c:135-183; the PMA half
+ * of the same tables lives in the matching PHY driver as CFG_PRE_INIT.
+ *
+ * Lane selectors follow the vendor encoding: TX_LANE_0 = 0, RX_LANE_0 = 4.
+ */
+#define EXYNOS9610_RX_LANE_0	4
+#define EXYNOS9610_NO_LANE	-1
+
+static void exynos9610_ufs_dme_set(struct exynos_ufs *ufs, u32 attr,
+				   int sel, u32 val)
+{
+	struct ufs_hba *hba = ufs->hba;
+	int ret;
+
+	if (sel == EXYNOS9610_NO_LANE)
+		ret = ufshcd_dme_set(hba, UIC_ARG_MIB(attr), val);
+	else
+		ret = ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(attr, sel), val);
+
+	/*
+	 * Keep the UIC result code visible: the generic helper only reports
+	 * this at debug level, and a rejected attribute is the difference
+	 * between a link and a dead line.
+	 */
+	if (ret)
+		dev_err(hba->dev, "dme set 0x%x (lane %d) = 0x%x: %d\n",
+			attr, sel, val, ret);
+}
+
+
+static int exynos9610_ufs_pre_link(struct exynos_ufs *ufs)
+{
+	u32 mclk_period = 1000000000UL / ufs->mclk_rate;
+	int rx = EXYNOS9610_RX_LANE_0;
+	int tx = 0;
+
+	exynos9610_ufs_dme_set(ufs, 0x9514, EXYNOS9610_NO_LANE, mclk_period);
+	exynos9610_ufs_dme_set(ufs, 0x200, EXYNOS9610_NO_LANE, 0x40);
+	exynos9610_ufs_dme_set(ufs, 0x12, rx, mclk_period);
+	exynos9610_ufs_dme_set(ufs, 0xaa, tx, mclk_period);
+	exynos9610_ufs_dme_set(ufs, 0x5c, rx, 0x38);
+	exynos9610_ufs_dme_set(ufs, 0x0f, rx, 0x00);
+	exynos9610_ufs_dme_set(ufs, 0x65, rx, 0x01);
+	exynos9610_ufs_dme_set(ufs, 0x69, rx, 0x01);
+	exynos9610_ufs_dme_set(ufs, 0x21, rx, 0x00);
+	exynos9610_ufs_dme_set(ufs, 0x22, rx, 0x00);
+	exynos9610_ufs_dme_set(ufs, 0x84, rx, 0x01);
+	exynos9610_ufs_dme_set(ufs, 0x04, tx, 0x01);
+	exynos9610_ufs_dme_set(ufs, 0x8f, tx, 0x3e);
+	exynos9610_ufs_dme_set(ufs, 0x200, EXYNOS9610_NO_LANE, 0x00);
+	exynos9610_ufs_dme_set(ufs, 0x9536, EXYNOS9610_NO_LANE, 0x4e20);
+	exynos9610_ufs_dme_set(ufs, 0x9564, EXYNOS9610_NO_LANE, 0x2e820183);
+	exynos9610_ufs_dme_set(ufs, 0x155e, EXYNOS9610_NO_LANE, 0x00);
+	exynos9610_ufs_dme_set(ufs, 0x3000, EXYNOS9610_NO_LANE, 0x00);
+	exynos9610_ufs_dme_set(ufs, 0x3001, EXYNOS9610_NO_LANE, 0x01);
+	exynos9610_ufs_dme_set(ufs, 0x4021, EXYNOS9610_NO_LANE, 0x01);
+	exynos9610_ufs_dme_set(ufs, 0x4020, EXYNOS9610_NO_LANE, 0x01);
+
+	return 0;
+}
+
+/*
+ * Exynos9610 HS series-B calibration, UIC half.  The matching MPHY register
+ * values are the CFG_PRE_PWR_HS table in the PHY driver; downstream keeps
+ * both halves in calib_of_hs_rate_b/post_calib_of_hs_rate_b
+ * (DOWNSTREAM_READONLY/drivers/scsi/ufs/ufs-cal-9610.c:253-296).  The CDR AFC
+ * lock wait of post_calib_of_hs_rate_b is the PHY's CFG_POST_PWR_HS step.
+ */
+static int exynos9610_ufs_pre_pwr_change(struct exynos_ufs *ufs,
+					 struct ufs_pa_layer_attr *pwr)
+{
+	if (!ufshcd_is_hs_mode(pwr) || pwr->hs_rate != PA_HS_MODE_B)
+		return 0;
+
+	exynos9610_ufs_dme_set(ufs, 0x15b0, EXYNOS9610_NO_LANE, 12000);
+	exynos9610_ufs_dme_set(ufs, 0x15b1, EXYNOS9610_NO_LANE, 32000);
+	exynos9610_ufs_dme_set(ufs, 0x15b2, EXYNOS9610_NO_LANE, 16000);
+
+	unipro_writel(ufs, 8064, 0x7888);
+	unipro_writel(ufs, 28224, 0x788c);
+	unipro_writel(ufs, 20160, 0x7890);
+	unipro_writel(ufs, 12000, 0x78b8);
+	unipro_writel(ufs, 32000, 0x78bc);
+	unipro_writel(ufs, 16000, 0x78c0);
+
+	return 0;
+}
+
+static int exynos9610_ufs_post_link(struct exynos_ufs *ufs)
+{
+	int rx = EXYNOS9610_RX_LANE_0;
+
+	exynos9610_ufs_dme_set(ufs, 0x9529, EXYNOS9610_NO_LANE, 0x01);
+	exynos9610_ufs_dme_set(ufs, 0x15a4, EXYNOS9610_NO_LANE, 0xfa);
+	exynos9610_ufs_dme_set(ufs, 0x9529, EXYNOS9610_NO_LANE, 0x00);
+	exynos9610_ufs_dme_set(ufs, 0x200, EXYNOS9610_NO_LANE, 0x40);
+	exynos9610_ufs_dme_set(ufs, 0x35, rx, 0x05);
+	exynos9610_ufs_dme_set(ufs, 0x73, rx, 0x01);
+	exynos9610_ufs_dme_set(ufs, 0x41, rx, 0x02);
+	exynos9610_ufs_dme_set(ufs, 0x42, rx, 0xac);
+	exynos9610_ufs_dme_set(ufs, 0x200, EXYNOS9610_NO_LANE, 0x00);
 
 	return 0;
 }
@@ -752,6 +867,15 @@ static void exynos_ufs_config_smu(struct exynos_ufs *ufs)
 {
 	u32 reg, val;
 
+	/*
+	 * Exynos9610: writing the UFSP protector registers raises an
+	 * asynchronous SError and panics the kernel (verified on device,
+	 * build #95). Skip the protector programming entirely; encryption
+	 * is not needed for the bring-up probe.
+	 */
+	if (ufs->opts & EXYNOS_UFS_OPT_SKIP_SMU_CONFIG)
+		return;
+
 	if (ufs->opts & EXYNOS_UFS_OPT_UFSPR_SECURE)
 		return;
 
@@ -848,7 +972,13 @@ static int exynos_ufs_pre_pwr_mode(struct ufs_hba *hba,
 		ufs->drv_data->pre_pwr_change(ufs, dev_req_params);
 
 	if (ufshcd_is_hs_mode(dev_req_params)) {
-		exynos_ufs_config_sync_pattern_mask(ufs, dev_req_params);
+		/*
+		 * The RX sync pattern mask is an Exynos7-era PA_DBG override; the
+		 * 9610 MPHY rejects the override-test-mode writes, and its vendor
+		 * calibration table has no equivalent step.
+		 */
+		if (!(ufs->opts & EXYNOS_UFS_OPT_VENDOR_CAL))
+			exynos_ufs_config_sync_pattern_mask(ufs, dev_req_params);
 
 		switch (dev_req_params->hs_rate) {
 		case PA_HS_MODE_A:
@@ -1062,15 +1192,26 @@ static int exynos_ufs_pre_link(struct ufs_hba *hba)
 
 	exynos_ufs_setup_clocks(hba, true, PRE_CHANGE);
 
+	/*
+	 * Exynos9610's MPHY must be out of isolation before the first UIC/DME
+	 * command.  The generic Exynos7 ordering issues DME while the PHY is
+	 * still isolated, which makes every UIC command time out.
+	 */
+	if (ufs->opts & EXYNOS_UFS_OPT_PHY_BEFORE_DME)
+		exynos_ufs_phy_init(ufs);
+
 	/* unipro */
-	exynos_ufs_config_unipro(ufs);
+	if (!(ufs->opts & EXYNOS_UFS_OPT_VENDOR_CAL))
+		exynos_ufs_config_unipro(ufs);
 
 	if (ufs->drv_data->pre_link)
 		ufs->drv_data->pre_link(ufs);
 
 	/* m-phy */
-	exynos_ufs_phy_init(ufs);
-	if (!(ufs->opts & EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR)) {
+	if (!(ufs->opts & EXYNOS_UFS_OPT_PHY_BEFORE_DME))
+		exynos_ufs_phy_init(ufs);
+	if (!(ufs->opts & EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR) &&
+	    !(ufs->opts & EXYNOS_UFS_OPT_VENDOR_CAL)) {
 		exynos_ufs_config_phy_time_attr(ufs);
 		exynos_ufs_config_phy_cap_attr(ufs);
 	}
@@ -1308,6 +1449,16 @@ static void exynos_ufs_fmp_init(struct ufs_hba *hba, struct exynos_ufs *ufs)
 	 * enable FMP support on SoCs with EXYNOS_UFS_OPT_UFSPR_SECURE.
 	 */
 	if (!(ufs->opts & EXYNOS_UFS_OPT_UFSPR_SECURE))
+		return;
+
+	/*
+	 * Exynos9610 has no verified FMP SMC interface; the downstream
+	 * 9610 driver programs FMP through its own exynos_fmp path, not
+	 * via these SMC calls. Never issue them on this SoC. Note the
+	 * 9610 drvdata no longer sets UFSPR_SECURE, so this is also
+	 * unreachable there; the check documents the intent.
+	 */
+	if (ufs->opts & EXYNOS_UFS_OPT_SKIP_SMU_CONFIG)
 		return;
 
 	/*
@@ -2100,6 +2251,48 @@ static const struct exynos_ufs_drv_data exynosauto_ufs_vh_drvs = {
 	.opts			= EXYNOS_UFS_OPT_BROKEN_RX_SEL_IDX,
 };
 
+static int exynos9610_ufs_drv_init(struct exynos_ufs *ufs)
+{
+	/*
+	 * 9610 is a single-lane UFS design.  Set this before PHY power-on so
+	 * exynos_ufs_phy_init() does not issue an initial DME query while the
+	 * PHY is still isolated.
+	 */
+	ufs->avail_ln_rx = 1;
+	ufs->avail_ln_tx = 1;
+
+	/*
+	 * Program the sysreg IO-coherency bits (offset 0x1010, BIT(8)|BIT(9))
+	 * exactly as downstream's ufs-dma-coherency node does.  Only gs101
+	 * and exynosauto call this, so without it a non-zero .iocc_mask would
+	 * never reach hardware while the node claims 'dma-coherent'.
+	 */
+	return exynos_ufs_shareability(ufs);
+}
+
+static const struct exynos_ufs_drv_data exynos9610_ufs_drvs = {
+	.uic_attr		= &exynos7_uic_attr,
+	.quirks			= UFSHCD_QUIRK_PRDT_BYTE_GRAN |
+				  UFSHCI_QUIRK_BROKEN_REQ_LIST_CLR |
+				  UFSHCI_QUIRK_SKIP_RESET_INTR_AGGR |
+				  UFSHCD_QUIRK_BROKEN_OCS_FATAL_ERROR |
+				  UFSHCI_QUIRK_SKIP_MANUAL_WB_FLUSH_CTRL |
+				  UFSHCD_QUIRK_SKIP_DEF_UNIPRO_TIMEOUT_SETTING,
+	.opts			= EXYNOS_UFS_OPT_HAS_APB_CLK_CTRL |
+				  EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL |
+				  EXYNOS_UFS_OPT_BROKEN_RX_SEL_IDX |
+				  EXYNOS_UFS_OPT_SKIP_CONNECTION_ESTAB |
+				  EXYNOS_UFS_OPT_USE_SW_HIBERN8_TIMER |
+				  EXYNOS_UFS_OPT_SKIP_SMU_CONFIG |
+				  EXYNOS_UFS_OPT_PHY_BEFORE_DME |
+				  EXYNOS_UFS_OPT_VENDOR_CAL,
+	.iocc_mask		= UFS_EXYNOS9610_SHARABLE,
+	.drv_init		= exynos9610_ufs_drv_init,
+	.pre_link		= exynos9610_ufs_pre_link,
+	.post_link		= exynos9610_ufs_post_link,
+	.pre_pwr_change		= exynos9610_ufs_pre_pwr_change,
+};
+
 static const struct exynos_ufs_drv_data exynos_ufs_drvs = {
 	.uic_attr		= &exynos7_uic_attr,
 	.quirks			= UFSHCD_QUIRK_PRDT_BYTE_GRAN |
@@ -2196,6 +2389,8 @@ static const struct of_device_id exynos_ufs_of_match[] = {
 	  .data	      = &gs101_ufs_drvs },
 	{ .compatible = "samsung,exynos7-ufs",
 	  .data	      = &exynos_ufs_drvs },
+	{ .compatible = "samsung,exynos9610-ufs",
+	  .data	      = &exynos9610_ufs_drvs },
 	{ .compatible = "samsung,exynosautov9-ufs",
 	  .data	      = &exynosauto_ufs_drvs },
 	{ .compatible = "samsung,exynosautov9-ufs-vh",

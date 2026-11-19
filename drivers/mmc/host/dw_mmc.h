@@ -177,6 +177,7 @@ struct dw_mci {
 
 	/* DMA interface members*/
 	int			use_dma;
+	unsigned int		desc_sz;
 	int			using_dma;
 	int			dma_64bit_address;
 
@@ -213,6 +214,9 @@ struct dw_mci {
 	struct clk		*biu_clk;
 	struct clk		*ciu_clk;
 	struct dw_mci_slot	*slot;
+	u32			init_cmd_trace_count;
+	u32			init_power_trace_count;
+	bool			init_cmd_snapshot_done;
 
 	/* FIFO push and pull */
 	int			fifo_depth;
@@ -249,6 +253,7 @@ struct dw_mci_dma_ops {
 	/* DMA Ops */
 	int (*init)(struct dw_mci *host);
 	int (*start)(struct dw_mci *host, unsigned int sg_len);
+	void (*reset)(struct dw_mci *host);
 	void (*complete)(void *host);
 	void (*stop)(struct dw_mci *host);
 	void (*cleanup)(struct dw_mci *host);
@@ -608,6 +613,7 @@ struct dw_mci_drv_data {
 	u32		common_caps;
 	int		(*init)(struct dw_mci *host);
 	void		(*set_ios)(struct dw_mci *host, struct mmc_ios *ios);
+	void		(*hwacg_control)(struct dw_mci *host, bool enable);
 	int		(*parse_dt)(struct dw_mci *host);
 	int		(*execute_tuning)(struct dw_mci_slot *slot, u32 opcode);
 	int		(*prepare_hs400_tuning)(struct dw_mci *host,
@@ -618,5 +624,6 @@ struct dw_mci_drv_data {
 					  unsigned int timeout_ns);
 	u32		(*get_drto_clks)(struct dw_mci *host);
 	void		(*hw_reset)(struct dw_mci *host);
+	void		(*dump_debug_regs)(struct dw_mci *host);
 };
 #endif /* _DW_MMC_H_ */

@@ -513,6 +513,11 @@ static int persistent_ram_buffer_map(phys_addr_t start, phys_addr_t size,
 		prz->vaddr = persistent_ram_iomap(start, size, memtype,
 						  prz->label);
 
+	/* Port diagnostic: report the mapping actually used per zone. */
+	pr_info("%s: 0x%llx@0x%llx memtype=%d %s\n", prz->label,
+		(unsigned long long)size, (unsigned long long)start, memtype,
+		pfn_valid(start >> PAGE_SHIFT) ? "vmap" : "iomap");
+
 	if (!prz->vaddr) {
 		pr_err("%s: Failed to map 0x%llx pages at 0x%llx\n", __func__,
 			(unsigned long long)size, (unsigned long long)start);

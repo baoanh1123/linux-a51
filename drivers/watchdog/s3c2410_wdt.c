@@ -375,6 +375,23 @@ static const struct s3c2410_wdt_variant drv_data_exynosautov920_cl1 = {
 		  QUIRK_HAS_DBGACK_BIT | QUIRK_HAS_32BIT_CNT,
 };
 
+/*
+ * Exynos9610 has two watchdogs: CPUCL0 (Cortex-A73) and CPUCL1 (Cortex-A53).
+ * Both use the Exynos5 PMU layout, but the reset source bit differs per
+ * cluster - 23 for CPUCL0 and 24 for CPUCL1, as in the vendor kernel's
+ * drv_data_exynos7/drv_data_exynos8.  CPUCL0 is covered by the "exynos7"
+ * variant; this one describes CPUCL1.
+ */
+static const struct s3c2410_wdt_variant drv_data_exynos9610_cl1 = {
+	.disable_reg = EXYNOS5_WDT_DISABLE_REG_OFFSET,
+	.mask_reset_reg = EXYNOS5_WDT_MASK_RESET_REG_OFFSET,
+	.mask_bit = 24,
+	.rst_stat_reg = EXYNOS5_RST_STAT_REG_OFFSET,
+	.rst_stat_bit = 24,	/* Cortex-A53 WDTRESET */
+	.quirks = QUIRK_HAS_WTCLRINT_REG | QUIRK_HAS_PMU_MASK_RESET |
+		  QUIRK_HAS_PMU_RST_STAT | QUIRK_HAS_PMU_AUTO_DISABLE,
+};
+
 static const struct of_device_id s3c2410_wdt_match[] = {
 	{ .compatible = "google,gs101-wdt",
 	  .data = &drv_data_gs101_cl0 },
@@ -388,6 +405,8 @@ static const struct of_device_id s3c2410_wdt_match[] = {
 	  .data = &drv_data_exynos5420 },
 	{ .compatible = "samsung,exynos7-wdt",
 	  .data = &drv_data_exynos7 },
+	{ .compatible = "samsung,exynos9610-wdt",
+	  .data = &drv_data_exynos9610_cl1 },
 	{ .compatible = "samsung,exynos850-wdt",
 	  .data = &drv_data_exynos850_cl0 },
 	{ .compatible = "samsung,exynos990-wdt",
@@ -849,6 +868,27 @@ static int s3c2410wdt_probe(struct platform_device *pdev)
 
 	watchdog_set_nowayout(&wdt->wdt_device, nowayout);
 	watchdog_set_restart_priority(&wdt->wdt_device, 128);
+
+	/* state left behind by the bootloader, useful when debugging resets */
+	if (wdt->drv_data->quirks & QUIRK_HAS_PMU_RST_STAT) {
+		unsigned int rst;
+
+		if (!regmap_read(wdt->pmureg, wdt->drv_data->rst_stat_reg, &rst))
+			dev_dbg(dev, "PMU RST_STAT=%#x%s%s%s%s%s\n", rst,
+				 rst & BIT(23) ? " CL0_WDTRESET" : "",
+				 rst & BIT(24) ? " CL1_WDTRESET" : "",
+				 rst & BIT(25) ? " AUD_WDTRESET" : "",
+				 rst & BIT(29) ? " WRESET" : "",
+				 rst & BIT(30) ? " SWRESET" : "");
+	}
+
+	dev_dbg(dev, "bootloader WTCON=%#x (enable=%u reseten=%u inten=%u) WTCNT=%#x WTDAT=%#x\n",
+		 readl(wdt->reg_base + S3C2410_WTCON),
+		 !!(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE),
+		 !!(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_RSTEN),
+		 !!(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_INTEN),
+		 readl(wdt->reg_base + S3C2410_WTCNT),
+		 readl(wdt->reg_base + S3C2410_WTDAT));
 
 	wdt->wdt_device.bootstatus = s3c2410wdt_get_bootstatus(wdt);
 	wdt->wdt_device.parent = dev;

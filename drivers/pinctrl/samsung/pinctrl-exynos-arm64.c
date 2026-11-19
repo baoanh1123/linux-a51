@@ -88,6 +88,18 @@ static const struct samsung_pin_bank_type artpec_bank_type_off = {
 /* Pad retention control code for accessing PMU regmap */
 static atomic_t exynos_shared_retention_refcnt;
 
+/*
+ * This descriptor has no pad-retention registers; its init still supplies
+ * the PMU regmap used by SoC-specific external wakeup-mask programming.
+ */
+static const struct samsung_retention_data no_retention_data __initconst = {
+	.regs	 = NULL,
+	.nr_regs = 0,
+	.value	 = 0,
+	.refcnt	 = &exynos_shared_retention_refcnt,
+	.init	 = exynos_retention_init,
+};
+
 /* pin banks of exynos2200 pin-controller - ALIVE */
 static const struct samsung_pin_bank_data exynos2200_pin_banks0[] __initconst = {
 	EXYNOS850_PIN_BANK_EINTW(8, 0x0, "gpa0", 0x00),
@@ -943,6 +955,420 @@ const struct samsung_pinctrl_of_match_data exynos850_of_data __initconst = {
 	.num_ctrl	= ARRAY_SIZE(exynos850_pin_ctrl),
 };
 
+/*
+ * Exynos9610 GPIO bank data from DOWNSTREAM_READONLY/drivers/pinctrl/samsung/
+ * pinctrl-exynos-arm64.c:429-503. The register layouts match the Exynos850
+ * alive/off types above. ALIVE gpa1/gpa2 wake IRQs use vendor EINT offsets
+ * and direct SPI routes; other banks remain disabled.
+ */
+static const struct samsung_pin_bank_data exynos9610_pin_banks0[] __initconst = {
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x000,
+		.nr_pins = 6,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "etc0",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x020,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpa0",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x040,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_WKUP,
+		.eint_offset = 0x04,
+		.eint_fltcon_offset = 0x08,
+		.name = "gpa1",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x060,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_WKUP,
+		.eint_offset = 0x08,
+		.eint_fltcon_offset = 0x10,
+		.name = "gpa2",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x080,
+		.nr_pins = 5,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpq0",
+	},
+};
+
+static const struct samsung_pin_bank_data exynos9610_pin_banks1[] __initconst = {
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x000,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm0",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x020,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm1",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x040,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm2",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x060,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm3",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x080,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm4",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x0a0,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm5",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x0c0,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm6",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x0e0,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm7",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x100,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm8",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x120,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm9",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x140,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm10",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x160,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm11",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x180,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm12",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x1a0,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm13",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x1c0,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm14",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x1e0,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm15",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x200,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm16",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x220,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm17",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x240,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm18",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x260,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm19",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x280,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm20",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x2a0,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm21",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x2c0,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm22",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x2e0,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm23",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x300,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm24",
+	},
+	{
+		.type = &exynos850_bank_type_alive,
+		.pctl_offset = 0x320,
+		.nr_pins = 1,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpm25",
+	},
+};
+
+static const struct samsung_pin_bank_data exynos9610_pin_banks2[] __initconst = {
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x000,
+		.nr_pins = 5,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpb0",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x020,
+		.nr_pins = 4,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpb1",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x040,
+		.nr_pins = 5,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpb2",
+	},
+};
+
+static const struct samsung_pin_bank_data exynos9610_pin_banks3[] __initconst = {
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x000,
+		.nr_pins = 4,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpf0",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x020,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpf1",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x040,
+		.nr_pins = 6,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpf2",
+	},
+};
+
+static const struct samsung_pin_bank_data exynos9610_pin_banks4[] __initconst = {
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x000,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpp0",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x020,
+		.nr_pins = 6,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpp1",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x040,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpp2",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x060,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpc0",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x080,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpc1",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x0a0,
+		.nr_pins = 5,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpc2",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x0c0,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpg0",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x0e0,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpg1",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x100,
+		.nr_pins = 8,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpg2",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x120,
+		.nr_pins = 6,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpg3",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x140,
+		.nr_pins = 3,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gpg4",
+	},
+};
+
+static const struct samsung_pin_bank_data exynos9610_pin_banks5[] __initconst = {
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x000,
+		.nr_pins = 4,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gph0",
+	},
+	{
+		.type = &exynos850_bank_type_off,
+		.pctl_offset = 0x020,
+		.nr_pins = 3,
+		.eint_type = EINT_TYPE_NONE,
+		.name = "gph1",
+	},
+};
+
+static const struct samsung_pin_ctrl exynos9610_pin_ctrl[] __initconst = {
+	{
+		.pin_banks = exynos9610_pin_banks0,
+		.nr_banks = ARRAY_SIZE(exynos9610_pin_banks0),
+		.eint_wkup_init = exynos_eint_wkup_init,
+		.suspend = exynos_pinctrl_suspend,
+		.resume = exynos_pinctrl_resume,
+		.retention_data = &no_retention_data,
+	},
+	{
+		.pin_banks = exynos9610_pin_banks1,
+		.nr_banks = ARRAY_SIZE(exynos9610_pin_banks1),
+	},
+	{
+		.pin_banks = exynos9610_pin_banks2,
+		.nr_banks = ARRAY_SIZE(exynos9610_pin_banks2),
+	},
+	{
+		.pin_banks = exynos9610_pin_banks3,
+		.nr_banks = ARRAY_SIZE(exynos9610_pin_banks3),
+	},
+	{
+		.pin_banks = exynos9610_pin_banks4,
+		.nr_banks = ARRAY_SIZE(exynos9610_pin_banks4),
+	},
+	{
+		.pin_banks = exynos9610_pin_banks5,
+		.nr_banks = ARRAY_SIZE(exynos9610_pin_banks5),
+	},
+};
+
+const struct samsung_pinctrl_of_match_data exynos9610_of_data __initconst = {
+	.ctrl = exynos9610_pin_ctrl,
+	.num_ctrl = ARRAY_SIZE(exynos9610_pin_ctrl),
+};
+
 /* pin banks of exynos990 pin-controller 0 (ALIVE) */
 static struct samsung_pin_bank_data exynos990_pin_banks0[] = {
 	/* Must start with EINTG banks, ordered by EINT group number. */
@@ -1412,14 +1838,6 @@ static const struct samsung_pin_bank_data exynosautov920_pin_banks7[] = {
 	EXYNOSV920_PIN_BANK_EINTG(4, 0x6000, "gpp9",  0x18, 0x20, 0x24),
 	EXYNOSV920_PIN_BANK_EINTG(4, 0x7000, "gpp12", 0x18, 0x20, 0x24),
 	EXYNOSV920_PIN_BANK_EINTG(8, 0x8000, "gpg1",  0x18, 0x24, 0x28),
-};
-
-static const struct samsung_retention_data no_retention_data __initconst = {
-	.regs	 = NULL,
-	.nr_regs = 0,
-	.value	 = 0,
-	.refcnt	 = &exynos_shared_retention_refcnt,
-	.init	 = exynos_retention_init,
 };
 
 static const struct samsung_pin_ctrl exynosautov920_pin_ctrl[] = {

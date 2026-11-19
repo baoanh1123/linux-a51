@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/siliconmitus,sm5713-fuelgauge.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Silicon Mitus SM5713 fuel gauge
+
+maintainers:
+  - Bao Anh <baoanh@example.com>
+
+description: |
+  The SM5713 is a companion chip found on Samsung Exynos9610/9611 boards that
+  combines a switch-mode charger, a fuel gauge and a MUIC.  The fuel gauge has
+  its own I2C address and reports battery capacity, voltage, current and
+  temperature.
+
+properties:
+  compatible:
+    const: siliconmitus,sm5713-fuelgauge
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        fuel-gauge@71 {
+            compatible = "siliconmitus,sm5713-fuelgauge";
+            reg = <0x71>;
+        };
+    };
