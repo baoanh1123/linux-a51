@@ -83,7 +83,7 @@ Short version:
 
 ```sh
 # uniLoader is the small payload that starts the kernel from the stock
-# bootloader; build it from its own repository.
+# bootloader; build it from my forked repository.
 make ARCH=aarch64 CROSS_COMPILE=aarch64-linux-gnu-   # in uniLoader
 
 magiskboot repack boot.img new-boot.img   # Image + dtb + uniLoader
