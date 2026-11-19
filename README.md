@@ -8,8 +8,17 @@ mainline drivers.
 
 ![Weston desktop with Xwayland, htop and a Wayland terminal](screenshots/a51-desktop.png)
 
-*Weston with Xwayland on the phone: `htop` (X11), a Wayland terminal, GPU
-compositing and 60 fps scanout on the 1080x2400 panel.*
+*Weston with Xwayland: `htop` is an X11 client, the window next to it is a
+native Wayland one, both composited on the GPU at 60 fps on the 1080x2400
+panel.*
+
+## Screenshots
+
+| Sway | Phosh |
+|---|---|
+| <img src="screenshots/a51-sway-glmark.png" width="300"> | <img src="screenshots/a51-phosh.png" width="300"> |
+| *Sway tiling `foot` next to `glmark2`, rendering a textured scene on the Mali-G72 through panfrost.* | *Phosh on the phone, with the blurred, translucent shell drawn by the GPU.* |
+
 
 ## Hardware
 
