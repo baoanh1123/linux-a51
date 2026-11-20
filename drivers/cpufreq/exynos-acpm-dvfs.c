@@ -53,7 +53,17 @@ struct acpm_dvfs {
 	struct acpm_handle *acpm;
 	unsigned int chan;
 	struct dentry *debugfs;
+	enum acpm_front_mode front_mode;
 };
+
+/*
+ * The ACPM shared memory window is only partly mapped for the AP: the
+ * framework/plugin code below offset 0x5970 raises a synchronous external
+ * abort when read from the non-secure world, and repeated aborts escalate to an
+ * SError panic.  Only the channel table (0x5970..0x8000) and the top FV map
+ * window (0x12400..0x15000) are safe to read, so this driver never touches the
+ * window; the file dump in the ACPM core driver is limited to those regions.
+ */
 
 static int acpm_dvfs_send(struct acpm_dvfs *dvfs, unsigned int id, u32 cmd,
 			  unsigned long rate, u32 arg, u32 *result)
@@ -69,6 +79,30 @@ static int acpm_dvfs_send(struct acpm_dvfs *dvfs, unsigned int id, u32 cmd,
 		*result = msg[1];
 
 	return 0;
+}
+
+/**
+ * acpm_dvfs_send_nowait() - post a DVFS command without waiting for a reply
+ * @dvfs: driver data
+ * @msg: four words as the firmware expects them
+ *
+ * DVFS requests are fire-and-forget on this firmware: FREQ_REQ is answered by
+ * changing the rate, not by writing a response word, so the vendor kernel
+ * never waits either (which is why its mailbox interrupt count stays at zero).
+ */
+static int acpm_dvfs_send_nowait(struct acpm_dvfs *dvfs, u32 *msg)
+{
+	struct acpm_xfer xfer = {
+		.txd = msg,
+		.rxd = msg,
+		.txlen = 4 * sizeof(u32),
+		.rxlen = 4 * sizeof(u32),
+		.acpm_chan_id = dvfs->chan,
+		.no_wait = true,
+		.front_mode = dvfs->front_mode,
+	};
+
+	return acpm_do_xfer(dvfs->acpm, &xfer);
 }
 
 /**
@@ -118,7 +152,7 @@ static int acpm_dvfs_get_rate(struct acpm_dvfs *dvfs, unsigned int id,
 static int acpm_dvfs_set_rate(struct acpm_dvfs *dvfs, unsigned int id,
 			      unsigned long rate)
 {
-	u32 max;
+	u32 max, msg[4];
 
 	switch (id) {
 	case 2:
@@ -136,7 +170,12 @@ static int acpm_dvfs_set_rate(struct acpm_dvfs *dvfs, unsigned int id,
 	if (rate > max)
 		return -ERANGE;
 
-	return acpm_dvfs_send(dvfs, id, ACPM_DVFS_FREQ_REQ, rate, 0, NULL);
+	msg[0] = id;
+	msg[1] = rate;
+	msg[2] = ACPM_DVFS_FREQ_REQ;
+	msg[3] = 0;
+
+	return acpm_dvfs_send_nowait(dvfs, msg);
 }
 
 static int acpm_dvfs_dump_show(struct seq_file *s, void *unused)
@@ -172,6 +211,7 @@ static ssize_t acpm_dvfs_set_write(struct file *file, const char __user *ubuf,
 	struct acpm_dvfs *dvfs = file->private_data;
 	unsigned int id, cmd = ACPM_DVFS_FREQ_REQ, arg = 0;
 	unsigned long rate;
+	u32 msg[4];
 	char buf[40];
 	int ret;
 
@@ -190,16 +230,72 @@ static ssize_t acpm_dvfs_set_write(struct file *file, const char __user *ubuf,
 	 * SET_INIT_FREQ needs a non-zero arg (DATA_INIT), which the earlier
 	 * two-message approximation could never produce.
 	 */
-	ret = acpm_dvfs_send(dvfs, id, cmd, rate, arg, NULL);
-	if (ret && ret != -ETIME)
+	if (cmd == ACPM_DVFS_FREQ_REQ && !arg) {
+		/* Plain rate request: clamped per domain, posted without waiting. */
+		ret = acpm_dvfs_set_rate(dvfs, id, rate);
+	} else {
+		msg[0] = id;
+		msg[1] = rate;
+		msg[2] = cmd;
+		msg[3] = arg;
+		ret = acpm_dvfs_send_nowait(dvfs, msg);
+	}
+	if (ret)
 		return ret;
 
-	dev_info(dvfs->dev, "cmd %u id %u rate %lu arg %u (%s)\n", cmd, id,
-		 rate, arg, ret ? "sent, unconfirmed" : "acknowledged");
+	dev_info(dvfs->dev, "posted cmd %u id %#x rate %lu arg %u\n", cmd, id,
+		 rate, arg);
 	*ppos += count;
 
 	return count;
 }
+
+/*
+ * "mode" selects how a single-slot buffer channel advertises a new message.
+ * 0 publishes rear + 1 (our own scheme), 1 replicates the vendor driver, which
+ * leaves front at zero and relies on the doorbell.  Runtime selectable so both
+ * can be tested against the same firmware without another flash.
+ */
+static int acpm_dvfs_mode_show(struct seq_file *s, void *unused)
+{
+	struct acpm_dvfs *dvfs = s->private;
+
+	seq_printf(s, "%d\n", dvfs->front_mode);
+	return 0;
+}
+static ssize_t acpm_dvfs_mode_write(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct acpm_dvfs *dvfs = s->private;
+	unsigned int mode;
+	char buf[8];
+
+	if (count == 0 || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	if (kstrtouint(buf, 0, &mode) || mode > ACPM_FRONT_VENDOR)
+		return -EINVAL;
+
+	dvfs->front_mode = mode;
+	dev_info(dvfs->dev, "front mode %u\n", mode);
+
+	return count;
+}
+static int acpm_dvfs_mode_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, acpm_dvfs_mode_show, inode->i_private);
+}
+static const struct file_operations acpm_dvfs_mode_fops = {
+	.owner = THIS_MODULE,
+	.open = acpm_dvfs_mode_open,
+	.read = seq_read,
+	.write = acpm_dvfs_mode_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 
 static const struct file_operations acpm_dvfs_set_fops = {
 	.open = simple_open,
@@ -232,9 +328,12 @@ static int acpm_dvfs_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, dvfs);
 
+
 	dvfs->debugfs = debugfs_create_dir("acpm-dvfs", NULL);
 	debugfs_create_file("dump", 0444, dvfs->debugfs, dvfs,
 			    &acpm_dvfs_dump_fops);
+	debugfs_create_file("mode", 0644, dvfs->debugfs, dvfs,
+			    &acpm_dvfs_mode_fops);
 	debugfs_create_file("set", 0200, dvfs->debugfs, dvfs,
 			    &acpm_dvfs_set_fops);
 

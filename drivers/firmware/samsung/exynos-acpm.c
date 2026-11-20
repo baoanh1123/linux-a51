@@ -31,6 +31,9 @@
 #include <linux/types.h>
 
 static const struct file_operations acpm_sram_dump_fops;
+static const struct file_operations acpm_chans_fops;
+static const struct file_operations acpm_plugins_fops;
+static const struct file_operations acpm_fvmap_raw_fops;
 
 #include "exynos-acpm.h"
 #include "exynos-acpm-pmic.h"
@@ -174,6 +177,13 @@ struct acpm_chan {
 	unsigned int qlen;
 	unsigned int mlen;
 	unsigned int type;
+	/* Raw descriptor offsets, kept so debugfs can bound its reads: some
+	 * firmware-only channels store absolute addresses here instead.
+	 */
+	u32 tx_off_front;
+	u32 tx_off_rear;
+	u32 rx_off_front;
+	u32 rx_off_rear;
 	u8 seqnum;
 	u8 id;
 	bool poll_completion;
@@ -199,6 +209,8 @@ struct acpm_info {
 	struct acpm_chan *chans;
 	struct device *dev;
 	struct acpm_handle handle;
+	size_t sram_size;
+	loff_t initdata_base;
 	u32 num_chans;
 	u32 num_chans_offset;
 };
@@ -604,7 +616,12 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 		 * Publish rear + 1 instead: a raw counter the firmware can
 		 * compare, and which is restored when it consumes the slot.
 		 */
-		if (achan->type == ACPM_CHAN_TYPE_BUFFER)
+		if (achan->type == ACPM_CHAN_TYPE_BUFFER &&
+		    xfer->front_mode == ACPM_FRONT_VENDOR)
+			writel(achan->qlen > 1 ?
+			       (readl(achan->tx.front) + 1) % achan->qlen : 0,
+			       achan->tx.front);
+		else if (achan->type == ACPM_CHAN_TYPE_BUFFER)
 			writel(readl(achan->tx.rear) + 1, achan->tx.front);
 		else
 			writel(idx, achan->tx.front);
@@ -618,8 +635,17 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 		acpm_dump_chan(achan, "post");
 	}
 
+	/*
+	 * Fire-and-forget clients - the DVFS ones - are answered by the
+	 * firmware acting on the request, not by a response word, so waiting
+	 * here only produces a timeout on a message that was delivered.
+	 */
+	if (xfer->no_wait)
+		return 0;
+
 	return acpm_wait_for_message_response(achan, xfer);
 }
+EXPORT_SYMBOL_GPL(acpm_do_xfer);
 
 /**
  * acpm_chan_shmem_get_params() - get channel parameters and addresses of the
@@ -639,6 +665,11 @@ static void acpm_chan_shmem_get_params(struct acpm_chan *achan,
 	achan->poll_completion = readl(&chan_shmem->poll_completion);
 	achan->id = readl(&chan_shmem->id);
 	achan->qlen = readl(&chan_shmem->qlen);
+
+	achan->tx_off_front = readl(&chan_shmem->rx_front);
+	achan->tx_off_rear = readl(&chan_shmem->rx_rear);
+	achan->rx_off_front = readl(&chan_shmem->tx_front);
+	achan->rx_off_rear = readl(&chan_shmem->tx_rear);
 
 	tx->base = base + readl(&chan_shmem->rx_base);
 	tx->rear = base + readl(&chan_shmem->rx_rear);
@@ -965,6 +996,7 @@ static int acpm_probe(struct platform_device *pdev)
 				     "Failed to get shared memory.\n");
 
 	size = resource_size(&res);
+	acpm->sram_size = size;
 	acpm->sram_base = devm_ioremap(dev, res.start, size);
 	if (!acpm->sram_base)
 		return dev_err_probe(dev, -ENOMEM,
@@ -975,6 +1007,7 @@ static int acpm_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL,
 				     "Failed to get match data.\n");
 
+	acpm->initdata_base = match_data->initdata_base;
 	acpm->shmem = acpm->sram_base + match_data->initdata_base;
 	acpm->num_chans_offset = match_data->num_chans_offset;
 	acpm->dev = dev;
@@ -993,6 +1026,12 @@ static int acpm_probe(struct platform_device *pdev)
 	acpm->debugfs = debugfs_create_dir("acpm", NULL);
 	debugfs_create_file("sram", 0444, acpm->debugfs, acpm,
 			    &acpm_sram_dump_fops);
+	debugfs_create_file("chans", 0444, acpm->debugfs, acpm,
+			    &acpm_chans_fops);
+	debugfs_create_file("plugins", 0444, acpm->debugfs, acpm,
+			    &acpm_plugins_fops);
+	debugfs_create_file("fvmap_raw", 0444, acpm->debugfs, acpm,
+			    &acpm_fvmap_raw_fops);
 
 	return devm_of_platform_populate(dev);
 }
@@ -1188,6 +1227,343 @@ channels:
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(acpm_sram_dump);
+
+/*
+ * The ACPM firmware is modular: the header starts with the offset of a plugin
+ * table and the number of entries.  A plugin whose handler is not built into
+ * the framework (DVFS is one) is loaded by the OS at boot - the vendor's
+ * plugins_init() reads fw_name, request_firmware()s the blob and copies it into
+ * shared memory at base_addr.  Decoding the table is the first step of porting
+ * that, because it names the blobs the firmware expects.
+ */
+#define ACPM_PLUGIN_ENTRY_SIZE	0x30
+#define ACPM_PLUGIN_MAX		32
+#define ACPM_FW_NAME_MAX	64
+
+/* struct plugin, fw_header/common.h, 32-bit layout */
+struct acpm_plugin {
+	u32 id;
+	u32 base_addr;
+	u32 acpm_ops;
+	u32 plugin_ops;
+	u32 secure_func_mask;
+	u32 extern_func_mask;
+	u32 timer_period;
+	u32 timer_multiplier;
+	u8 is_attached;
+	u32 size;
+	u8 stay_attached;
+	u32 fw_name;
+};
+
+/*
+ * The ACPM firmware is modular: the header starts with the offset of a plugin
+ * table and the number of entries.  A plugin whose handler is not built into
+ * the framework (DVFS is one) is loaded by the OS at boot - the vendor's
+ * plugins_init() reads fw_name, request_firmware()s the blob and copies it into
+ * shared memory at base_addr.
+ *
+ * Only 32-bit reads of the table region are done here.  Byte-wide accesses into
+ * ACPM SRAM and reads of descriptors that do not point at real SRAM both faulted
+ * the bus (SError) in the first version of this file, so anything not proven
+ * reachable - channel buffers of firmware-only channels in particular - is
+ * skipped.  The blob names live in the same window and are decoded from the
+ * words below rather than by following the fw_name offset.
+ */
+#define ACPM_PLUGIN_ENTRY_WORDS	12	/* 0x30 bytes per struct plugin */
+#define ACPM_PLUGIN_MAX		32
+#define ACPM_PLUGIN_DUMP_WORDS	(ACPM_PLUGIN_MAX * ACPM_PLUGIN_ENTRY_WORDS)
+
+static bool acpm_off_readable(struct acpm_info *acpm, u32 off)
+{
+	return off && off + 4 <= acpm->sram_size;
+}
+
+/**
+ * acpm_plugin_decode() - print one plugin entry as fields, plus its fw_name
+ *
+ * The name is stored as a C string in shared memory.  It is read as whole
+ * words and the bytes are unpacked here, because byte-wide accesses into ACPM
+ * SRAM abort the bus.
+ */
+static void acpm_plugin_decode(struct seq_file *s, struct acpm_info *acpm,
+			       u32 base_off)
+{
+	u32 id = readl(acpm->sram_base + base_off);
+	u32 base = readl(acpm->sram_base + base_off + 4) & ~1U;
+	u32 size = readl(acpm->sram_base + base_off + 9 * 4);
+	u32 fw = readl(acpm->sram_base + base_off + 11 * 4);
+	u32 attached = readl(acpm->sram_base + base_off + 8 * 4) & 0xff;
+	u32 stay = readl(acpm->sram_base + base_off + 10 * 4) & 0xff;
+	char name[48];
+
+	name[0] = '\0';
+
+	if (acpm_off_readable(acpm, fw)) {
+		unsigned int i, c = 0;
+
+		for (i = 0; i + 3 < sizeof(name) && fw + i * 4 + 4 <= acpm->sram_size; i++) {
+			u32 v = readl(acpm->sram_base + fw + i * 4);
+			unsigned int b;
+
+			for (b = 0; b < 4; b++) {
+				char ch = (v >> (8 * b)) & 0xff;
+
+				if (!ch)
+					goto done;
+				if (ch >= 0x20 && ch < 0x7f)
+					name[c++] = ch;
+			}
+		}
+done:
+		name[c] = '\0';
+	}
+
+	seq_printf(s,
+		   "    id=%u base=%#06x size=%#06x attached=%u stay=%u fw_name=\"%s\"\n",
+		   id, base, size, attached, stay, name);
+}
+
+static int acpm_plugins_show(struct seq_file *s, void *unused)
+{
+	struct acpm_info *acpm = s->private;
+	u32 table = readl(acpm->sram_base + acpm->initdata_base);
+	u32 count = readl(acpm->sram_base + acpm->initdata_base + 4);
+	unsigned int i, w;
+
+	seq_printf(s, "plugin table @%#x, %u entries\n", table, count);
+
+	if (!table || table >= acpm->sram_size) {
+		seq_puts(s, "table offset is outside shared memory\n");
+		return 0;
+	}
+	if (count > ACPM_PLUGIN_MAX)
+		count = ACPM_PLUGIN_MAX;
+
+	/*
+	 * The DVFS plugin needs an FV map (rate/voltage table) written into its
+	 * own SRAM window at fvmap_offset.  The bootloader may or may not have
+	 * filled it in - a zeroed header means the kernel is expected to write
+	 * it, which is what the vendor's fvmap_init() does from the ASV tables.
+	 */
+	{
+		u32 dvfs_base = 0;
+		u32 fvmap_off = 0x6000;
+
+		of_property_read_u32(acpm->dev->of_node, "fvmap_offset",
+				     &fvmap_off);
+
+		for (i = 0; i < count; i++) {
+			u32 off = table + i * ACPM_PLUGIN_ENTRY_WORDS * 4;
+			u32 base = readl(acpm->sram_base + off + 4) & ~1U;
+
+			if (base && readl(acpm->sram_base + off) == 1)
+				dvfs_base = base;
+		}
+
+		u32 fv = dvfs_base + fvmap_off;
+
+		seq_printf(s, "fvmap @%#06x (dvfs base %#06x + %#x):",
+			   fv, dvfs_base, fvmap_off);
+		if (acpm_off_readable(acpm, fv)) {
+			for (w = 0; w < 6; w++)
+				seq_printf(s, " %08x",
+					   readl(acpm->sram_base + fv + w * 4));
+		} else {
+			seq_puts(s, " (outside shared memory)");
+			seq_puts(s, "\n");
+			goto plugins;
+		}
+		seq_puts(s, "\n");
+
+		/*
+		 * struct fvmap_header: dvfs_type, num_of_lv, num_of_members,
+		 * num_of_pll, num_of_mux, num_of_div, gearratio, init_lv,
+		 * num_of_gate, reserved[2], block_addr[3], o_members,
+		 * o_ratevolt, o_tables.  o_ratevolt points at an array of
+		 * struct rate_volt { rate, volt }, i.e. the OPP list the
+		 * firmware will accept for this domain.
+		 */
+		/*
+		 * struct fvmap_header: dvfs_type, num_of_lv, num_of_members,
+		 * num_of_pll, num_of_mux, num_of_div, gearratio, init_lv,
+		 * num_of_gate, reserved[2], block_addr[3], o_members,
+		 * o_ratevolt, o_tables.  o_ratevolt points at an array of
+		 * struct rate_volt { rate, volt } - the OPP list the firmware
+		 * accepts - and o_tables links to the next domain's header.
+		 */
+		{
+			u32 table_off = 0;
+			unsigned int t;
+
+			for (t = 0; t < 12; t++) {
+				u32 hdr = fv + table_off;
+				u32 w0 = readl(acpm->sram_base + hdr);
+				u32 w5;
+				u32 lv = (w0 >> 8) & 0xff;
+				u32 type = w0 & 0xff;
+				u32 o_ratevolt, o_tables;
+				unsigned int n;
+
+				if (acpm_off_readable(acpm, hdr + 24) == false)
+					break;
+
+				w5 = readl(acpm->sram_base + hdr + 5 * 4);
+				o_ratevolt = w5 & 0xffff;
+				o_tables = (w5 >> 16) & 0xffff;
+
+				seq_printf(s, "  domain type=%u lv=%u o_ratevolt=%#x o_tables=%#x\n",
+					   type, lv, o_ratevolt, o_tables);
+
+				if (acpm_off_readable(acpm, hdr + o_ratevolt)) {
+					seq_puts(s, "    rate/volt:");
+					for (n = 0; n < min(lv, 16U); n++)
+						seq_printf(s, " %u/%u",
+							   readl(acpm->sram_base +
+								 hdr + o_ratevolt + n * 8),
+							   readl(acpm->sram_base +
+								 hdr + o_ratevolt + n * 8 + 4));
+					seq_puts(s, "\n");
+				}
+
+				if (!o_tables)
+					break;
+				table_off = o_tables;
+			}
+		}
+	}
+
+plugins:
+	for (i = 0; i < count; i++) {
+		u32 base_off = table + i * ACPM_PLUGIN_ENTRY_WORDS * 4;
+
+		if (base_off + ACPM_PLUGIN_ENTRY_WORDS * 4 > acpm->sram_size)
+			break;
+
+		/* id, base_addr, acpm_ops, plugin_ops, masks, timer, then
+		 * is_attached/size/stay_attached/fw_name - all as raw words.
+		 */
+		seq_printf(s, "[%u] @%#06x:", i, base_off);
+		for (w = 0; w < ACPM_PLUGIN_ENTRY_WORDS; w++)
+			seq_printf(s, " %08x",
+				   readl(acpm->sram_base + base_off + w * 4));
+		seq_puts(s, "\n");
+		acpm_plugin_decode(s, acpm, base_off);
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(acpm_plugins);
+
+/**
+ * acpm_fvmap_raw_show() - dump the DVFS plugin's FV map window as words
+ *
+ * One fvmap block describes one DVFS domain, and the chain field (o_tables) is
+ * a per-level clock table rather than a link to the next domain, so the only
+ * way to find the other domains' maps is to read the whole window and look for
+ * headers.  Word reads only, bounded by the plugin's own size.
+ */
+static int acpm_fvmap_raw_show(struct seq_file *s, void *unused)
+{
+	struct acpm_info *acpm = s->private;
+	u32 fvmap_off = 0x6000;
+	u32 table = readl(acpm->sram_base + acpm->initdata_base);
+	u32 count = readl(acpm->sram_base + acpm->initdata_base + 4);
+	u32 dvfs_base = 0, dvfs_size = 0;
+	u32 off, end;
+	unsigned int i, n = 0;
+
+	of_property_read_u32(acpm->dev->of_node, "fvmap_offset", &fvmap_off);
+
+	if (count > ACPM_PLUGIN_MAX)
+		count = ACPM_PLUGIN_MAX;
+
+	for (i = 0; i < count; i++) {
+		u32 e = table + i * ACPM_PLUGIN_ENTRY_WORDS * 4;
+
+		if (!acpm_off_readable(acpm, e + 44))
+			break;
+
+		if (readl(acpm->sram_base + e) == 1) {
+			dvfs_base = readl(acpm->sram_base + e + 4) & ~1U;
+			dvfs_size = readl(acpm->sram_base + e + 9 * 4);
+		}
+	}
+
+	if (!dvfs_base || !dvfs_size) {
+		seq_puts(s, "no DVFS plugin\n");
+		return 0;
+	}
+
+	off = dvfs_base + fvmap_off;
+	end = dvfs_base + dvfs_size;
+	if (end > acpm->sram_size)
+		end = acpm->sram_size;
+
+	seq_printf(s, "# fvmap window %#x..%#x\n", off, end);
+	for (; off + 4 <= end; off += 4, n++) {
+		if (!(n % 8))
+			seq_printf(s, "%06x:", off);
+		seq_printf(s, " %08x", readl(acpm->sram_base + off));
+		if (n % 8 == 7)
+			seq_puts(s, "\n");
+	}
+	if (n % 8)
+		seq_puts(s, "\n");
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(acpm_fvmap_raw);
+
+/**
+ * acpm_chans_show() - dump the live pointer values of every channel
+ *
+ * The sram dump shows where the descriptors live; this shows what they hold
+ * right now, which is the only way to tell whether the firmware consumed a
+ * message (rear catches up with front) or never looked at it.
+ */
+static int acpm_chans_show(struct seq_file *s, void *unused)
+{
+	struct acpm_info *acpm = s->private;
+	unsigned int i;
+
+	for (i = 0; i < acpm->num_chans; i++) {
+		struct acpm_chan *achan = &acpm->chans[i];
+
+		seq_printf(s,
+			   "ch%u id=%u type=%u qlen=%u mlen=%u poll=%u\n",
+			   i, achan->id, achan->type, achan->qlen,
+			   achan->mlen, achan->poll_completion);
+
+		/*
+		 * Every read is bounded by the descriptor offsets.  Channels
+		 * the firmware keeps to itself carry absolute addresses in
+		 * these fields, and dereferencing one aborts the bus, so they
+		 * are reported instead of followed.  No slot contents either:
+		 * only ch5's buffer is proven reachable.
+		 */
+		if (acpm_off_readable(acpm, achan->tx_off_front) &&
+		    acpm_off_readable(acpm, achan->tx_off_rear))
+			seq_printf(s, "  tx front=%u rear=%u\n",
+				   readl(achan->tx.front),
+				   readl(achan->tx.rear));
+		else
+			seq_printf(s, "  tx front/rear offsets %#x/%#x (not SRAM)\n",
+				   achan->tx_off_front, achan->tx_off_rear);
+
+		if (acpm_off_readable(acpm, achan->rx_off_front) &&
+		    acpm_off_readable(acpm, achan->rx_off_rear))
+			seq_printf(s, "  rx front=%u rear=%u\n",
+				   readl(achan->rx.front),
+				   readl(achan->rx.rear));
+		else
+			seq_printf(s, "  rx front/rear offsets %#x/%#x (not SRAM)\n",
+				   achan->rx_off_front, achan->rx_off_rear);
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(acpm_chans);
 
 static const struct acpm_match_data acpm_gs101 = {
 	.initdata_base = ACPM_GS101_INITDATA_BASE,

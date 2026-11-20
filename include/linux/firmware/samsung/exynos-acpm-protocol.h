@@ -44,6 +44,44 @@ struct acpm_handle *devm_acpm_get_by_node(struct device *dev,
 					  struct device_node *np);
 
 /**
+ * enum acpm_front_mode - how a TYPE_BUFFER channel advertises a new message
+ * @ACPM_FRONT_REAR_NEXT: publish rear + 1, a raw counter the firmware compares
+ * @ACPM_FRONT_VENDOR: replicate the vendor driver, which writes
+ *		      (front + 1) % q_len and therefore leaves a single-slot
+ *		      buffer's front at zero and relies on the doorbell alone
+ */
+enum acpm_front_mode {
+	ACPM_FRONT_REAR_NEXT = 0,
+	ACPM_FRONT_VENDOR,
+};
+
+/**
+ * struct acpm_xfer - one ACPM message exchange
+ * @txd: request words
+ * @rxd: buffer for the response words
+ * @txlen: request length in bytes
+ * @rxlen: response buffer length in bytes
+ * @acpm_chan_id: ACPM channel id
+ * @no_wait: post the request and return instead of waiting for a response
+ *
+ * Some firmware channels are fire-and-forget: the request is answered by the
+ * firmware acting on it, and waiting for a response word would only time out
+ * on a message that was delivered.  DVFS is one of those.
+ */
+struct acpm_xfer {
+	const u32 *txd;
+	u32 *rxd;
+	size_t txlen;
+	size_t rxlen;
+	unsigned int acpm_chan_id;
+	bool no_wait;
+	enum acpm_front_mode front_mode;
+};
+
+int acpm_do_xfer(struct acpm_handle *handle,
+		 const struct acpm_xfer *xfer);
+
+/**
  * acpm_do_cmd() - exchange one raw message with the ACPM firmware
  * @handle: ACPM handle
  * @acpm_chan_id: ACPM channel id
