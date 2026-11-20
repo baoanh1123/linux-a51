@@ -59,6 +59,7 @@ struct mss100 {
 	struct input_dev *input;
 	bool slots[MSS100_MAX_FINGERS];
 	struct delayed_work poll;
+	bool suspended;
 };
 
 /**
@@ -182,9 +183,48 @@ static void mss100_poll_work(struct work_struct *work)
 	struct mss100 *ts = container_of(to_delayed_work(work),
 					 struct mss100, poll);
 
+	/* The I2C bus is suspended; resuming schedules this again. */
+	if (ts->suspended)
+		return;
+
 	mss100_poll(&ts->poll.work);
 	schedule_delayed_work(&ts->poll, msecs_to_jiffies(10));
 }
+
+/*
+ * System sleep: stop talking to the controller before its I2C bus goes away.
+ * Without this the poll work (or the attention interrupt) reaches the adapter
+ * after it has been suspended, which trips "Transfer while suspended" in the
+ * I2C core on every suspend and, on a real bus, can hang the resume.
+ */
+static int mss100_suspend(struct device *dev)
+{
+	struct mss100 *ts = dev_get_drvdata(dev);
+
+	ts->suspended = true;
+
+	if (ts->client->irq > 0)
+		disable_irq(ts->client->irq);
+
+	cancel_delayed_work_sync(&ts->poll);
+	return 0;
+}
+
+static int mss100_resume(struct device *dev)
+{
+	struct mss100 *ts = dev_get_drvdata(dev);
+
+	ts->suspended = false;
+
+	if (ts->client->irq > 0)
+		enable_irq(ts->client->irq);
+	else
+		schedule_delayed_work(&ts->poll, msecs_to_jiffies(10));
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(mss100_pm_ops, mss100_suspend, mss100_resume);
 
 static int mss100_probe(struct i2c_client *client)
 {
@@ -200,6 +240,9 @@ static int mss100_probe(struct i2c_client *client)
 	ts->dev = &client->dev;
 	ts->client = client;
 	i2c_set_clientdata(client, ts);
+
+	/* Initialised even in interrupt mode: suspend cancels it either way. */
+	INIT_DELAYED_WORK(&ts->poll, mss100_poll_work);
 
 	ts->vdd = devm_regulator_get(&client->dev, "vdd");
 	if (IS_ERR(ts->vdd))
@@ -271,7 +314,6 @@ static int mss100_probe(struct i2c_client *client)
 		dev_info(&client->dev, "Touch reporting enabled (IRQ %d)\n",
 			 client->irq);
 	} else {
-		INIT_DELAYED_WORK(&ts->poll, mss100_poll_work);
 		schedule_delayed_work(&ts->poll, msecs_to_jiffies(10));
 		dev_info(&client->dev, "Touch reporting enabled (polled)\n");
 	}
@@ -299,6 +341,7 @@ static struct i2c_driver mss100_driver = {
 	.driver = {
 		.name = "mss100",
 		.of_match_table = mss100_of_match,
+		.pm = pm_ptr(&mss100_pm_ops),
 	},
 	.probe = mss100_probe,
 	.id_table = mss100_i2c_id,

@@ -79,6 +79,7 @@ struct sm5713_muic {
 	struct power_supply *psy;
 	struct mutex lock;
 	struct delayed_work work;
+	bool suspended;
 	bool online;
 	bool otg;
 	int usb_type;
@@ -148,6 +149,10 @@ static void sm5713_muic_poll(struct work_struct *work)
 	}
 
 	mutex_unlock(&muic->lock);
+
+	/* Resume restarts this; the I2C bus is gone while suspended. */
+	if (muic->suspended)
+		return;
 
 	schedule_delayed_work(&muic->work, SM5713_MUIC_POLL_PERIOD);
 }
@@ -336,6 +341,32 @@ static int sm5713_muic_probe(struct i2c_client *client)
 	return 0;
 }
 
+/*
+ * System sleep: stop polling before the I2C adapter goes down, and start again
+ * on resume - cable attach/detach is what this poll exists for, so the first
+ * one after resume matters.
+ */
+static int sm5713_muic_suspend(struct device *dev)
+{
+	struct sm5713_muic *muic = dev_get_drvdata(dev);
+
+	muic->suspended = true;
+	cancel_delayed_work_sync(&muic->work);
+	return 0;
+}
+
+static int sm5713_muic_resume(struct device *dev)
+{
+	struct sm5713_muic *muic = dev_get_drvdata(dev);
+
+	muic->suspended = false;
+	schedule_delayed_work(&muic->work, 0);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sm5713_muic_pm_ops, sm5713_muic_suspend,
+				sm5713_muic_resume);
+
 static void sm5713_muic_remove(struct i2c_client *client)
 {
 	struct sm5713_muic *muic = i2c_get_clientdata(client);
@@ -358,6 +389,7 @@ MODULE_DEVICE_TABLE(i2c, sm5713_muic_i2c_id);
 static struct i2c_driver sm5713_muic_driver = {
 	.driver = {
 		.name = "sm5713-muic",
+		.pm = pm_ptr(&sm5713_muic_pm_ops),
 		.of_match_table = sm5713_muic_of_match,
 	},
 	.probe = sm5713_muic_probe,

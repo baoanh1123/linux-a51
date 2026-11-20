@@ -61,6 +61,8 @@
 
 /* WDTCNTL: writing the reset bit re-arms the charger watchdog; self-clearing */
 #define SM5713_CHG_WDTCNTL_RESET	BIT(6)
+/* WDTCNTL[0] enables the watchdog; bits [2:1] select its timeout */
+#define SM5713_CHG_WDTCNTL_EN		BIT(0)
 
 /*
  * VBUSCNTL[6:0] sets the input current limit in 25 mA steps above 100 mA;
@@ -148,6 +150,9 @@ struct sm5713_charger {
 	bool charging;
 	int health;
 	bool wdt_expired;
+	bool suspended;
+	bool wdtcntl_saved_valid;
+	u32 wdtcntl_saved;
 };
 
 static int sm5713_chg_read(struct sm5713_charger *chg, u8 reg, u32 *val)
@@ -245,7 +250,9 @@ static void sm5713_chg_limit_work(struct work_struct *work)
 	__sm5713_chg_update_limit(chg);
 	mutex_unlock(&chg->lock);
 
-	schedule_delayed_work(&chg->limit_work, SM5713_CHG_CABLE_PERIOD);
+	if (!chg->suspended)
+		schedule_delayed_work(&chg->limit_work,
+				      SM5713_CHG_CABLE_PERIOD);
 }
 
 /**
@@ -441,6 +448,9 @@ static void sm5713_chg_cable_work(struct work_struct *work)
 
 	mutex_unlock(&chg->lock);
 
+	if (chg->suspended)
+		return;
+
 	schedule_delayed_work(&chg->cable_work, SM5713_CHG_CABLE_PERIOD);
 }
 
@@ -449,6 +459,10 @@ static void sm5713_chg_wdt_work(struct work_struct *work)
 	struct sm5713_charger *chg =
 		container_of(to_delayed_work(work), struct sm5713_charger,
 			     wdt_work);
+
+	/* Resume restarts this; the I2C bus is gone while suspended. */
+	if (chg->suspended)
+		return;
 
 	sm5713_chg_kick_watchdog(chg);
 	sm5713_chg_cable_work(&chg->cable_work.work);
@@ -741,10 +755,72 @@ static int sm5713_chg_probe(struct i2c_client *client)
 	sm5713_chg_kick_watchdog(chg);
 	sm5713_chg_cable_work(&chg->cable_work.work);
 	schedule_delayed_work(&chg->wdt_work, SM5713_CHG_WDT_PERIOD);
+	if (!chg->suspended)
+		schedule_delayed_work(&chg->limit_work,
+				      SM5713_CHG_CABLE_PERIOD);
+
+	return 0;
+}
+
+/*
+ * System sleep.  In s2idle the kernel keeps running, so these delayed works keep
+ * firing - but the I2C adapter has been suspended and every transfer warns and
+ * fails.  Worse for charging than for the log: the charger's own watchdog stops
+ * charging if it is not re-armed (WDTCNTL[6]) and the vendor programs it for
+ * 90 s, so a suspend longer than that would silently end charging.
+ *
+ * The bus cannot be used, so the watchdog is switched off for the duration
+ * instead (WDTCNTL[0]; the vendor's WDTCNTL layout is timer index in [2:1],
+ * enable in bit 0, kick in bit 6).  The value found at suspend is put back on
+ * resume, so whatever the boot chain or another agent programmed survives, and
+ * the first kick after resume re-arms the timer anyway.
+ */
+static int sm5713_chg_suspend(struct device *dev)
+{
+	struct sm5713_charger *chg = dev_get_drvdata(dev);
+	u32 val;
+
+	chg->suspended = true;
+	cancel_delayed_work_sync(&chg->wdt_work);
+	cancel_delayed_work_sync(&chg->cable_work);
+	cancel_delayed_work_sync(&chg->limit_work);
+
+	mutex_lock(&chg->lock);
+	if (!sm5713_chg_read(chg, SM5713_CHG_WDTCNTL, &val)) {
+		chg->wdtcntl_saved = val;
+		chg->wdtcntl_saved_valid = true;
+		sm5713_chg_update_bits(chg, SM5713_CHG_WDTCNTL,
+				       SM5713_CHG_WDTCNTL_EN, 0);
+	}
+	mutex_unlock(&chg->lock);
+
+	return 0;
+}
+
+static int sm5713_chg_resume(struct device *dev)
+{
+	struct sm5713_charger *chg = dev_get_drvdata(dev);
+
+	chg->suspended = false;
+
+	mutex_lock(&chg->lock);
+	if (chg->wdtcntl_saved_valid) {
+		sm5713_chg_update_bits(chg, SM5713_CHG_WDTCNTL,
+				       SM5713_CHG_WDTCNTL_EN,
+				       chg->wdtcntl_saved &
+				       SM5713_CHG_WDTCNTL_EN);
+		chg->wdtcntl_saved_valid = false;
+	}
+	mutex_unlock(&chg->lock);
+
+	schedule_delayed_work(&chg->wdt_work, SM5713_CHG_WDT_PERIOD);
 	schedule_delayed_work(&chg->limit_work, SM5713_CHG_CABLE_PERIOD);
 
 	return 0;
 }
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sm5713_chg_pm_ops, sm5713_chg_suspend,
+				sm5713_chg_resume);
 
 static void sm5713_chg_remove(struct i2c_client *client)
 {
@@ -774,6 +850,7 @@ static struct i2c_driver sm5713_chg_driver = {
 	.driver = {
 		.name = "sm5713-charger",
 		.of_match_table = sm5713_chg_of_match,
+		.pm = pm_ptr(&sm5713_chg_pm_ops),
 	},
 	.probe = sm5713_chg_probe,
 	.remove = sm5713_chg_remove,
