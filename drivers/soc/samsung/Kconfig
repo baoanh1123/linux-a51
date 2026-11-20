@@ -104,3 +104,17 @@ config EXYNOS9610_G3D_PD
 	  It exposes debugfs knobs to power the domain down and back up with the
 	  vendor register sequences, so the sequence can be validated by hand
 	  before any device is attached to the domain.
+
+config EXYNOS9610_WLBT
+	tristate "Exynos 9610 SCSC/WLBT power and boot handshake"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on ARM64
+	help
+	  Power up the Samsung SCSC ("mx140") WiFi/Bluetooth subsystem and
+	  answer its configuration request on Exynos 9610.  The subsystem is
+	  driven over a mailbox: this driver only brings it out of reset and
+	  lets it start, which is the foundation the transport driver needs.
+
+	  The Galaxy A51 has no SDIO and no PCIe WiFi, so this block is the
+	  only route to a built-in wireless interface.  Say M unless you are
+	  working on that port.

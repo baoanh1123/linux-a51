@@ -16,3 +16,4 @@ obj-$(CONFIG_EXYNOS9611_MSHC_SNAPSHOT) += exynos9611-mshc-snapshot.o
 obj-$(CONFIG_SAMSUNG_PM_CHECK)	+= s3c-pm-check.o
 obj-$(CONFIG_EXYNOS9610_CPUHP)		+= exynos9610_cpuhp.o
 obj-$(CONFIG_EXYNOS9610_G3D_PD)		+= exynos9610-g3d-pd.o
+obj-$(CONFIG_EXYNOS9610_WLBT)		+= exynos9610-wlbt.o

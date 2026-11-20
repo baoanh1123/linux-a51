@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/samsung/exynos-wlbt.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos SCSC/WLBT wireless subsystem
+
+description:
+  The SCSC block carries the WiFi and Bluetooth combo chip (called mx140 in
+  Samsung's driver) on several Exynos SoCs.  It is not an ordinary peripheral:
+  it has its own firmware, its own power domain and a mailbox interface, and the
+  AP has to expose DRAM and a few peripheral ranges to it through bus window
+  controllers before it can boot.  This node describes the mailbox and the
+  window controllers that belong to it.
+
+maintainers:
+  - Samsung Exynos mainline port <noreply@example.com>
+
+properties:
+  compatible:
+    const: samsung,scsc_wifibt
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    items:
+      - description: mailbox doorbell from the subsystem
+      - description: subsystem alive indication
+      - description: subsystem watchdog reset request
+      - description: subsystem boot configuration request
+
+  interrupt-names:
+    items:
+      - const: MBOX
+      - const: ALIVE
+      - const: WDOG
+      - const: CFG_REQ
+
+  memory-region:
+    maxItems: 1
+    description:
+      MIF DRAM window.  The subsystem boots its firmware from this memory and
+      sees it through the data bus window, so it must be at least 16 MiB.
+
+  samsung,syscon-phandle:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PMU registers holding the power and reset control.
+
+  samsung,dbus_baaw-syscon-phandle:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Data bus window controller that maps the MIF DRAM.
+
+  samsung,pbus_baaw-syscon-phandle:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Peripheral bus window controller.
+
+  samsung,wlbt_remap-syscon-phandle:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Address remap block used during the boot handshake.
+
+  samsung,boot_cfg-syscon-phandle:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Boot configuration window used during the boot handshake.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - interrupt-names
+  - memory-region
+  - samsung,syscon-phandle
+
+additionalProperties: false
+
+examples:
+  - |
+    wifibt@119c0000 {
+        compatible = "samsung,scsc_wifibt";
+        reg = <0x119c0000 0x180>;
+        interrupts = <0 42 4>, <0 28 4>, <0 72 4>, <0 73 4>;
+        interrupt-names = "MBOX", "ALIVE", "WDOG", "CFG_REQ";
+        memory-region = <&wifibt_mem>;
+        samsung,syscon-phandle = <&pmu_system_controller>;
+        samsung,dbus_baaw-syscon-phandle = <&dbus_baaw>;
+        samsung,pbus_baaw-syscon-phandle = <&pbus_baaw>;
+        samsung,wlbt_remap-syscon-phandle = <&wlbt_remap>;
+        samsung,boot_cfg-syscon-phandle = <&boot_cfg>;
+    };

@@ -244,6 +244,22 @@
 		};
 
 		/*
+		 * 16 MiB of MIF DRAM for the SCSC/WLBT subsystem (WiFi and
+		 * Bluetooth).  The peer boots its firmware from this window and
+		 * sees it at 0x80000000 through the data bus controller, which
+		 * is programmed from this base, so the address is arbitrary as
+		 * long as it is 16 MiB aligned, below 4 GiB and outside every
+		 * other reservation.  The vendor allocates the same amount
+		 * dynamically (DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
+		 * exynos9610-rmem.dtsi:156-159); it sits just below the
+		 * framebuffer here to keep it out of the CMA pool's way.
+		 */
+		wifibt_mem: wifibt@c9000000 {
+			reg = <0x0 0xc9000000 0x1000000>;
+			no-map;
+		};
+
+		/*
 		 * Contiguous pool for the display driver's GEM buffers.  The DPU
 		 * IDMA channel takes plain 32-bit physical addresses, so scanout
 		 * buffers have to be contiguous.  A 1080x2400 XRGB8888 frame is
@@ -663,6 +679,64 @@
 			de-active = <1>;
 			pixelclk-active = <0>;
 		};
+	};
+};
+
+/*
+ * Samsung SCSC/WLBT - the WiFi and Bluetooth subsystem.  The Galaxy A51 has no
+ * SDIO and no PCIe WiFi; wireless lives in this separate block, which the AP
+ * boots over a mailbox.  Before it can run, the AP has to expose DRAM and a
+ * few peripheral ranges to it through the window controllers below, so those
+ * are part of the same device.
+ *
+ * Addresses and the interrupt set are from
+ * DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/exynos9610-wlbt.dtsi:2-45 and
+ * the sequences in
+ * DOWNSTREAM_READONLY/drivers/misc/samsung/scsc/platform_mif_9610.c.
+ * SPI 42/28/72/73 are the mailbox doorbell, the "alive" signal, the peer's
+ * watchdog reset request and its boot configuration request.
+ */
+/ {
+	baaw_p_wlbt: syscon@12050000 {
+		compatible = "samsung,exynos9610-baaw-p-wlbt", "syscon";
+		reg = <0x0 0x12050000 0xff>;
+	};
+
+	dbus_baaw: syscon@14c20000 {
+		compatible = "samsung,exynos9610-dbus-baaw", "syscon";
+		reg = <0x0 0x14c20000 0x300>;
+	};
+
+	pbus_baaw: syscon@14c30000 {
+		compatible = "samsung,exynos9610-pbus-baaw", "syscon";
+		reg = <0x0 0x14c30000 0x300>;
+	};
+
+	wlbt_remap: syscon@14c50000 {
+		compatible = "samsung,exynos9610-wlbt-remap", "syscon";
+		reg = <0x0 0x14c50000 0x300>;
+	};
+
+	boot_cfg: syscon@14c60000 {
+		compatible = "samsung,exynos9610-wlbt-boot-cfg", "syscon";
+		reg = <0x0 0x14c60000 0x1200>;
+	};
+
+	scsc_wifibt: wifibt@119c0000 {
+		compatible = "samsung,scsc_wifibt";
+		reg = <0x0 0x119c0000 0x180>;
+		interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 28 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "MBOX", "ALIVE", "WDOG", "CFG_REQ";
+		samsung,syscon-phandle = <&pmu_system_controller>;
+		samsung,baaw_p_wlbt-syscon-phandle = <&baaw_p_wlbt>;
+		samsung,dbus_baaw-syscon-phandle = <&dbus_baaw>;
+		samsung,pbus_baaw-syscon-phandle = <&pbus_baaw>;
+		samsung,wlbt_remap-syscon-phandle = <&wlbt_remap>;
+		samsung,boot_cfg-syscon-phandle = <&boot_cfg>;
+		memory-region = <&wifibt_mem>;
 	};
 };
 
