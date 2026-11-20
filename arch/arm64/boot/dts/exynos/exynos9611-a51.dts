@@ -535,17 +535,17 @@
 			trips {
 				cpu_alert0: cpu-alert-0 {
 					temperature = <65000>;
-					hysteresis = <2000>;
+					hysteresis = <4000>;
 					type = "passive";
 				};
 				cpu_alert1: cpu-alert-1 {
 					temperature = <75000>;
-					hysteresis = <2000>;
+					hysteresis = <4000>;
 					type = "passive";
 				};
 				cpu_alert2: cpu-alert-2 {
 					temperature = <85000>;
-					hysteresis = <2000>;
+					hysteresis = <4000>;
 					type = "passive";
 				};
 				soc_hot: soc-hot {

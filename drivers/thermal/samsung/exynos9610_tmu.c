@@ -74,7 +74,38 @@ struct exynos9610_tmu {
 	void __iomem *base;
 	struct clk *clk;
 	u32 trim[ARRAY_SIZE(exynos9610_tmu_points)];
+};
+
+/*
+ * One per zone: the sensor it reads, plus the last few readings.
+ *
+ * The filter is not cosmetic.  A single bad code out of the TMU (a read that
+ * lands while the sensing core is updating shows up as a plausible but wrong
+ * temperature) was seen to move a reading 30 C between two samples 300 ms
+ * apart, and a reading above 95 C makes the thermal core shut the machine down.
+ * The median of three consecutive reads drops an isolated bad one in either
+ * direction and still reacts to a real rise within two poll intervals.
+ */
+#define EXYNOS9610_TMU_HISTORY	3
+
+/*
+ * Largest change a single reading may report, in millidegrees.
+ *
+ * The median alone is not enough: it drops one bad sample, but two in a row
+ * still get through, and the sensor sits close enough to the shutdown trip that
+ * a false reading there powers the machine off.  A real die does not move 15 C
+ * in the 500 ms between polls, so anything beyond that is clamped - a genuine
+ * overheat still ramps past it within a few polls, a glitch cannot reach the
+ * trip at all.
+ */
+#define EXYNOS9610_TMU_MAX_STEP		(15 * MILLIDEGREE_PER_DEGREE)
+
+struct exynos9610_tmu_zone {
+	struct exynos9610_tmu *tmu;
 	unsigned int sensor;
+	int hist[EXYNOS9610_TMU_HISTORY];
+	int last;
+	unsigned int n;
 };
 
 /* Convert one raw 9-bit code to millidegrees Celsius. */
@@ -90,13 +121,15 @@ static int exynos9610_tmu_code_to_temp(struct exynos9610_tmu *tmu,
 
 static int exynos9610_tmu_get_temp(struct thermal_zone_device *tz, int *temp)
 {
-	struct exynos9610_tmu *tmu = thermal_zone_device_priv(tz);
+	struct exynos9610_tmu_zone *zone = thermal_zone_device_priv(tz);
+	struct exynos9610_tmu *tmu = zone->tmu;
 	unsigned int i, first, last;
 	int hottest = INT_MIN;
+	int a, b, c;
 
-	if (tmu->sensor < EXYNOS9610_TMU_SENSOR_MAX) {
-		first = tmu->sensor;
-		last = tmu->sensor + 1;
+	if (zone->sensor < EXYNOS9610_TMU_SENSOR_MAX) {
+		first = zone->sensor;
+		last = zone->sensor + 1;
 	} else {
 		first = 0;
 		last = EXYNOS9610_TMU_SENSOR_MAX;
@@ -132,7 +165,30 @@ static int exynos9610_tmu_get_temp(struct thermal_zone_device *tz, int *temp)
 	if (hottest == INT_MIN)
 		return -ENODATA;
 
-	*temp = hottest;
+	zone->hist[zone->n % EXYNOS9610_TMU_HISTORY] = hottest;
+	zone->n++;
+
+	if (zone->n == 1) {
+		zone->last = hottest;
+		*temp = hottest;
+		return 0;
+	}
+
+	if (zone->n < EXYNOS9610_TMU_HISTORY) {
+		*temp = clamp(hottest, zone->last - EXYNOS9610_TMU_MAX_STEP,
+			      zone->last + EXYNOS9610_TMU_MAX_STEP);
+		zone->last = *temp;
+		return 0;
+	}
+
+	/* Median of the last three, so one bad sample cannot move the zone. */
+	a = zone->hist[0];
+	b = zone->hist[1];
+	c = zone->hist[2];
+	*temp = clamp(max(min(a, b), min(max(a, b), c)),
+		      zone->last - EXYNOS9610_TMU_MAX_STEP,
+		      zone->last + EXYNOS9610_TMU_MAX_STEP);
+	zone->last = *temp;
 
 	return 0;
 }
@@ -199,8 +255,21 @@ static int exynos9610_tmu_probe(struct platform_device *pdev)
 	 */
 	zones = 0;
 	for (i = 0; i <= EXYNOS9610_TMU_SENSOR_MAX; i++) {
-		tmu->sensor = i;
-		tz = devm_thermal_of_zone_register(dev, i, tmu,
+		struct exynos9610_tmu_zone *zone;
+
+		/*
+		 * The private data is per zone, not shared: the sensor id used
+		 * to live in the common struct, so the last zone registered
+		 * decided what every zone read and all of them reported the
+		 * same "hottest of all" value.
+		 */
+		zone = devm_kzalloc(dev, sizeof(*zone), GFP_KERNEL);
+		if (!zone)
+			return -ENOMEM;
+		zone->tmu = tmu;
+		zone->sensor = i;
+
+		tz = devm_thermal_of_zone_register(dev, i, zone,
 						   &exynos9610_tmu_ops);
 		if (IS_ERR(tz)) {
 			if (PTR_ERR(tz) == -ENODEV)
