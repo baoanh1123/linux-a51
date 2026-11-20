@@ -670,3 +670,13 @@
 &cpuclk {
 	status = "okay";
 };
+
+/*
+ * The LITTLE rail hangs the SoC between 637.5 mV and 600 mV (600 mV being what
+ * the vendor table asks for at 403 MHz), so it is never written below 650 mV.
+ * The big rail tolerated 600 mV in the same test, but keeping one floor for both
+ * is simpler and still well clear of every operating point it has to reach.
+ */
+&cpuclk0 {
+	samsung,rail-floor-uv = <650000>;
+};

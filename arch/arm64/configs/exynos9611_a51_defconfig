@@ -142,5 +142,7 @@ CONFIG_NFS_FS=y
 CONFIG_NFS_V4=y
 CONFIG_NFS_V4_1=y
 CONFIG_NFS_V4_2=y
+# CPU frequency statistics (time_in_state) for cpufreq diagnostics
+CONFIG_CPU_FREQ_STAT=y
 # CPU cluster clock control (ACPM DVFS is firmware-owned but unserviced)
 CONFIG_EXYNOS9610_CPUCLK=y

@@ -146,6 +146,7 @@ struct exynos9610_cpucl {
 	struct mutex lock;	/* one rate change at a time per cluster */
 	struct acpm_handle *acpm;
 	u8 buck_reg;
+	unsigned int rail_floor_uv;	/* lowest rail value this board tolerates */
 	unsigned int applied_uv;	/* highest rail value written so far */
 	unsigned int *uvolt;	/* parallel to table, NULL when unknown */
 };
@@ -194,32 +195,32 @@ MODULE_PARM_DESC(arm, "Allow rates above the boot operating point from boot");
 static bool cpucl_armed;
 
 /*
- * Only ever raise a rail, never write a lower value.
+ * Only ever raise a rail, never write a lower value.  This was the workaround
+ * for "writing a rail downward freezes this board" and is now off by default,
+ * because that belief was wrong: what froze it was the vendor table's 600 mV
+ * entry for the lowest LITTLE operating point, and the rail tolerates anything
+ * from 643.75 mV up (see rail_floor_uv).  With the floor in place the rails
+ * track the operating points in both directions, which is what makes this a
+ * real DVFS driver instead of a clock driver.
  *
- * Writing a CPU rail downward freezes this device, reproducibly, even with the
- * cluster already sitting at a frequency that needs the lower voltage, and with
- * the very same PMIC interface and register the firmware uses - so it is not an
- * ordering or undervoltage problem that can be fixed here.  With this on, the
- * full range of operating points is still usable: the rail is raised before the
- * frequency goes up and simply left alone when it comes down.  The cost is that
- * a rail stays at the highest value it reached until the next boot, where the
- * boot chain programs the boot voltage again.
- *
- * Turn it off only to experiment with the downward direction.
+ * Turn it on to keep the rails at the highest value they reached, which is
+ * still useful when bisecting a voltage problem.
  */
-static bool boost_only = true;
+static bool boost_only;
 module_param(boost_only, bool, 0644);
 MODULE_PARM_DESC(boost_only, "Only ever raise the CPU rails, never lower them");
 
 /*
- * Largest rail change written in one go, in selector steps (one step is
- * 6.25 mV).  Every attempt at writing a rail downward so far used a single
- * large jump; a buck can refuse or glitch on that, so the writes are slewed in
- * small steps here.  0 means "write the target in one go".
+ * Largest rail change the debugfs probe writes in one go, in selector steps (one
+ * step is 6.25 mV).  The normal path writes the target in a single register
+ * write and lets the PMIC ramp - which is what the vendor regulator does, and
+ * what keeps a full-range change at one 12 ms ramp instead of eight.  The probe
+ * defaults to small steps because walking a rail by hand is how the floor was
+ * measured and a jump hides where it is.
  */
 static unsigned int buck_step = 8;
 module_param(buck_step, uint, 0644);
-MODULE_PARM_DESC(buck_step, "Max rail change per write, in 6.25 mV selector steps");
+MODULE_PARM_DESC(buck_step, "Max rail change per debugfs write, in 6.25 mV steps");
 
 /*
  * Relocking one cluster while the other is relocking makes the lock wait
@@ -500,6 +501,19 @@ static int cpucl_relock(struct exynos9610_cpucl *c, unsigned long hz)
 	return ret;
 }
 
+/*
+ * Never write a rail below the floor this board was measured to tolerate.  The
+ * LITTLE rail hangs the SoC between 637.5 mV and 600 mV (the last value being
+ * what the vendor table asks for at 403 MHz); the big rail was walked down to
+ * 600 mV without trouble, so the floor is set per cluster from the device tree
+ * and defaults to the LITTLE measurement, which is safe for both.
+ */
+static unsigned int cpucl_rail_uv(const struct exynos9610_cpucl *c,
+				  unsigned int uv)
+{
+	return uv < c->rail_floor_uv ? c->rail_floor_uv : uv;
+}
+
 static unsigned int cpucl_uvolt_for(const struct exynos9610_cpucl *c,
 				    unsigned long hz)
 {
@@ -534,7 +548,7 @@ static unsigned long cpucl_ceiling_hz(const struct exynos9610_cpucl *c)
  * rail is not what was asked for" and do not touch the frequency.
  */
 static int cpucl_buck_slew(struct exynos9610_cpucl *c, unsigned int uvolt,
-			   bool loud)
+			   unsigned int max_step, bool loud)
 {
 	const struct acpm_pmic_ops *ops;
 	unsigned int sel, delta, n = 0;
@@ -562,14 +576,14 @@ static int cpucl_buck_slew(struct exynos9610_cpucl *c, unsigned int uvolt,
 		pr_emerg("cpucl: %s buck 0x%02x -> 0x%02x (%u -> %u uV) step %u\n",
 			 c->name, old, (u8)sel,
 			 old * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV,
-			 sel * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV, buck_step);
+			 sel * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV, max_step);
 
 	while (old != sel) {
 		u8 next;
 
 		delta = old > sel ? old - sel : sel - old;
-		if (buck_step && delta > buck_step)
-			delta = buck_step;
+		if (max_step && delta > max_step)
+			delta = max_step;
 
 		next = old > sel ? old - delta : old + delta;
 
@@ -596,9 +610,14 @@ static int cpucl_buck_slew(struct exynos9610_cpucl *c, unsigned int uvolt,
 	return n;
 }
 
+/*
+ * One write, then wait out the PMIC's ramp.  The buck ramps internally, so
+ * stepping here would only multiply the time the cpufreq workqueue spends with
+ * the cores at the old rate.
+ */
 static int cpucl_buck_set(struct exynos9610_cpucl *c, unsigned int uvolt)
 {
-	int ret = cpucl_buck_slew(c, uvolt, false);
+	int ret = cpucl_buck_slew(c, uvolt, 0, false);
 
 	return ret < 0 ? ret : 1;
 }
@@ -636,8 +655,8 @@ static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
 	if (cur == hz)
 		return 0;
 
-	uvolt = volt_scale ? cpucl_uvolt_for(c, hz) : 0;
-	boot_uv = volt_scale ? cpucl_uvolt_for(c, c->boot_hz) : 0;
+	uvolt = volt_scale ? cpucl_rail_uv(c, cpucl_uvolt_for(c, hz)) : 0;
+	boot_uv = volt_scale ? cpucl_rail_uv(c, cpucl_uvolt_for(c, c->boot_hz)) : 0;
 	raising = hz > cur;
 
 	/* Never step a rail down in bring-up mode. */
@@ -1134,8 +1153,9 @@ static int cpucl_dump_show(struct seq_file *s, void *unused)
 		if (c->uvolt) {
 			unsigned int j;
 
-			seq_printf(s, "    buck 0x%02x  asv group %d\n",
-				   c->buck_reg, cpucl_asv_group(c->id));
+			seq_printf(s, "    buck 0x%02x  asv group %d  rail floor %u uV\n",
+				   c->buck_reg, cpucl_asv_group(c->id),
+				   c->rail_floor_uv);
 			for (j = 0; c->table[j].frequency != CPUFREQ_TABLE_END; j++)
 				seq_printf(s, "    %7u kHz  %7u uV\n",
 					   c->table[j].frequency, c->uvolt[j]);
@@ -1282,7 +1302,8 @@ static ssize_t cpucl_buck_write(struct file *file, const char __user *ubuf,
 	 * and read /sys/fs/pstore/console-ramoops-0 to see how far it got.
 	 */
 	ret = cpucl_buck_slew(&clusters[cluster],
-			      val * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV, true);
+			      val * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV,
+			      buck_step, true);
 
 	return ret < 0 ? ret : count;
 }
@@ -1350,6 +1371,16 @@ static int cpucl_add(struct platform_device *pdev, struct device_node *np,
 		c->buck_reg = val;
 	else
 		c->buck_reg = c->id ? 0x1b : 0x1d;
+
+	/*
+	 * Lowest rail value this board tolerates.  650 mV clears the measured
+	 * LITTLE floor of 643.75 mV; the big rail is fine lower, but this
+	 * default is safe for both and the device tree can override it.
+	 */
+	ret = of_property_read_u32(np, "samsung,rail-floor-uv", &val);
+	c->rail_floor_uv = ret ? 650000U : val;
+	if (c->rail_floor_uv < CPUCL_BUCK_MIN_UV)
+		c->rail_floor_uv = CPUCL_BUCK_MIN_UV;
 
 	ret = of_property_read_u32(np, "samsung,pll-con0-offset", &val);
 	if (ret)
