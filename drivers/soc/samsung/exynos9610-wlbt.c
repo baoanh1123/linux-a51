@@ -34,9 +34,11 @@
  */
 
 #include <linux/arm-smccc.h>
+#include <linux/unaligned.h>
 #include <linux/completion.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/jiffies.h>
@@ -118,6 +120,34 @@
 #define CHIP_VERSION_ID_EMA_MASK	0x003fffff
 #define CHIP_VERSION_ID_EMA_VALUE	(BIT(20) | BIT(18) | BIT(13) | \
 					 BIT(11) | BIT(5) | BIT(2))
+
+/*
+ * The peer starts its firmware when it is released from reset and finds an
+ * entry point in mailbox 0, so the four mailbox registers have to be filled
+ * before the power sequence runs (mxman.c:1155 "mbox_init"):
+ *
+ *	ISSR0 = firmware entry point
+ *	ISSR1 = MIF-relative address of the firmware configuration (mxconf)
+ *	ISSR2 = 0xbcdeedcb, the "you may start" magic
+ *	ISSR3 = startup flags (0 = run normally)
+ */
+#define MBOX_ISSR_ENTRY			0	/* fw entry point */
+#define MBOX_ISSR_CONFIG		1	/* mxconf, MIF-relative */
+#define MBOX_ISSR_MAGIC			2
+#define MBOX_ISSR_FLAGS			3
+#define MBOX_START_MAGIC		0xbcdeedcb
+
+/* Firmware header (fwhdr.c:14-31): "smxf" at offset 8, header at the start of
+ * the image.  The entry point is a MIF-relative address, so it is added to the
+ * window the peer sees, not to the physical base.
+ */
+#define FW_HDR_MAGIC_OFFSET		8
+#define FW_HDR_RUNTIME_LENGTH_OFFSET	36
+#define FW_HDR_ENTRY_OFFSET		40
+#define FW_HDR_PANIC_OFFSET		176	/* R4 panic record */
+#define FW_HDR_BUILD_ID_OFFSET		48
+#define FW_HDR_BUILD_ID_MAX		64
+#define FW_HDR_MIN_SIZE			192
 
 #define BOOT_CFG_HOLD			0x00	/* 1 = keep the peer held */
 #define BOOT_CFG_ACK			0x04	/* 1 = configuration done */
@@ -203,6 +233,12 @@ struct exynos_wlbt {
 	enum wlbt_state state;
 	phys_addr_t mem_base;		/* MIF DRAM, 16 MiB */
 	resource_size_t mem_size;
+	void __iomem *dram;		/* uncached view of it */
+	u32 fw_entry;			/* MIF-relative entry point */
+	u32 fw_runtime_length;
+	u32 fw_size;			/* bytes of image copied in */
+	u32 fw_panic_offset;
+	bool fw_loaded;
 	unsigned int n_cfg_req;
 	unsigned int n_cfg_bad;
 	unsigned int n_wdog;
@@ -210,6 +246,14 @@ struct exynos_wlbt {
 	u32 last_mbox_status;
 	struct dentry *debugfs;
 };
+
+static char *firmware_name = "mx140/mx140.bin";
+module_param(firmware_name, charp, 0444);
+MODULE_PARM_DESC(firmware_name, "Firmware image for the WLBT subsystem");
+
+static bool load_firmware;
+module_param(load_firmware, bool, 0644);
+MODULE_PARM_DESC(load_firmware, "Copy the firmware image into MIF DRAM and let the peer run it");
 
 static const char *wlbt_state_name(enum wlbt_state state)
 {
@@ -475,6 +519,94 @@ static irqreturn_t wlbt_mbox_isr(int irq, void *data)
 }
 
 /*
+ * Copy the firmware into the MIF DRAM window the peer boots from.  The peer
+ * reads it over the data bus, which does not snoop our caches, so the mapping
+ * has to be write-combining like the vendor's platform_mif_map_region(); a
+ * cached copy would leave the peer with stale lines.
+ *
+ * The image is placed at offset 0 and the peer is entered at the entry point in
+ * its header.  Everything past the image stays zeroed so the firmware's BSS is
+ * clean, which is what the vendor gets from freshly allocated DMA memory.
+ */
+static int wlbt_load_firmware(struct exynos_wlbt *w)
+{
+	const struct firmware *fw;
+	int ret;
+
+	ret = request_firmware(&fw, firmware_name, w->dev);
+	if (ret) {
+		dev_warn(w->dev, "firmware %s not available: %d\n",
+			 firmware_name, ret);
+		return ret;
+	}
+
+	if (fw->size < FW_HDR_MIN_SIZE ||
+	    memcmp(fw->data + FW_HDR_MAGIC_OFFSET, "smxf", 4)) {
+		dev_err(w->dev, "%s is not a Maxwell firmware image\n",
+			firmware_name);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	w->fw_entry = get_unaligned_le32(fw->data + FW_HDR_ENTRY_OFFSET);
+	w->fw_runtime_length =
+		get_unaligned_le32(fw->data + FW_HDR_RUNTIME_LENGTH_OFFSET);
+
+	if (w->fw_runtime_length > w->mem_size) {
+		dev_err(w->dev, "firmware needs %u bytes, the window is %pa\n",
+			w->fw_runtime_length, &w->mem_size);
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	w->fw_size = fw->size;
+	if (fw->size >= FW_HDR_PANIC_OFFSET + 4)
+		w->fw_panic_offset =
+			get_unaligned_le32(fw->data + FW_HDR_PANIC_OFFSET);
+
+	if (!w->dram) {
+		w->dram = memremap(w->mem_base, w->mem_size, MEMREMAP_WC);
+		if (!w->dram) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+
+	memset_io(w->dram, 0, w->mem_size);
+	memcpy_toio(w->dram, fw->data, fw->size);
+	/* The peer reads the image over the bus; drain the writes first. */
+	wmb();
+
+	w->fw_loaded = true;
+	ret = 0;
+
+	dev_info(w->dev, "firmware loaded: %zu bytes, runtime %u, entry 0x%x\n",
+		 fw->size, w->fw_runtime_length, w->fw_entry);
+	dev_info(w->dev, "firmware build: %.*s\n", FW_HDR_BUILD_ID_MAX,
+		 fw->data + FW_HDR_BUILD_ID_OFFSET);
+out:
+	release_firmware(fw);
+
+	return ret;
+}
+
+/*
+ * Hand the peer its start parameters (mxman.c:1155-1183).  Configuration is
+ * left empty for now: the real mxconf needs the layered port of the vendor
+ * configuration builder, and an empty one is the cheapest way to find out how
+ * far the firmware gets without it.
+ */
+static void wlbt_mbox_init(struct exynos_wlbt *w)
+{
+	writel(w->fw_entry, w->mbox + MBOX_ISSR_BASE + MBOX_ISSR_ENTRY * 4);
+	writel(0, w->mbox + MBOX_ISSR_BASE + MBOX_ISSR_CONFIG * 4);
+	writel(MBOX_START_MAGIC, w->mbox + MBOX_ISSR_BASE + MBOX_ISSR_MAGIC * 4);
+	writel(0, w->mbox + MBOX_ISSR_BASE + MBOX_ISSR_FLAGS * 4);
+	/* The peer reads these through the bus; make sure they are there. */
+	wmb();
+}
+
+/*
  * Power up and let the peer run (platform_mif_9610.c:1043-1069).  The caller
  * holds w->lock and has already put the state machine in WAIT_CFG_REQ.
  */
@@ -584,9 +716,27 @@ static void wlbt_boot(struct exynos_wlbt *w)
 	mutex_lock(&w->lock);
 	w->state = WLBT_WAIT_CFG_REQ;
 	reinit_completion(&w->cfg_ack);
+
+	/*
+	 * Loading firmware is opt-in until the transport that talks to it
+	 * exists: without HIP4 nothing answers the peer, and a boot path that
+	 * starts a subsystem nothing services is not worth having.
+	 */
+	if (load_firmware && !w->fw_loaded)
+		wlbt_load_firmware(w);
+	if (w->fw_loaded)
+		wlbt_mbox_init(w);
+
 	ret = wlbt_power_up(w);
-	if (ret)
+	if (ret) {
 		dev_err(w->dev, "boot failed: %d\n", ret);
+	} else if (w->fw_loaded) {
+		/* Give the firmware a moment to boot and say something. */
+		msleep(200);
+		dev_info(w->dev, "after boot: INTSR0 0x%08x INTMSR0 0x%08x\n",
+			 readl(w->mbox + MBOX_INTSR0),
+			 readl(w->mbox + MBOX_INTMSR0));
+	}
 	mutex_unlock(&w->lock);
 }
 
@@ -626,6 +776,49 @@ static const struct file_operations wlbt_boot_fops =
 static const struct file_operations wlbt_reset_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_reset);
 
+/*
+ * What did the peer do with its memory?  The image occupies [0, fw_size) and
+ * the runtime, heap and panic record live above it, so anything non-zero up
+ * there was written by the peer - the cheapest proof that the firmware is
+ * really running, and where it stopped if it is not.
+ */
+static void wlbt_dram_report(struct exynos_wlbt *w, struct seq_file *s)
+{
+	unsigned int i, nz = 0, first_nz = 0;
+	u32 val;
+
+	if (!w->dram || !w->fw_loaded)
+		return;
+
+	for (i = w->fw_size & ~3u; i + 4 <= w->fw_runtime_length; i += 4) {
+		if (readl(w->dram + i)) {
+			if (!nz)
+				first_nz = i;
+			nz++;
+		}
+	}
+
+	seq_printf(s, "peer memory: %u non-zero words above the image (%u bytes), first at 0x%x\n",
+		   nz, w->fw_size, first_nz);
+
+	if (nz) {
+		seq_printf(s, "peer words @0x%x:", first_nz);
+		for (i = 0; i < 8; i++)
+			seq_printf(s, " %08x",
+				   readl(w->dram + first_nz + i * 4));
+		seq_puts(s, "\n");
+	}
+
+	if (w->fw_panic_offset && w->fw_panic_offset + 32 <= w->mem_size) {
+		seq_printf(s, "panic record @0x%x:", w->fw_panic_offset);
+		for (i = 0; i < 8; i++) {
+			val = readl(w->dram + w->fw_panic_offset + i * 4);
+			seq_printf(s, " %08x", val);
+		}
+		seq_puts(s, "\n");
+	}
+}
+
 static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 {
 	struct exynos_wlbt *w = s->private;
@@ -635,6 +828,9 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 	seq_printf(s, "state %s  MIF DRAM %pa  irq cfg-req %u bad %u wdog %u mbox %u\n",
 		   wlbt_state_name(w->state), &w->mem_base, w->n_cfg_req,
 		   w->n_cfg_bad, w->n_wdog, w->n_mbox);
+	seq_printf(s, "firmware %s, entry 0x%x, runtime %u, dram %s\n",
+		   firmware_name, w->fw_entry, w->fw_runtime_length,
+		   w->fw_loaded ? "loaded" : "not loaded");
 	seq_printf(s, "mailbox last status 0x%04x\n", w->last_mbox_status);
 
 	regmap_read(w->pmu, CENTRAL_SEQ_WLBT_STATUS, &val);
@@ -651,6 +847,14 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 		   readl(w->mbox + MBOX_MCUCTRL),
 		   readl(w->mbox + MBOX_INTSR0),
 		   readl(w->mbox + MBOX_INTMR0));
+
+	wlbt_dram_report(w, s);
+
+	if (w->dram)
+		for (i = 0; i < 8; i++)
+			seq_printf(s, "dram[%u] 0x%08x%s", i,
+				   readl(w->dram + i * 4),
+				   i % 4 == 3 ? "\n" : "  ");
 
 	for (i = 0; i < MBOX_NUM_ISSR; i++)
 		seq_printf(s, "ISSR%u 0x%08x%s", i,
@@ -820,6 +1024,9 @@ static void wlbt_remove(struct platform_device *pdev)
 	mutex_unlock(&w->lock);
 
 	debugfs_remove(w->debugfs);
+
+	if (w->dram)
+		memunmap(w->dram);
 }
 
 static const struct of_device_id wlbt_of_match[] = {
