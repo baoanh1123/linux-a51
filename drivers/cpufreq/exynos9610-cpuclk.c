@@ -918,6 +918,12 @@ static struct cpufreq_driver cpucl_cpufreq_driver = {
 	.verify		= cpufreq_generic_frequency_table_verify,
 	.target_index	= cpucl_cpufreq_target,
 	.get		= cpucl_cpufreq_get,
+	/*
+	 * Let the core register this policy as a thermal cooling device, so the
+	 * thermal zones can throttle the clusters instead of letting an all-core
+	 * load at the top operating points reach the platform shutdown.
+	 */
+	.flags		= CPUFREQ_IS_COOLING_DEV,
 };
 
 static int cpucl_dump_show(struct seq_file *s, void *unused)
