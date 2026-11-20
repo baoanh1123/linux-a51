@@ -178,24 +178,29 @@ module_param(volt_scale, bool, 0644);
 MODULE_PARM_DESC(volt_scale, "Build the operating points above the boot rate (needs the ECT tables)");
 
 /*
- * Arming.  Off by default, and that is the important part of this driver: while
- * it is off nothing above the boot operating point is allowed and the CPU rails
- * are never written, so a boot can only ever run at the frequencies and voltages
- * the boot chain already validated.  Everything that has been suspected of
- * hanging this board - the rail writes and the top operating points - is behind
- * this switch.
+ * Arming: on by default, because the platform is expected to run at its rated
+ * operating points, not at whatever the boot chain happened to leave behind.
  *
- * Arm it at runtime:
+ * This switch exists because everything that was ever suspected of hanging this
+ * board - the rail writes, the top operating points, the PLL relock - is behind
+ * it, and during bring-up a boot that cannot reach any of it is worth more than
+ * a boot that is fast.  All three turned out to be understood (see notes/
+ * cpufreq.md: the PLL STABLE bit is not a lock indicator, "downward rail writes
+ * hang the board" was the destination voltage, and the rail floor is 643.75 mV),
+ * so it is now on: twelve soak rounds of full-range transitions, 8-core loads,
+ * hotplug and thermal throttling on dpu129 ran without a single relock error.
  *
- *	echo 1 > /sys/kernel/debug/exynos9610-cpuclk/arm
+ * Turn it off at boot with exynos9610_cpuclk.arm=0, or at runtime with
  *
- * or at boot with exynos9610_cpuclk.arm=1.  The point of the split is that a
- * failed experiment is recoverable: the next boot starts inert again, so a
- * freeze costs a power cycle instead of a reflash.
+ *	echo 0 > /sys/kernel/debug/exynos9610-cpuclk/arm
+ *
+ * which is what to reach for when bisecting something new: an unarmed kernel
+ * never writes the PMIC and never leaves the operating points the boot chain
+ * validated.
  */
-static bool arm;
+static bool arm = true;
 module_param(arm, bool, 0644);
-MODULE_PARM_DESC(arm, "Allow rates above the boot operating point from boot");
+MODULE_PARM_DESC(arm, "Allow rates above the boot operating point (default: on)");
 
 static bool cpucl_armed;
 
@@ -1803,9 +1808,8 @@ static int cpucl_probe(struct platform_device *pdev)
 
 	/*
 	 * Arming is what turns the operating points above the boot rate on, and
-	 * with them the rail writes.  It is off unless the kernel command line
-	 * asks for it (exynos9610_cpuclk.arm=1), so a plain boot is limited to
-	 * the boot operating point and never touches the PMIC.
+	 * with them the rail writes.  It is on unless the kernel command line
+	 * turns it off (exynos9610_cpuclk.arm=0).
 	 */
 	cpucl_armed = arm;
 
@@ -1824,8 +1828,9 @@ static int cpucl_probe(struct platform_device *pdev)
 	debugfs_create_file("arm", 0644, cpucl_debugfs, NULL,
 			    &cpucl_arm_fops);
 
-	dev_info(&pdev->dev, "%s (exynos9610_cpuclk.arm=1 to unlock the top operating points)\n",
-		 cpucl_armed ? "armed" : "not armed");
+	dev_info(&pdev->dev, "%s (exynos9610_cpuclk.arm=0 for the boot operating points only)\n",
+		 cpucl_armed ? "armed: top operating points unlocked"
+			     : "not armed: boot operating point only");
 
 	platform_set_drvdata(pdev, clusters);
 
