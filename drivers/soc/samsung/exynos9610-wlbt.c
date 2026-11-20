@@ -97,6 +97,10 @@
 #define MBOX_INTSR0			0x014	/* status, [31:16] */
 #define MBOX_INTMSR0			0x018	/* unmasked status, [31:16] */
 #define MBOX_INTGR1			0x01c	/* raise IRQ to WLBT, [15:0] */
+#define MBOX_INTCR1			0x020	/* clear IRQ to WLBT, [15:0] */
+#define MBOX_INTMR1			0x024	/* mask IRQ to WLBT, [15:0] */
+#define MBOX_INTSR1			0x028	/* status, [15:0] */
+#define MBOX_INTMSR1			0x02c	/* unmasked status, [15:0] */
 #define MBOX_IS_VERSION			0x050
 #define MBOX_ISSR_BASE			0x080	/* shared registers, 4 bytes each */
 #define MBOX_SSC			0x180	/* semaphores, 4 bytes each */
@@ -131,6 +135,18 @@
  *	ISSR2 = 0xbcdeedcb, the "you may start" magic
  *	ISSR3 = startup flags (0 = run normally)
  */
+/* Maxwell agent messages, must match the firmware (mxman.c:529). */
+#define WLBT_MM_START_IND		0
+#define WLBT_MM_HALT_REQ		1
+#define WLBT_MM_FORCE_PANIC		2
+#define WLBT_MM_HOST_SUSPEND		3
+#define WLBT_MM_HOST_RESUME		4
+#define WLBT_MM_FW_CONFIG		5
+#define WLBT_MM_HALT_RSP			6
+#define WLBT_MM_SYSERR_IND		9
+
+#define MMTRANS_CHAN_ID_MAXWELL_MANAGEMENT	0
+
 #define MBOX_ISSR_ENTRY			0	/* fw entry point */
 #define MBOX_ISSR_CONFIG		1	/* mxconf, MIF-relative */
 #define MBOX_ISSR_MAGIC			2
@@ -390,7 +406,11 @@ struct exynos_wlbt {
 
 static u32 wlbt_stream_read(struct exynos_wlbt *w, struct wlbt_stream *s,
 			    void *dst, u32 bytes);
+static bool wlbt_stream_write(struct exynos_wlbt *w, struct wlbt_stream *s,
+			      const void *src, u32 bytes);
 static void wlbt_log_drain(struct exynos_wlbt *w);
+static bool wlbt_mgmt_send(struct exynos_wlbt *w, u8 channel, u8 ma_msg,
+			   u32 arg);
 static void wlbt_mgmt_drain(struct exynos_wlbt *w);
 
 static char *firmware_name = "mx140/mx140.bin";
@@ -647,6 +667,20 @@ static irqreturn_t wlbt_wdog_isr(int irq, void *data)
  * halt, panic notification, ...).  Without the message table ported yet, dump
  * what arrives so the first exchange can be read off the wire.
  */
+/*
+ * One management message: the channel byte, then a packed
+ * struct ma_msg_packet { u8 ma_msg; u32 arg; } (mxman.c:547).
+ */
+static bool wlbt_mgmt_send(struct exynos_wlbt *w, u8 channel, u8 ma_msg, u32 arg)
+{
+	u8 frame[6] = { channel, ma_msg };
+	__le32 le = cpu_to_le32(arg);
+
+	memcpy(frame + 2, &le, sizeof(le));
+
+	return wlbt_stream_write(w, &w->mgmt_out, frame, sizeof(frame));
+}
+
 static void wlbt_mgmt_drain(struct exynos_wlbt *w)
 {
 	char hex[3 * 32 + 1];
@@ -895,6 +929,50 @@ static u32 wlbt_stream_read(struct exynos_wlbt *w, struct wlbt_stream *s,
 	return bytes;
 }
 
+/*
+ * A short write still costs a whole cell: cpacketbuffer_write_gather() pads
+ * the tail and advances the index once, so the peer never sees a half cell.
+ */
+static bool wlbt_stream_write(struct exynos_wlbt *w, struct wlbt_stream *s,
+			      const void *src, u32 bytes)
+{
+	const u8 *p = src;
+	u8 *cell;
+	u32 cells, i, ridx, widx, left;
+
+	if (!w->dram || !bytes)
+		return false;
+
+	ridx = readl(w->dram + s->ridx);
+	widx = readl(w->dram + s->widx);
+	if (ridx >= s->num_packets || widx >= s->num_packets)
+		return false;
+
+	cells = DIV_ROUND_UP(bytes, s->packet_size);
+	if (cells >= s->num_packets)
+		return false;
+
+	cell = kzalloc(s->packet_size, GFP_KERNEL);
+	if (!cell)
+		return false;
+
+	for (i = 0; i < cells; i++) {
+		left = bytes - i * s->packet_size;
+		memcpy(cell, p + i * s->packet_size, min(left, s->packet_size));
+		memcpy_toio(w->dram + s->buf + ((widx + i) % s->num_packets) *
+			    s->packet_size, cell, s->packet_size);
+	}
+	kfree(cell);
+
+	/* memcpy_toio() orders the copies against the index store below. */
+	writel((widx + cells) % s->num_packets, w->dram + s->widx);
+
+	/* Kick the peer the way mif_stream_write_gather() does. */
+	writel(BIT(s->write_bit), w->mbox + MBOX_INTGR1);
+
+	return true;
+}
+
 static const char *wlbt_fw_level(u8 level)
 {
 	switch (level) {
@@ -956,9 +1034,18 @@ static void wlbt_log_drain(struct exynos_wlbt *w)
 			 * the firmware carries; until that table is ported, show
 			 * the raw words so the messages can still be read.
 			 */
-			if (w->n_fwlog_bad <= 8)
-				dev_info(w->dev, "firmware log (phase 5, level %u):%*phN\n",
-					 level, (int)min(got, 32u), text);
+			if (w->n_fwlog_bad <= 64) {
+				const __le32 *args = (const __le32 *)text;
+				u32 nwords = got / 4;
+
+				dev_info(w->dev, "fwlog5 lvl %u off 0x%x argc %u:%s\n",
+					 level, nwords > 1 ? le32_to_cpu(args[1]) : 0,
+					 nwords > 2 ? nwords - 2 : 0,
+					 nwords > 2 ? "" : " (no args)");
+				if (nwords > 2)
+					dev_info(w->dev, "fwlog5 args:%*phN\n",
+						 (int)((nwords - 2) * 4), text + 8);
+			}
 		}
 	}
 }
@@ -1220,6 +1307,43 @@ static ssize_t wlbt_debugfs_boot(struct file *file, const char __user *buf,
 	return len;
 }
 
+/*
+ * Ask the peer to halt and wait for MM_HALT_RSP.  Nothing here needs the
+ * reply, but a round trip is the only way to prove the outbound management
+ * path works before HIP4 depends on it.
+ */
+static ssize_t wlbt_debugfs_halt(struct file *file, const char __user *buf,
+				 size_t len, loff_t *ppos)
+{
+	struct exynos_wlbt *w = file->private_data;
+	unsigned int before = w->n_mgmt;
+	bool sent;
+	int i;
+
+	mutex_lock(&w->lock);
+	sent = wlbt_mgmt_send(w, MMTRANS_CHAN_ID_MAXWELL_MANAGEMENT,
+			      WLBT_MM_HALT_REQ, 0);
+
+	/* Watch the doorbell before draining anything: the log acknowledgements
+	 * write the same register, so a drain here would hide the result.
+	 */
+	for (i = 0; i < 10; i++) {
+		if (!(readl(w->mbox + MBOX_INTSR1) & BIT(WLBT_BIT_MGMT_OUT_WRITE)))
+			break;
+		msleep(100);
+	}
+	dev_info(w->dev, "halt requested (%s), peer %s the doorbell, ring read %u write %u\n",
+		 sent ? "written" : "failed",
+		 i < 10 ? "took" : "ignored",
+		 readl(w->dram + w->mgmt_out.ridx),
+		 readl(w->dram + w->mgmt_out.widx));
+	wlbt_mgmt_drain(w);
+	dev_info(w->dev, "%u management message(s) in reply\n", w->n_mgmt - before);
+	mutex_unlock(&w->lock);
+
+	return sent ? len : -EIO;
+}
+
 static ssize_t wlbt_debugfs_reset(struct file *file, const char __user *buf,
 				  size_t len, loff_t *ppos)
 {
@@ -1245,6 +1369,8 @@ static const struct file_operations wlbt_boot_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_boot);
 static const struct file_operations wlbt_reset_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_reset);
+static const struct file_operations wlbt_halt_fops =
+	WLBT_DEBUGFS_OPS(wlbt_debugfs_halt);
 
 /*
  * What did the peer do with its memory?  The image occupies [0, fw_size) and
@@ -1289,6 +1415,17 @@ static void wlbt_dram_report(struct exynos_wlbt *w, struct seq_file *s)
 	}
 }
 
+static void wlbt_stream_status(struct exynos_wlbt *w, struct seq_file *s,
+			       struct wlbt_stream *st)
+{
+	if (!w->dram)
+		return;
+
+	seq_printf(s, "stream %-10s cells %4u x %3u  read %u write %u\n",
+		   st->name, st->num_packets, st->packet_size,
+		   readl(w->dram + st->ridx), readl(w->dram + st->widx));
+}
+
 static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 {
 	struct exynos_wlbt *w = s->private;
@@ -1312,6 +1449,9 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 	regmap_read(w->pmu, CENTRAL_SEQ_WLBT_CONFIGURATION, &val);
 	seq_printf(s, "CENTRAL_SEQ_WLBT_CONFIGURATION 0x%08x\n", val);
 
+	seq_printf(s, "irq to peer: INTGR1 0x%08x INTMR1 0x%08x INTSR1 0x%08x\n",
+		   readl(w->mbox + MBOX_INTGR1), readl(w->mbox + MBOX_INTMR1),
+		   readl(w->mbox + MBOX_INTSR1));
 	seq_printf(s, "mailbox IS_VERSION 0x%08x MCUCTRL 0x%08x INTSR0 0x%08x INTMR0 0x%08x\n",
 		   readl(w->mbox + MBOX_IS_VERSION),
 		   readl(w->mbox + MBOX_MCUCTRL),
@@ -1321,6 +1461,9 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 	wlbt_dram_report(w, s);
 
 	if (w->dram && w->mxconf_offset) {
+		wlbt_stream_status(w, s, &w->mgmt_in);
+		wlbt_stream_status(w, s, &w->mgmt_out);
+		wlbt_stream_status(w, s, &w->log);
 		seq_printf(s, "streams: log %u bytes queued (fw %u, bad %u), mgmt %u messages\n",
 			   ((readl(w->dram + w->log.widx) + w->log.num_packets -
 			     readl(w->dram + w->log.ridx)) % w->log.num_packets) *
@@ -1375,6 +1518,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("dump", 0400, w->debugfs, w, &wlbt_dump_fops);
 	debugfs_create_file("boot", 0200, w->debugfs, w, &wlbt_boot_fops);
 	debugfs_create_file("off", 0200, w->debugfs, w, &wlbt_reset_fops);
+	debugfs_create_file("halt", 0200, w->debugfs, w, &wlbt_halt_fops);
 }
 
 static struct regmap *wlbt_syscon(struct exynos_wlbt *w, const char *name)
