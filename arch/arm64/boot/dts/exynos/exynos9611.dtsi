@@ -232,6 +232,43 @@
 		clock-names = "fin_pll";
 	};
 
+
+	/*
+	 * CPU cluster clocks and PLLs.  The ACPM firmware owns CPU DVFS on this
+	 * SoC but never services the DVFS channel, so the clusters stay at the
+	 * rate the boot chain programmed them to (1053 MHz LITTLE, 1456 MHz
+	 * big).  This node lets the AP take the clocks back; the driver only
+	 * ever moves down from the boot rate so the boot voltage still holds.
+	 *
+	 * CMU_CPUCL0/1 bases and PLL/VCO limits:
+	 * DOWNSTREAM_READONLY/drivers/soc/samsung/cal-if/exynos9610/
+	 * cmucal-sfr.c:13-14,587-590,633-637 and cal-if/pll_spec.c:114,136.
+	 */
+	cpuclk: cpuclk {
+		compatible = "samsung,exynos9610-cpuclk";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		cpuclk0: cluster0 {
+			reg = <0>;
+			samsung,cmu = <0x10900000 0x8000>;
+			samsung,pll-con0-offset = <0x140>;
+			samsung,sw-user-offset = <0x120>;
+			samsung,vco-min-hz = <1200000000>;
+			samsung,vco-max-hz = <2400000000>;
+		};
+
+		cpuclk1: cluster1 {
+			reg = <1>;
+			samsung,cmu = <0x10800000 0x8000>;
+			samsung,pll-con0-offset = <0x120>;
+			samsung,sw-user-offset = <0x100>;
+			samsung,vco-min-hz = <1500000000>;
+			samsung,vco-max-hz = <3000000000>;
+		};
+	};
+
 	/*
 	 * FSYS bus and MMC-card clocks/QCH:
 	 * DOWNSTREAM_READONLY/drivers/soc/samsung/cal-if/exynos9610/

@@ -615,3 +615,8 @@
 		};
 	};
 };
+
+/* CPU cluster clock control (AP-side cpufreq). */
+&cpuclk {
+	status = "okay";
+};

@@ -41,6 +41,7 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 
 #define CPUCL_PLL_CON0		0x0140
@@ -511,35 +512,55 @@ static const struct file_operations cpucl_set_fops = {
 	.llseek = noop_llseek,
 };
 
-static unsigned long cpucl0_base = 0x10900000;
-static unsigned long cpucl1_base = 0x10800000;
-module_param(cpucl0_base, ulong, 0444);
-module_param(cpucl1_base, ulong, 0444);
-
-/* CPUCL0 puts its PLL after the switch-user mux, CPUCL1 before it. */
-#define CPUCL1_PLL_CON0		0x0120
-#define CPUCL1_SW_USER		0x0100
-
-static int __init cpucl_add(struct exynos9610_cpucl *c, const char *name,
-			    unsigned long base, u32 pll_con0, u32 sw_user,
-			    unsigned long vco_min_hz, unsigned long vco_max_hz)
+/*
+ * One cluster from the device tree.  "samsung,cmu" is the CMU base and size,
+ * the remaining properties describe where the PLL and its input mux sit inside
+ * it and which VCO band that PLL can reach.
+ */
+static int cpucl_add(struct platform_device *pdev, struct device_node *np,
+		     struct exynos9610_cpucl *c)
 {
-	c->name = name;
-	c->vco_min_hz = vco_min_hz;
-	c->vco_max_hz = vco_max_hz;
-	c->base = ioremap(base, 0x8000);
+	u32 cmu[2], val;
+	int ret;
+
+	ret = of_property_read_u32_array(np, "samsung,cmu", cmu,
+					 ARRAY_SIZE(cmu));
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "%pOF: missing samsung,cmu\n", np);
+
+	c->name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "%pOFn", np);
+	if (!c->name)
+		return -ENOMEM;
+
+	c->base = devm_ioremap(&pdev->dev, cmu[0], cmu[1]);
 	if (!c->base)
 		return -ENOMEM;
 
-	c->pll_con0 = pll_con0;
-	c->sw_user = sw_user;
+	ret = of_property_read_u32(np, "samsung,pll-con0-offset", &val);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "%pOF: missing samsung,pll-con0-offset\n", np);
+	c->pll_con0 = val;
+
+	ret = of_property_read_u32(np, "samsung,sw-user-offset", &val);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "%pOF: missing samsung,sw-user-offset\n", np);
+	c->sw_user = val;
+
+	of_property_read_u32(np, "samsung,vco-min-hz", &val);
+	c->vco_min_hz = val;
+	of_property_read_u32(np, "samsung,vco-max-hz", &val);
+	c->vco_max_hz = val;
+
 	mutex_init(&c->lock);
 	c->orig_con0 = readl(c->base + c->pll_con0);
 	c->boot_hz = cpucl_pll_rate(c->orig_con0);
 	c->cur_hz = c->boot_hz;
 
-	pr_info("cpucl: %s at 0x%08lx: %lu Hz (pll_con0=%#x sw_user=%#x)\n",
-		name, base, c->boot_hz, pll_con0, sw_user);
+	dev_info(&pdev->dev, "%s at 0x%08x: %lu Hz (pll_con0=%#x sw_user=%#x)\n",
+		 c->name, cmu[0], c->boot_hz, c->pll_con0, c->sw_user);
 
 	return 0;
 }
@@ -547,6 +568,8 @@ static int __init cpucl_add(struct exynos9610_cpucl *c, const char *name,
 /*
  * Cluster membership comes from the CPU nodes' reg: the little cores sit at
  * 0x0..0x3 and the big ones at 0x100..0x103, so the high byte is the cluster.
+ * CPU nodes here use a two-cell reg ("reg = <0x0 0x100>"), so the cluster id is
+ * in the last cell and not the first.
  */
 static void cpucl_build_cpu_masks(void)
 {
@@ -566,10 +589,6 @@ static void cpucl_build_cpu_masks(void)
 		u32 reg;
 		int cpu, len;
 
-		/*
-		 * CPU nodes here use a two-cell reg ("reg = <0x0 0x100>"),
-		 * so the cluster id is in the last cell and not the first.
-		 */
 		prop = of_get_property(np, "reg", &len);
 		if (!prop || len < sizeof(*prop))
 			continue;
@@ -589,37 +608,42 @@ static void cpucl_build_cpu_masks(void)
 	of_node_put(cpus);
 }
 
-static int __init cpucl_probe(void)
+static int cpucl_probe(struct platform_device *pdev)
 {
+	struct device_node *np = pdev->dev.of_node, *child;
 	unsigned int i;
 	int ret;
 
-	clusters = kcalloc(2, sizeof(*clusters), GFP_KERNEL);
+	num_clusters = of_get_child_count(np);
+	if (!num_clusters || num_clusters > 4)
+		return -EINVAL;
+
+	clusters = devm_kcalloc(&pdev->dev, num_clusters, sizeof(*clusters),
+				GFP_KERNEL);
 	if (!clusters)
 		return -ENOMEM;
-	num_clusters = 2;
 
-	ret = cpucl_add(&clusters[0], "cpucl0", cpucl0_base,
-			CPUCL_PLL_CON0, CPUCL_SW_USER, 1200000000UL,
-			2400000000UL);	/* gpll1051X_spec */
-	if (ret)
-		goto out_tables;
-	ret = cpucl_add(&clusters[1], "cpucl1", cpucl1_base,
-			CPUCL1_PLL_CON0, CPUCL1_SW_USER, 1500000000UL,
-			3000000000UL);	/* gpll1054X_spec */
-	if (ret)
-		goto out_tables;
+	i = 0;
+	for_each_available_child_of_node(np, child) {
+		ret = cpucl_add(pdev, child, &clusters[i]);
+		if (ret) {
+			of_node_put(child);
+			return ret;
+		}
+		i++;
+	}
 
 	cpucl_build_cpu_masks();
 	for (i = 0; i < num_clusters; i++) {
 		ret = cpucl_build_table(&clusters[i]);
 		if (ret)
-			goto out_tables;
+			return ret;
 	}
 
 	ret = cpufreq_register_driver(&cpucl_cpufreq_driver);
 	if (ret)
-		goto out_tables;
+		return dev_err_probe(&pdev->dev, ret,
+				     "failed to register cpufreq driver\n");
 
 	cpucl_debugfs = debugfs_create_dir("exynos9610-cpuclk", NULL);
 	debugfs_create_file("dump", 0444, cpucl_debugfs, NULL,
@@ -627,16 +651,12 @@ static int __init cpucl_probe(void)
 	debugfs_create_file("set", 0200, cpucl_debugfs, NULL,
 			    &cpucl_set_fops);
 
-	return 0;
+	platform_set_drvdata(pdev, clusters);
 
-out_tables:
-	for (i = 0; i < num_clusters; i++)
-		kfree(clusters[i].table);
-	kfree(clusters);
-	return ret;
+	return 0;
 }
 
-static void __exit cpucl_remove(void)
+static void cpucl_remove(struct platform_device *pdev)
 {
 	unsigned int i;
 
@@ -645,17 +665,27 @@ static void __exit cpucl_remove(void)
 
 	/* Hand each cluster back to the boot rate before letting go. */
 	for (i = 0; i < num_clusters; i++) {
-		if (!clusters[i].base)
-			continue;
-		cpucl_set_rate(&clusters[i], clusters[i].boot_hz);
-		iounmap(clusters[i].base);
+		if (clusters[i].base)
+			cpucl_set_rate(&clusters[i], clusters[i].boot_hz);
 		kfree(clusters[i].table);
 	}
-	kfree(clusters);
 }
 
-module_init(cpucl_probe);
-module_exit(cpucl_remove);
+static const struct of_device_id cpucl_of_match[] = {
+	{ .compatible = "samsung,exynos9610-cpuclk" },
+	{ },
+};
+MODULE_DEVICE_TABLE(of, cpucl_of_match);
+
+static struct platform_driver cpucl_driver = {
+	.probe	= cpucl_probe,
+	.remove	= cpucl_remove,
+	.driver	= {
+		.name		= "exynos9610-cpuclk",
+		.of_match_table	= cpucl_of_match,
+	},
+};
+module_platform_driver(cpucl_driver);
 
 MODULE_DESCRIPTION("Exynos9610 CPU cluster clock control");
 MODULE_LICENSE("GPL");
