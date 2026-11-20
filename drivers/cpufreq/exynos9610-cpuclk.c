@@ -154,6 +154,13 @@ static bool volt_scale;
 module_param(volt_scale, bool, 0644);
 MODULE_PARM_DESC(volt_scale, "Allow rates above the boot rate (needs the ECT tables)");
 
+/*
+ * Relocking one cluster while the other is relocking makes the lock wait
+ * unreliable (the waiting cluster runs from the 26 MHz oscillator, and the two
+ * sequences overlap), so rate changes are serialised across clusters.
+ */
+static DEFINE_MUTEX(cpucl_relock_lock);
+
 static void __iomem *cpucl_ect_base;
 static struct exynos9610_cpucl *clusters;
 static unsigned int num_clusters;
@@ -348,6 +355,7 @@ static int cpucl_relock(struct exynos9610_cpucl *c, unsigned long hz)
 	 * interleaved pair of sequences would leave the mux on the oscillator
 	 * with an unlocked PLL.
 	 */
+	guard(mutex)(&cpucl_relock_lock);
 	guard(mutex)(&c->lock);
 
 	/* Take the cluster off the PLL; SW_USER selects OSCCLK here. */
@@ -355,6 +363,11 @@ static int cpucl_relock(struct exynos9610_cpucl *c, unsigned long hz)
 	ret = cpucl_wait_clear(mux, MUX_PLL_BUSY);
 	if (ret)
 		return ret;
+
+	/* Let the switch settle: the PLL is reprogrammed while unused. */
+	if (!(readl(mux) & MUX_PLL_SEL))
+		return -EIO;
+	udelay(5);
 
 	if (cpucl_pll_program(c, new_con0)) {
 		pr_err("cpucl: %s PLL did not lock at %lu Hz (con0=%#x)\n",
@@ -386,6 +399,7 @@ static int cpucl_relock(struct exynos9610_cpucl *c, unsigned long hz)
 	/* Hand the cluster back to the PLL. */
 	writel(readl(mux) & ~MUX_PLL_SEL, mux);
 	cpucl_wait_clear(mux, MUX_PLL_BUSY);
+	udelay(5);
 
 	c->cur_hz = cpucl_pll_rate(readl(c->base + c->pll_con0));
 	if (ret)
