@@ -1483,6 +1483,10 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 	if (w->dram && w->mxconf_offset) {
 		wlbt_stream_status(w, s, &w->mgmt_in);
 		wlbt_stream_status(w, s, &w->mgmt_out);
+		wlbt_stream_status(w, s, &w->gdb_r4_in);
+		wlbt_stream_status(w, s, &w->gdb_r4_out);
+		wlbt_stream_status(w, s, &w->gdb_m4_in);
+		wlbt_stream_status(w, s, &w->gdb_m4_out);
 		wlbt_stream_status(w, s, &w->log);
 		seq_printf(s, "streams: log %u bytes queued (fw %u, bad %u), mgmt %u messages\n",
 			   ((readl(w->dram + w->log.widx) + w->log.num_packets -
@@ -1506,7 +1510,10 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 				   readl(w->dram + i * 4),
 				   i % 4 == 3 ? "\n" : "  ");
 
-	for (i = 0; i < MBOX_NUM_ISSR; i++)
+	/* The peer writes mailboxes 8 and 9 (image 0x80117f2a), past the eight
+	 * the vendor's mbox manager knows about.
+	 */
+	for (i = 0; i < 12; i++)
 		seq_printf(s, "ISSR%u 0x%08x%s", i,
 			   readl(w->mbox + MBOX_ISSR_BASE + i * 4),
 			   i % 4 == 3 ? "\n" : "  ");
