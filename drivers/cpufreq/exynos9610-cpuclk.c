@@ -148,6 +148,11 @@ struct exynos9610_cpucl {
 	u8 buck_reg;
 	unsigned int rail_floor_uv;	/* lowest rail value this board tolerates */
 	unsigned int applied_uv;	/* highest rail value written so far */
+	unsigned long n_relock;		/* rate changes that reached the hardware */
+	unsigned long n_rail;		/* rail writes, 1 per real change */
+	unsigned long n_skipped;	/* requests for the rate already in place */
+	unsigned int pending_uv;	/* rail value waiting out the hold time */
+	struct delayed_work rail_work;	/* applies a pending rail drop */
 	unsigned int *uvolt;	/* parallel to table, NULL when unknown */
 };
 
@@ -207,6 +212,35 @@ static bool cpucl_armed;
  * still useful when bisecting a voltage problem.
  */
 static bool boost_only;
+
+/* Print every rate change and rail write, for chasing a rail that will not move. */
+static bool loud;
+module_param(loud, bool, 0644);
+MODULE_PARM_DESC(loud, "Log every rate change and rail write");
+
+/*
+ * How long the rail stays where it is before a lower value is applied.
+ *
+ * A governor on a bursty desktop hops between the bottom of the range and its
+ * ceiling many times a second: schedutil maps utilisation against the maximum
+ * frequency the CPU advertises, so anything above half of it lands on the
+ * ceiling, and the next sample lands back on the minimum.  Following that with
+ * the rail means a PMIC ramp - twelve milliseconds during which the cluster
+ * cannot speed up - on every hop, which is exactly the wrong way round: the
+ * voltage is then high while the cluster is slow, and the frequency change waits
+ * for it.
+ *
+ * Holding the rail for longer than a hop makes each hop a plain PLL change, and
+ * the rail still comes down as soon as the cluster has settled at a lower
+ * operating point: measured hop periods on an idle system with an NFS root are
+ * around 110 ms, so two hundred milliseconds leaves the PMIC out of the loop
+ * while still following a cluster that really has gone quiet.  The cost is that a short dip is over-volted,
+ * which is what the vendor hardware does too: its DVFS firmware is asynchronous
+ * and does not chase every request.
+ */
+static unsigned int rail_hold_ms = 200;
+module_param(rail_hold_ms, uint, 0644);
+MODULE_PARM_DESC(rail_hold_ms, "Hold a rail this long before dropping it (ms)");
 module_param(boost_only, bool, 0644);
 MODULE_PARM_DESC(boost_only, "Only ever raise the CPU rails, never lower them");
 
@@ -548,7 +582,7 @@ static unsigned long cpucl_ceiling_hz(const struct exynos9610_cpucl *c)
  * rail is not what was asked for" and do not touch the frequency.
  */
 static int cpucl_buck_slew(struct exynos9610_cpucl *c, unsigned int uvolt,
-			   unsigned int max_step, bool loud)
+			   unsigned int max_step, bool wait, bool loud)
 {
 	const struct acpm_pmic_ops *ops;
 	unsigned int sel, delta, n = 0;
@@ -596,8 +630,17 @@ static int cpucl_buck_slew(struct exynos9610_cpucl *c, unsigned int uvolt,
 		if (ret)
 			return ret;
 
-		/* Wait out the ramp of this step before asking for the next. */
-		usleep_range(CPUCL_BUCK_RAMP_US, CPUCL_BUCK_RAMP_US + 2000);
+		/*
+		 * Wait out the ramp of this step before asking for the next.
+		 * Only a raise has to be waited for: the clock is moved after
+		 * the rail is up, and a step asked for before the previous one
+		 * settled would ramp from an unknown point.  A drop happens once
+		 * the cores are already slower than before, so the buck can take
+		 * its 12 ms on its own while the next request is served.
+		 */
+		if (wait)
+			usleep_range(CPUCL_BUCK_RAMP_US,
+				     CPUCL_BUCK_RAMP_US + 2000);
 
 		old = next;
 		n++;
@@ -611,15 +654,50 @@ static int cpucl_buck_slew(struct exynos9610_cpucl *c, unsigned int uvolt,
 }
 
 /*
- * One write, then wait out the PMIC's ramp.  The buck ramps internally, so
- * stepping here would only multiply the time the cpufreq workqueue spends with
- * the cores at the old rate.
+ * One write, then wait out the PMIC's ramp if anyone is going to depend on the
+ * new voltage being in place.  The buck ramps internally, so stepping here
+ * would only multiply the time the cpufreq workqueue spends at the old rate.
  */
-static int cpucl_buck_set(struct exynos9610_cpucl *c, unsigned int uvolt)
+static int cpucl_buck_set(struct exynos9610_cpucl *c, unsigned int uvolt,
+			  bool wait)
 {
-	int ret = cpucl_buck_slew(c, uvolt, 0, false);
+	/* Returns the number of register writes, 0 when the rail was already there. */
+	return cpucl_buck_slew(c, uvolt, 0, wait, loud);
+}
 
-	return ret < 0 ? ret : 1;
+/*
+ * Apply a rail drop once the cluster has stayed at the lower operating point for
+ * the hold time.  The rail is re-checked first: a burst that raised it again in
+ * the meantime wins, and the pending value is simply dropped.
+ */
+static void cpucl_rail_work(struct work_struct *work)
+{
+	struct exynos9610_cpucl *c = container_of(to_delayed_work(work),
+						  struct exynos9610_cpucl,
+						  rail_work);
+	unsigned int uvolt;
+	int ret;
+
+	guard(mutex)(&c->lock);
+
+	uvolt = c->pending_uv;
+	c->pending_uv = 0;
+	if (!uvolt || uvolt == c->applied_uv)
+		return;
+
+	/* Still the voltage the current rate asks for? */
+	if (cpucl_rail_uv(c, cpucl_uvolt_for(c, c->cur_hz)) != uvolt)
+		return;
+
+	ret = cpucl_buck_set(c, uvolt, false);
+	if (ret < 0) {
+		pr_warn("cpucl: %s could not drop to %u uV\n", c->name, uvolt);
+		return;
+	}
+
+	c->applied_uv = uvolt;
+	if (ret)
+		c->n_rail++;
 }
 
 /*
@@ -652,8 +730,10 @@ static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
 	 * a governor that asks for a clamped rate repeats the request on every
 	 * update, and each needless relock is a chance to lose the lock.
 	 */
-	if (cur == hz)
+	if (cur == hz) {
+		c->n_skipped++;
 		return 0;
+	}
 
 	uvolt = volt_scale ? cpucl_rail_uv(c, cpucl_uvolt_for(c, hz)) : 0;
 	boot_uv = volt_scale ? cpucl_rail_uv(c, cpucl_uvolt_for(c, c->boot_hz)) : 0;
@@ -664,35 +744,41 @@ static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
 		uvolt = 0;
 
 	if (uvolt && raising) {
-		ret = cpucl_buck_set(c, uvolt);
+		cancel_delayed_work(&c->rail_work);
+		c->pending_uv = 0;
+
+		ret = cpucl_buck_set(c, uvolt, true);
 		if (ret < 0)
 			return ret;
 		c->applied_uv = uvolt;
+		if (ret)
+			c->n_rail++;
 	}
 
 	ret = cpucl_relock(c, hz);
-
-	if (ret == -ENODEV) {
-		pr_warn_once("cpucl: %s stopped: PLL will not lock\n", c->name);
-		return 0;
-	}
-
 	if (ret) {
 		/* The relock fell back to the boot PLL setting: match it. */
 		if (raising && boot_uv && !boost_only)
-			cpucl_buck_set(c, boot_uv);
+			cpucl_buck_set(c, boot_uv, true);
 		return ret;
 	}
 
-	if (uvolt && !raising) {
-		/* The cores must be off the old PLL before the rail drops. */
-		usleep_range(20, 50);
+	c->n_relock++;
 
-		if (cpucl_buck_set(c, uvolt) < 0)
-			pr_warn("cpucl: %s could not set voltage %u uV\n",
-				c->name, uvolt);
-		else
-			c->applied_uv = uvolt;
+	if (loud)
+		pr_info("cpucl: %s %lu -> %lu Hz, uvolt %u, applied %u, raising %d\n",
+			c->name, cur, hz, uvolt, c->applied_uv, raising);
+
+	/*
+	 * A lower rail is not worth waiting for: the cores are already slower
+	 * than before, so it is only a power matter and can wait out the hold
+	 * time.  A burst in the meantime cancels it, which is what keeps the
+	 * PMIC out of the governor's decision loop.
+	 */
+	if (uvolt && !raising && uvolt < c->applied_uv) {
+		c->pending_uv = uvolt;
+		mod_delayed_work(system_wq, &c->rail_work,
+				 msecs_to_jiffies(rail_hold_ms));
 	}
 
 	return 0;
@@ -1069,6 +1155,35 @@ static int cpucl_cpufreq_init(struct cpufreq_policy *policy)
 	return 0;
 }
 
+/*
+ * The advertised maximum has to be cut here, not in ->init(): the core fills
+ * policy->cpuinfo from the frequency table after calling ->init(), so anything
+ * set there is overwritten.  ->ready() runs once the policy is complete.
+ *
+ * This matters for more than tidiness.  schedutil starts from
+ * policy->cpuinfo.max_freq when it maps utilisation to a frequency, so leaving
+ * it at the rated maximum while policy->max is the boot rate makes every
+ * utilisation above half of capacity ask for the ceiling and every sample after
+ * it ask for the floor: the clusters hopped between the two ends of the range
+ * tens of times a second, and with the rail tracking that, so did the PMIC.
+ */
+static void cpucl_cpufreq_ready(struct cpufreq_policy *policy)
+{
+	struct exynos9610_cpucl *c = cpucl_for_cpu(policy->cpu);
+	unsigned int khz;
+
+	if (!c)
+		return;
+
+	khz = cpucl_ceiling_hz(c) / 1000;
+	if (policy->cpuinfo.max_freq > khz)
+		policy->cpuinfo.max_freq = khz;
+	if (policy->max > khz)
+		policy->max = khz;
+	if (policy->min > policy->max)
+		policy->min = policy->max;
+}
+
 static int cpucl_cpufreq_target(struct cpufreq_policy *policy,
 				unsigned int index)
 {
@@ -1095,6 +1210,37 @@ static int cpucl_cpufreq_target(struct cpufreq_policy *policy,
 	return cpucl_set_rate(c, hz);
 }
 
+/*
+ * Cap the policy at the ceiling as well as the individual requests.
+ *
+ * Clamping only in ->target() leaves the policy maximum at the top of the
+ * table, and schedutil maps its utilisation onto that range: every idle blip
+ * asked for a rate above the boot operating point, the driver turned that into
+ * boot_hz, and the cluster bounced between the bottom and the ceiling of the
+ * unarmed range, moving the rail at every bounce.  Lowering the policy maximum
+ * here makes the governor see the range that can actually be used - and a
+ * minimum above it must come down too, or the core rejects the policy.
+ */
+static int cpucl_cpufreq_verify(struct cpufreq_policy_data *policy)
+{
+	struct exynos9610_cpucl *c = cpucl_for_cpu(policy->cpu);
+	unsigned int ceiling_khz;
+	int ret;
+
+	ret = cpufreq_generic_frequency_table_verify(policy);
+	if (ret || !c)
+		return ret;
+
+	ceiling_khz = cpucl_ceiling_hz(c) / 1000;
+	if (policy->max > ceiling_khz) {
+		policy->max = ceiling_khz;
+		if (policy->min > policy->max)
+			policy->min = policy->max;
+	}
+
+	return 0;
+}
+
 static unsigned int cpucl_cpufreq_get(unsigned int cpu)
 {
 	struct exynos9610_cpucl *c = cpucl_for_cpu(cpu);
@@ -1108,7 +1254,8 @@ static unsigned int cpucl_cpufreq_get(unsigned int cpu)
 static struct cpufreq_driver cpucl_cpufreq_driver = {
 	.name		= "exynos9610-cpu",
 	.init		= cpucl_cpufreq_init,
-	.verify		= cpufreq_generic_frequency_table_verify,
+	.verify		= cpucl_cpufreq_verify,
+	.ready		= cpucl_cpufreq_ready,
 	.target_index	= cpucl_cpufreq_target,
 	.get		= cpucl_cpufreq_get,
 	/*
@@ -1146,6 +1293,8 @@ static int cpucl_dump_show(struct seq_file *s, void *unused)
 			   (sw & SW_USER_SEL) ? 1UL : 0UL, mux,
 			   (mux & MUX_PLL_SEL) ? 1UL : 0UL);
 		seq_printf(s, "    cpus=%*pbl\n", cpumask_pr_args(&c->cpus));
+		seq_printf(s, "    relocks %lu  rail writes %lu  skipped %lu\n",
+				   c->n_relock, c->n_rail, c->n_skipped);
 		seq_printf(s, "    boot=%lu Hz  last_set=%lu Hz  range=%lu-%lu Hz  ceiling=%lu Hz\n",
 			   c->boot_hz, c->cur_hz, c->min_hz, c->max_hz,
 			   cpucl_ceiling_hz(c));
@@ -1174,12 +1323,46 @@ DEFINE_SHOW_ATTRIBUTE(cpucl_dump);
  * ceiling back at the boot operating point.  Nothing is written to the PMIC by
  * the switch itself; the rails follow the frequencies the governor asks for.
  */
+/*
+ * Move the range a cluster advertises with its ceiling.
+ *
+ * The policy maximum is not the only thing that matters: schedutil takes its
+ * reference frequency from policy->cpuinfo.max_freq, so a policy whose maximum
+ * is the boot rate while cpuinfo still says the rated maximum maps every
+ * utilisation above half of capacity onto the ceiling and back down again on the
+ * next sample.  Shrinking both makes the governor spread its choices over the
+ * operating points that are actually available.
+ */
+static void cpucl_policy_set_range(struct exynos9610_cpucl *c, unsigned long hz)
+{
+	struct cpufreq_policy *policy;
+	unsigned int khz = hz / 1000;
+	int cpu;
+
+	for_each_cpu(cpu, &c->cpus) {
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+
+		down_write(&policy->rwsem);
+		policy->cpuinfo.max_freq = khz;
+		if (policy->max > khz)
+			WRITE_ONCE(policy->max, khz);
+		if (policy->min > policy->max)
+			WRITE_ONCE(policy->min, policy->max);
+		up_write(&policy->rwsem);
+
+		cpufreq_update_policy(cpu);
+		cpufreq_cpu_put(policy);
+	}
+}
+
 static ssize_t cpucl_arm_write(struct file *file, const char __user *ubuf,
 			       size_t count, loff_t *ppos)
 {
 	char buf[16];
 	bool on;
-	int ret;
+	int ret, i;
 
 	if (count == 0 || count >= sizeof(buf))
 		return -EINVAL;
@@ -1195,6 +1378,12 @@ static ssize_t cpucl_arm_write(struct file *file, const char __user *ubuf,
 	pr_info("cpucl: %s, ceiling is now the %s operating point\n",
 		on ? "armed" : "disarmed",
 		on ? "rated maximum" : "boot");
+
+	for (i = 0; i < num_clusters; i++) {
+		if (clusters[i].base)
+			cpucl_policy_set_range(&clusters[i],
+					       cpucl_ceiling_hz(&clusters[i]));
+	}
 
 	return count;
 }
@@ -1301,9 +1490,12 @@ static ssize_t cpucl_buck_write(struct file *file, const char __user *ubuf,
 	 * the ramoops console buffer.  After a hard reset, boot stock Android
 	 * and read /sys/fs/pstore/console-ramoops-0 to see how far it got.
 	 */
+	cancel_delayed_work_sync(&clusters[cluster].rail_work);
+	clusters[cluster].pending_uv = 0;
+
 	ret = cpucl_buck_slew(&clusters[cluster],
 			      val * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV,
-			      buck_step, true);
+			      buck_step, true, true);
 
 	return ret < 0 ? ret : count;
 }
@@ -1416,6 +1608,7 @@ static int cpucl_add(struct platform_device *pdev, struct device_node *np,
 		return -EINVAL;
 
 	mutex_init(&c->lock);
+	INIT_DELAYED_WORK(&c->rail_work, cpucl_rail_work);
 	c->orig_con0 = readl(c->base + c->pll_con0);
 	c->good_con0 = c->orig_con0;
 	c->boot_hz = cpucl_pll_rate(c->orig_con0);
@@ -1648,8 +1841,12 @@ static void cpucl_remove(struct platform_device *pdev)
 
 	/* Hand each cluster back to the boot rate before letting go. */
 	for (i = 0; i < num_clusters; i++) {
+		cancel_delayed_work_sync(&clusters[i].rail_work);
 		if (clusters[i].base)
 			cpucl_set_rate(&clusters[i], clusters[i].boot_hz);
+		/* That set_rate may itself have queued a drop; the tables go next. */
+		cancel_delayed_work_sync(&clusters[i].rail_work);
+		clusters[i].pending_uv = 0;
 		cpucl_drop_table(&clusters[i]);
 	}
 
