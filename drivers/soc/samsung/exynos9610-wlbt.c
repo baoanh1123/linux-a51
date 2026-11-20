@@ -137,6 +137,73 @@
 #define MBOX_ISSR_FLAGS			3
 #define MBOX_START_MAGIC		0xbcdeedcb
 
+/*
+ * Infrastructure configuration.  The peer boots, then reads a pointer out of
+ * mailbox 1 to this structure, which tells it where the shared streams are in
+ * DRAM and which interrupt bit signals each of them (mxconf.h, mxman.c:1086).
+ *
+ * The vendor's own header says the structures are deliberately *not* packed -
+ * the old "__packed struct" syntax never took effect and correcting it would
+ * desynchronise the firmware - so these are plain C structs with natural
+ * alignment, laid out exactly like mxconf.h.
+ */
+#define MXCONF_MAGIC			0x79828486
+#define MXCONF_VERSION_MAJOR		0
+#define MXCONF_VERSION_MINOR		5
+#define MXCONF_GDB_M4_MAX		0
+
+/*
+ * Stream buffer sizes, from the vendor transports: the management channel is
+ * 512 bytes of 128-byte messages (mxmgmt_transport.c:241), the firmware log is
+ * 16 KiB of 4-byte cells (mxlog_transport.c:17).
+ */
+#define MGMT_PACKET_SIZE		128
+#define MGMT_NUM_PACKETS		4
+#define GDB_PACKET_SIZE			4
+#define GDB_NUM_PACKETS			(2 * 1024 / GDB_PACKET_SIZE)
+#define LOG_PACKET_SIZE			4
+#define LOG_BUF_LENGTH			(16 * 1024)
+#define LOG_NUM_PACKETS			(LOG_BUF_LENGTH / LOG_PACKET_SIZE)
+
+/* Log packet header: 16 bits of sync, 8 bits of level, 8 bits of length
+ * (mxlog.c:310-345).  Phase 4 payloads are plain strings, phase 5 ones are
+ * compressed against a string table, which the AP side does not have yet.
+ */
+#define MXLOG_SYNC_PHASE_4		0xa55a
+#define MXLOG_SYNC_PHASE_5		0x9669
+
+/*
+ * Interrupt bit allocation.  The vendor allocates these dynamically from the
+ * same pool it keeps bit 0 in for PANIC, so streams start at bit 1; the peer
+ * learns which is which from the configuration, so the numbers only have to be
+ * consistent between the two sides.
+ */
+#define WLBT_BIT_MGMT_IN_WRITE		0
+#define WLBT_BIT_MGMT_OUT_WRITE		1
+#define WLBT_BIT_GDB_R4_IN_WRITE	2
+#define WLBT_BIT_GDB_R4_OUT_WRITE	3
+#define WLBT_BIT_GDB_M4_IN_WRITE	4
+#define WLBT_BIT_GDB_M4_OUT_WRITE	5
+#define WLBT_BIT_LOG_WRITE		6
+
+#define WLBT_BIT_MGMT_IN_READ		0
+#define WLBT_BIT_MGMT_OUT_READ		1
+#define WLBT_BIT_GDB_R4_IN_READ		2
+#define WLBT_BIT_GDB_R4_OUT_READ	0	/* the bit reserved for panics */
+#define WLBT_BIT_LOG_READ		3
+#define WLBT_BIT_GDB_M4_IN_READ		0
+#define WLBT_BIT_GDB_M4_OUT_READ	0	/* the bit reserved for panics */
+
+#define WLBT_IRQ_BITS			(BIT(WLBT_BIT_MGMT_IN_WRITE) | \
+					 BIT(WLBT_BIT_MGMT_OUT_WRITE) | \
+					 BIT(WLBT_BIT_GDB_R4_IN_WRITE) | \
+					 BIT(WLBT_BIT_GDB_R4_OUT_WRITE) | \
+					 BIT(WLBT_BIT_GDB_M4_IN_WRITE) | \
+					 BIT(WLBT_BIT_GDB_M4_OUT_WRITE) | \
+					 BIT(WLBT_BIT_LOG_WRITE))
+
+#define MXCONF_FWCONFIG_UNUSED		0
+
 /* Firmware header (fwhdr.c:14-31): "smxf" at offset 8, header at the start of
  * the image.  The entry point is a MIF-relative address, so it is added to the
  * window the peer sees, not to the physical base.
@@ -169,6 +236,68 @@ enum wlbt_state {
 	WLBT_ACK_CFG_REQ,
 	WLBT_CFG_DONE,
 	WLBT_CFG_ERROR,
+};
+
+/** struct wlbt_cbuf - circular packet buffer, as the peer sees it (mxcbufconf) */
+struct wlbt_cbuf {
+	u32 buffer_loc;		/* MIF-relative offset of the cells */
+	u32 num_packets;
+	u32 packet_size;
+	u32 read_index_loc;	/* MIF-relative offset of the read cursor */
+	u32 write_index_loc;
+};
+
+/** struct wlbt_stream_conf - one simplex stream (mxstreamconf) */
+struct wlbt_stream_conf {
+	struct wlbt_cbuf buf_conf;
+	u8 read_bit_idx;
+	u8 write_bit_idx;
+};
+
+/** struct wlbt_trans_conf - a pair of streams (mxtransconf) */
+struct wlbt_trans_conf {
+	struct wlbt_stream_conf to_ap;
+	struct wlbt_stream_conf from_ap;
+};
+
+/** struct wlbt_log_conf - the firmware log stream (mxlogconf) */
+struct wlbt_log_conf {
+	struct wlbt_stream_conf stream_conf;
+};
+
+/** struct wlbt_mxconf - the whole configuration (mxconf) */
+struct wlbt_mxconf {
+	u32 magic;
+	u16 version_major;
+	u16 version_minor;
+	struct wlbt_trans_conf trans;		/* management transport */
+	struct wlbt_trans_conf gdb_r4;		/* unused here */
+	struct wlbt_trans_conf gdb_m4;		/* unused here */
+	struct wlbt_log_conf logconf;
+	u32 soc_revision;
+	u32 flags;
+	struct {
+		u32 offset;
+		u32 size;
+	} fwconfig;				/* common HCF, absent on this board */
+	struct wlbt_trans_conf gdb_m4_1;	/* unused here */
+};
+
+/**
+ * struct wlbt_stream - one stream, host side
+ * @buf: offset of the cells in MIF DRAM
+ * @ridx: offset of the read cursor
+ * @widx: offset of the write cursor
+ */
+struct wlbt_stream {
+	const char *name;
+	u32 buf;
+	u32 ridx;
+	u32 widx;
+	u32 num_packets;
+	u32 packet_size;
+	u8 read_bit;
+	u8 write_bit;
 };
 
 /**
@@ -239,6 +368,18 @@ struct exynos_wlbt {
 	u32 fw_size;			/* bytes of image copied in */
 	u32 fw_panic_offset;
 	bool fw_loaded;
+	u32 heap_next;			/* MIF-relative bump pointer */
+	u32 mxconf_offset;
+	struct wlbt_stream log;
+	struct wlbt_stream mgmt_in;
+	struct wlbt_stream mgmt_out;
+	struct wlbt_stream gdb_r4_in;
+	struct wlbt_stream gdb_r4_out;
+	struct wlbt_stream gdb_m4_in;
+	struct wlbt_stream gdb_m4_out;
+	unsigned int n_fwlog;
+	unsigned int n_fwlog_bad;
+	unsigned int n_mgmt;
 	unsigned int n_cfg_req;
 	unsigned int n_cfg_bad;
 	unsigned int n_wdog;
@@ -246,6 +387,11 @@ struct exynos_wlbt {
 	u32 last_mbox_status;
 	struct dentry *debugfs;
 };
+
+static u32 wlbt_stream_read(struct exynos_wlbt *w, struct wlbt_stream *s,
+			    void *dst, u32 bytes);
+static void wlbt_log_drain(struct exynos_wlbt *w);
+static void wlbt_mgmt_drain(struct exynos_wlbt *w);
 
 static char *firmware_name = "mx140/mx140.bin";
 module_param(firmware_name, charp, 0444);
@@ -497,23 +643,55 @@ static irqreturn_t wlbt_wdog_isr(int irq, void *data)
 }
 
 /*
- * Doorbell from the peer.  Nothing answers it yet - the HIP transport is the
- * next layer up - so just record it and clear.  INTSR0[31:16] is one bit per
- * ISSR register, which is how the peer signals a new message.
+ * The management channel carries the infrastructure protocol (firmware version,
+ * halt, panic notification, ...).  Without the message table ported yet, dump
+ * what arrives so the first exchange can be read off the wire.
+ */
+static void wlbt_mgmt_drain(struct exynos_wlbt *w)
+{
+	char hex[3 * 32 + 1];
+	u8 msg[MGMT_PACKET_SIZE];
+	u32 got;
+	int i;
+
+	while ((got = wlbt_stream_read(w, &w->mgmt_in, msg, MGMT_PACKET_SIZE))) {
+		w->n_mgmt++;
+		memset(hex, 0, sizeof(hex));
+		for (i = 1; i < got && i < 32; i++)
+			snprintf(hex + (i - 1) * 3, 4, " %02x", msg[i]);
+		dev_info(w->dev, "mgmt message: channel %u:%s\n", msg[0], hex);
+	}
+}
+
+/*
+ * Doorbell from the peer: one bit per stream, INTSR0[31:16].
  */
 static irqreturn_t wlbt_mbox_isr(int irq, void *data)
 {
 	struct exynos_wlbt *w = data;
 	u32 status;
 
-	status = readl(w->mbox + MBOX_INTSR0) >> 16;
+	/* INTMSR0 is the pending set after the mask, which is what the vendor
+	 * reads too (platform_mif_9610.c:1334).
+	 */
+	status = readl(w->mbox + MBOX_INTMSR0) >> 16;
 	w->n_mbox++;
 	w->last_mbox_status = status;
 
-	if (status)
-		writel(status << 16, w->mbox + MBOX_INTCR0);
-	else
+	if (!status) {
 		dev_warn(w->dev, "mailbox IRQ without a status bit\n");
+		return IRQ_HANDLED;
+	}
+
+	/* Acknowledge before reading: any message that lands in the meantime
+	 * raises the bit again and the streams are drained until empty anyway.
+	 */
+	writel(status << 16, w->mbox + MBOX_INTCR0);
+
+	if (status & BIT(w->log.write_bit))
+		wlbt_log_drain(w);
+	if (status & BIT(w->mgmt_in.write_bit))
+		wlbt_mgmt_drain(w);
 
 	return IRQ_HANDLED;
 }
@@ -591,19 +769,301 @@ out:
 }
 
 /*
- * Hand the peer its start parameters (mxman.c:1155-1183).  Configuration is
- * left empty for now: the real mxconf needs the layered port of the vendor
- * configuration builder, and an empty one is the cheapest way to find out how
- * far the firmware gets without it.
+ * Hand the peer its start parameters (mxman.c:1155-1183).
  */
 static void wlbt_mbox_init(struct exynos_wlbt *w)
 {
 	writel(w->fw_entry, w->mbox + MBOX_ISSR_BASE + MBOX_ISSR_ENTRY * 4);
-	writel(0, w->mbox + MBOX_ISSR_BASE + MBOX_ISSR_CONFIG * 4);
+	writel(w->mxconf_offset, w->mbox + MBOX_ISSR_BASE + MBOX_ISSR_CONFIG * 4);
 	writel(MBOX_START_MAGIC, w->mbox + MBOX_ISSR_BASE + MBOX_ISSR_MAGIC * 4);
 	writel(0, w->mbox + MBOX_ISSR_BASE + MBOX_ISSR_FLAGS * 4);
 	/* The peer reads these through the bus; make sure they are there. */
 	wmb();
+}
+
+/*
+ * The MIF DRAM is split the way the vendor splits it (mxman.c:1494): the
+ * firmware image occupies [0, fw_runtime_length), and everything else - heaps,
+ * streams, configuration - lives above it.  A bump allocator is all that is
+ * needed, because nothing is ever freed while the peer is running.
+ */
+static u32 wlbt_heap_alloc(struct exynos_wlbt *w, u32 bytes)
+{
+	u32 offset;
+
+	bytes = ALIGN(bytes, 4);
+	if (!w->heap_next || w->heap_next + bytes > w->mem_size) {
+		dev_err(w->dev, "MIF heap is full (%u of %pa used)\n",
+			w->heap_next, &w->mem_size);
+		return 0;
+	}
+
+	offset = w->heap_next;
+	w->heap_next += bytes;
+	memset_io(w->dram + offset, 0, bytes);
+
+	return offset;
+}
+
+/*
+ * One stream is a ring of fixed-size cells plus the two cursors the peer reads
+ * (cpacket_buffer.c:15-45).  An input stream is pre-filled with 0xff like the
+ * vendor does, so a mis-parsed header is obvious rather than looking like a
+ * valid message.
+ */
+static int wlbt_stream_init(struct exynos_wlbt *w, struct wlbt_stream *s,
+			    const char *name, u32 num_packets, u32 packet_size,
+			    u8 read_bit, u8 write_bit, bool to_ap)
+{
+	s->name = name;
+	s->num_packets = num_packets;
+	s->packet_size = packet_size;
+	s->read_bit = read_bit;
+	s->write_bit = write_bit;
+
+	s->buf = wlbt_heap_alloc(w, num_packets * packet_size);
+	s->ridx = wlbt_heap_alloc(w, 4);
+	s->widx = wlbt_heap_alloc(w, 4);
+	if (!s->buf || !s->ridx || !s->widx)
+		return -ENOMEM;
+
+	if (to_ap)
+		memset_io(w->dram + s->buf, 0xff, num_packets * packet_size);
+
+	return 0;
+}
+
+static void wlbt_stream_serialise(struct wlbt_stream *s,
+				 struct wlbt_stream_conf *conf, bool to_ap)
+{
+	conf->buf_conf.buffer_loc = s->buf;
+	conf->buf_conf.num_packets = s->num_packets;
+	conf->buf_conf.packet_size = s->packet_size;
+	conf->buf_conf.read_index_loc = s->ridx;
+	conf->buf_conf.write_index_loc = s->widx;
+	if (to_ap) {
+		conf->read_bit_idx = s->read_bit;
+		conf->write_bit_idx = s->write_bit;
+	} else {
+		conf->read_bit_idx = s->write_bit;
+		conf->write_bit_idx = s->read_bit;
+	}
+}
+
+/**
+ * wlbt_stream_read() - take bytes out of a stream
+ * @bytes: how much to read; the result is rounded up to whole cells
+ *
+ * Mirrors cpacketbuffer_read(): the cursors are cell counts, the read advances
+ * the read cursor and tells the peer with a doorbell so it may reuse the cells.
+ *
+ * Return: bytes actually copied.
+ */
+static u32 wlbt_stream_read(struct exynos_wlbt *w, struct wlbt_stream *s,
+			    void *dst, u32 bytes)
+{
+	u32 avail, cells, ridx, widx, first, off;
+
+	if (!w->dram || !bytes)
+		return 0;
+
+	ridx = readl(w->dram + s->ridx);
+	widx = readl(w->dram + s->widx);
+	if (ridx >= s->num_packets || widx >= s->num_packets)
+		return 0;
+
+	avail = (widx + s->num_packets - ridx) % s->num_packets;
+	if (!avail)
+		return 0;
+
+	cells = DIV_ROUND_UP(bytes, s->packet_size);
+	if (cells > avail)
+		cells = avail;
+	bytes = min(bytes, cells * s->packet_size);
+
+	off = s->buf + ridx * s->packet_size;
+	first = min(cells, s->num_packets - ridx) * s->packet_size;
+	memcpy_fromio(dst, w->dram + off, min(first, bytes));
+	if (bytes > first)
+		memcpy_fromio(dst + first, w->dram + s->buf, bytes - first);
+
+	writel((ridx + cells) % s->num_packets, w->dram + s->ridx);
+
+	/* Tell the peer those cells are free again (mifstream.c:163). */
+	writel(BIT(s->read_bit), w->mbox + MBOX_INTGR1);
+
+	return bytes;
+}
+
+static const char *wlbt_fw_level(u8 level)
+{
+	switch (level) {
+	case 0:
+		return KERN_ERR;	/* firmware errors */
+	case 1:
+		return KERN_WARNING;
+	case 2:
+		return KERN_NOTICE;
+	case 3:
+		return KERN_INFO;
+	default:
+		return KERN_DEBUG;
+	}
+}
+
+/*
+ * Drain the firmware's log stream and print it.  Phase 4 payloads are plain
+ * NUL-terminated strings; phase 5 replaces repeated strings with indices into a
+ * table the firmware carries, which needs the string map from mxlog.c that has
+ * not been ported, so those are reported as unknown for now.
+ */
+static void wlbt_log_drain(struct exynos_wlbt *w)
+{
+	char text[260];
+	u32 header, sync, len, level, got;
+
+	while (wlbt_stream_read(w, &w->log, &header, sizeof(header)) ==
+	       sizeof(header)) {
+		sync = header >> 16;
+		level = (header >> 8) & 0xff;
+
+		if (sync == MXLOG_SYNC_PHASE_4) {
+			len = header & 0xff;
+		} else if (sync == MXLOG_SYNC_PHASE_5) {
+			len = (header & 0xff) * 4;
+		} else {
+			/* Not a header at all: the stream is out of step. */
+			w->n_fwlog_bad++;
+			continue;
+		}
+
+		if (!len)
+			continue;
+
+		/* The payload has to be consumed either way, otherwise the
+		 * next read starts in the middle of this message.
+		 */
+		got = wlbt_stream_read(w, &w->log, text, min(len, sizeof(text) - 1));
+		text[got] = '\0';
+
+		if (sync == MXLOG_SYNC_PHASE_4) {
+			w->n_fwlog++;
+			dev_printk(wlbt_fw_level(level), w->dev, "firmware: %s\n",
+				   text);
+		} else {
+			w->n_fwlog_bad++;
+			/* Phase 5 compresses repeated strings against a table
+			 * the firmware carries; until that table is ported, show
+			 * the raw words so the messages can still be read.
+			 */
+			if (w->n_fwlog_bad <= 8)
+				dev_info(w->dev, "firmware log (phase 5, level %u):%*phN\n",
+					 level, (int)min(got, 32u), text);
+		}
+	}
+}
+
+/*
+ * Build the configuration the peer reads from mailbox 1: three streams (the
+ * management channel in both directions and the log), the interrupt bits that
+ * signal them, and an empty common HCF - this board ships no `conf/` directory
+ * with the firmware, so the vendor runs with an empty one too
+ * (mxfwconfig.c:283, "HW file is optional").
+ */
+static int wlbt_build_mxconf(struct exynos_wlbt *w)
+{
+	struct wlbt_mxconf config;
+	struct wlbt_mxconf *conf = &config;
+	u32 offset;
+	int ret;
+
+	w->heap_next = ALIGN(w->fw_runtime_length, 4);
+	if (w->heap_next >= w->mem_size) {
+		dev_err(w->dev, "no room for a heap after the firmware\n");
+		return -ENOSPC;
+	}
+
+	ret = wlbt_stream_init(w, &w->mgmt_in, "mgmt-in", MGMT_NUM_PACKETS,
+			       MGMT_PACKET_SIZE, WLBT_BIT_MGMT_IN_READ,
+			       WLBT_BIT_MGMT_IN_WRITE, true);
+	if (ret)
+		return ret;
+	ret = wlbt_stream_init(w, &w->mgmt_out, "mgmt-out", MGMT_NUM_PACKETS,
+			       MGMT_PACKET_SIZE, WLBT_BIT_MGMT_OUT_READ,
+			       WLBT_BIT_MGMT_OUT_WRITE, false);
+	if (ret)
+		return ret;
+	ret = wlbt_stream_init(w, &w->log, "log", LOG_NUM_PACKETS,
+			       LOG_PACKET_SIZE, WLBT_BIT_LOG_READ,
+			       WLBT_BIT_LOG_WRITE, true);
+	if (ret)
+		return ret;
+
+	/*
+	 * The firmware validates the four GDB streams during bring-up and
+	 * refuses to continue if one of them is missing, even though nothing
+	 * here uses a debugger (0x801172fc in the image, "set up transports").
+	 */
+	ret = wlbt_stream_init(w, &w->gdb_r4_in, "gdb-r4-in", GDB_NUM_PACKETS,
+			       GDB_PACKET_SIZE, WLBT_BIT_GDB_R4_IN_READ,
+			       WLBT_BIT_GDB_R4_IN_WRITE, true);
+	if (ret)
+		return ret;
+	ret = wlbt_stream_init(w, &w->gdb_r4_out, "gdb-r4-out", GDB_NUM_PACKETS,
+			       GDB_PACKET_SIZE, WLBT_BIT_GDB_R4_OUT_READ,
+			       WLBT_BIT_GDB_R4_OUT_WRITE, false);
+	if (ret)
+		return ret;
+	ret = wlbt_stream_init(w, &w->gdb_m4_in, "gdb-m4-in", GDB_NUM_PACKETS,
+			       GDB_PACKET_SIZE, WLBT_BIT_GDB_M4_IN_READ,
+			       WLBT_BIT_GDB_M4_IN_WRITE, true);
+	if (ret)
+		return ret;
+	ret = wlbt_stream_init(w, &w->gdb_m4_out, "gdb-m4-out", GDB_NUM_PACKETS,
+			       GDB_PACKET_SIZE, WLBT_BIT_GDB_M4_OUT_READ,
+			       WLBT_BIT_GDB_M4_OUT_WRITE, false);
+	if (ret)
+		return ret;
+
+	offset = wlbt_heap_alloc(w, sizeof(*conf));
+	if (!offset)
+		return -ENOMEM;
+
+	/* Build it in normal memory: the window is device memory, where byte and
+	 * half-word stores are not something to rely on, and one block copy also
+	 * makes the ordering against the peer's read obvious.
+	 */
+	memset(conf, 0, sizeof(*conf));
+	conf->magic = MXCONF_MAGIC;
+	conf->version_major = MXCONF_VERSION_MAJOR;
+	conf->version_minor = MXCONF_VERSION_MINOR;
+	conf->flags = 0;
+	conf->soc_revision = 0;
+
+	wlbt_stream_serialise(&w->mgmt_in, &conf->trans.to_ap, true);
+	wlbt_stream_serialise(&w->mgmt_out, &conf->trans.from_ap, false);
+	wlbt_stream_serialise(&w->gdb_r4_in, &conf->gdb_r4.to_ap, true);
+	wlbt_stream_serialise(&w->gdb_r4_out, &conf->gdb_r4.from_ap, false);
+	wlbt_stream_serialise(&w->gdb_m4_in, &conf->gdb_m4.to_ap, true);
+	wlbt_stream_serialise(&w->gdb_m4_out, &conf->gdb_m4.from_ap, false);
+	wlbt_stream_serialise(&w->log, &conf->logconf.stream_conf, true);
+
+	conf->fwconfig.offset = MXCONF_FWCONFIG_UNUSED;
+	conf->fwconfig.size = 0;
+
+	memcpy_toio(w->dram + offset, conf, sizeof(*conf));
+	/* The peer reads the configuration over the bus, so it has to be
+	 * there before the doorbell rings.
+	 */
+	wmb();
+
+	w->mxconf_offset = offset;
+
+	dev_info(w->dev, "configuration at MIF+0x%x: mgmt %u/%u, log %u/%u, %zu bytes\n",
+		 offset, MGMT_NUM_PACKETS, MGMT_PACKET_SIZE, LOG_NUM_PACKETS,
+		 LOG_PACKET_SIZE, sizeof(*conf));
+
+	return 0;
 }
 
 /*
@@ -724,18 +1184,28 @@ static void wlbt_boot(struct exynos_wlbt *w)
 	 */
 	if (load_firmware && !w->fw_loaded)
 		wlbt_load_firmware(w);
-	if (w->fw_loaded)
-		wlbt_mbox_init(w);
+	if (w->fw_loaded) {
+		/* Only allow the interrupt bits the streams actually use. */
+		writel((~WLBT_IRQ_BITS & 0xffff) << 16, w->mbox + MBOX_INTMR0);
+		if (!wlbt_build_mxconf(w))
+			wlbt_mbox_init(w);
+		else
+			dev_err(w->dev, "no configuration: the peer will not find its streams\n");
+	}
 
 	ret = wlbt_power_up(w);
 	if (ret) {
 		dev_err(w->dev, "boot failed: %d\n", ret);
 	} else if (w->fw_loaded) {
-		/* Give the firmware a moment to boot and say something. */
-		msleep(200);
-		dev_info(w->dev, "after boot: INTSR0 0x%08x INTMSR0 0x%08x\n",
-			 readl(w->mbox + MBOX_INTSR0),
-			 readl(w->mbox + MBOX_INTMSR0));
+		/* Give the firmware a moment to boot and say something, then
+		 * take whatever it left in the log even if the doorbell was
+		 * missed.
+		 */
+		msleep(300);
+		wlbt_log_drain(w);
+		dev_info(w->dev, "after boot: %u log messages, %u undecodable, INTSR0 0x%08x\n",
+			 w->n_fwlog, w->n_fwlog_bad,
+			 readl(w->mbox + MBOX_INTSR0));
 	}
 	mutex_unlock(&w->lock);
 }
@@ -849,6 +1319,23 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 		   readl(w->mbox + MBOX_INTMR0));
 
 	wlbt_dram_report(w, s);
+
+	if (w->dram && w->mxconf_offset) {
+		seq_printf(s, "streams: log %u bytes queued (fw %u, bad %u), mgmt %u messages\n",
+			   ((readl(w->dram + w->log.widx) + w->log.num_packets -
+			     readl(w->dram + w->log.ridx)) % w->log.num_packets) *
+			   w->log.packet_size,
+			   w->n_fwlog, w->n_fwlog_bad, w->n_mgmt);
+			seq_printf(s, "mxconf at MIF+0x%x, heap next 0x%x\n",
+			   w->mxconf_offset, w->heap_next);
+
+		/* The firmware reports its progress as 0x2222_0000 | stage in
+		 * mailbox 0 (0x8011d568 in the image).
+		 */
+		val = readl(w->mbox + MBOX_ISSR_BASE);
+		if ((val & 0xffff0000) == 0x22220000)
+			seq_printf(s, "peer boot stage %u\n", val & 0xffff);
+	}
 
 	if (w->dram)
 		for (i = 0; i < 8; i++)
