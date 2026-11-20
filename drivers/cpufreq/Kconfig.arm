@@ -291,14 +291,18 @@ config ARM_EXYNOS_ACPM_DVFS
 	  If in doubt, say N.
 
 config EXYNOS9610_CPUCLK
-	tristate "Exynos9610 CPU cluster clock control (experimental)"
+	tristate "Exynos9610 CPU cluster clock control"
 	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on EXYNOS_ACPM_PROTOCOL
 	help
 	  Direct control of the Exynos9610 CPU cluster clocks (CMU_CPUCL0 and
 	  CMU_CPUCL1).  The ACPM firmware owns CPU DVFS on this SoC but does
-	  not service the DVFS channel, so the clusters stay at the rate the
-	  boot chain programmed.  This driver reprograms the cluster PLLs
-	  while keeping the boot voltage, and therefore only allows rates at
-	  or below the boot OPP.
+	  not service the DVFS channel, so the clusters would otherwise stay at
+	  the rate the boot chain programmed.
 
-	  Say M here to get a debugfs experiment driver.
+	  This driver reprograms the cluster PLLs itself and scales the
+	  cluster rails through the ACPM PMIC interface, using the operating
+	  points and voltages the vendor tables in ECT describe.  The rails are
+	  raised before the frequency goes up and lowered only after it has
+	  come down, and the policies register as thermal cooling devices so
+	  the thermal zones can throttle the clusters.

@@ -25,12 +25,17 @@
  * be done while the cores are clocked from it, so the mux is pointed at the
  * always-on 26 MHz oscillator first, exactly like the vendor's clock switch.
  *
- * Voltage is deliberately never touched: only rates at or below the boot OPP
- * are accepted, so the boot voltage stays valid and the regulator setup - which
- * really does belong to the firmware - is left alone.
+ * Two things this driver does *not* trust, both learned on hardware:
  *
- * This is a debugfs experiment driver for now; the cpufreq policy comes once
- * the switching sequence has been validated against measured hardware rates.
+ *   - the PLL STABLE bit, which stays 0 through hundreds of good rate changes
+ *     and must never decide whether the cluster is switched back (see
+ *     cpucl_pll_start()),
+ *   - writing a CPU buck downward, which hangs this board, so the rails are only
+ *     ever raised (see boost_only).
+ *
+ * The operating points above the boot rate also need a higher rail and are
+ * therefore behind the "arm" switch: an unarmed boot runs at the boot operating
+ * point and never writes the PMIC, whatever else happens.
  */
 
 #include <linux/cpufreq.h>
@@ -55,6 +60,7 @@
 #define PLL_ENABLE		BIT(31)
 #define PLL_STABLE		BIT(29)
 #define PLL_OUT_SEL		BIT(4)	/* PLL_MUX_SEL in the vendor sources */
+#define PLL_MUX_BUSY		BIT(7)	/* PLL_MUX_BUSY: the output mux is moving */
 #define PLL_M_MASK		GENMASK(25, 16)
 #define PLL_P_MASK		GENMASK(13, 8)
 #define PLL_S_MASK		GENMASK(2, 0)
@@ -70,12 +76,12 @@
 #define CPUCL_MIN_HZ		26000000UL
 #define CPUCL_PLL_LOCK_CYCLES	150	/* lock time in reference cycles per DIV_P */
 /*
- * Budget for the PLL to report STABLE.  A lock takes LOCKTIME phase detector
- * cycles, about 70 us with DIV_P 3, but the cluster is running from the 26 MHz
- * oscillator while it is waited for, so the loop is slow and can be preempted.
- * Timing out here is not harmless: it forces a rollback, so give it plenty.
+ * Time given to the analog loop to lock after it is started, in microseconds.  A
+ * lock takes LOCKTIME phase detector cycles, i.e. about 70 us with DIV_P 3; this
+ * is that with room for the slower oscillator the cluster runs from meanwhile.
+ * It is a plain delay, not a poll of the STABLE bit - see cpucl_pll_start().
  */
-#define CPUCL_PLL_LOCK_US	20000
+#define CPUCL_PLL_LOCK_UDELAY	300
 
 /*
  * PLL limits from cal-if/pll_spec.c.  The reference divider must put the phase
@@ -145,26 +151,75 @@ struct exynos9610_cpucl {
 };
 
 /*
- * Voltage scaling is opt-in, and off by default: the boot chain leaves the
- * clusters at their boot rate and boot voltage, which is always a valid state
- * to boot into.  Writing 1 here (or exynos9610_cpuclk.volt_scale=1 on the
- * command line) unlocks the operating points above the boot rate, which are
- * only safe because their voltages come from the vendor tables.
+ * Voltage tables.  The operating points above the boot rate need a higher rail,
+ * and the voltages come from the vendor tables in ECT, which are checked against
+ * the PMIC at probe time; if that check does not pass the driver falls back to
+ * the boot rate and never writes a rail.
+ *
+ * This is on by default because the policy has to expose the whole range from
+ * the moment it is created: schedutil takes its reference frequency from the
+ * policy at registration time, and the cooling device that thermal uses for
+ * throttling is built from the same table, so a policy that starts out capped
+ * at the boot rate stays capped even after the table is extended.
+ *
+ * Having a table is not the same as using it: see the "arm" switch below.  The
+ * registered table is always the full one (that is what keeps the thermal
+ * cooling state numbering stable), but every rate above the boot rate is
+ * refused until the driver is armed.
  */
-static bool volt_scale;
+static bool volt_scale = true;
 module_param(volt_scale, bool, 0644);
-MODULE_PARM_DESC(volt_scale, "Allow rates above the boot rate (needs the ECT tables)");
+MODULE_PARM_DESC(volt_scale, "Build the operating points above the boot rate (needs the ECT tables)");
 
 /*
- * Bring-up mode: raise the rail when going up but never write a lower value.
- * Walking a rail downward freezes this device, so this lets the top operating
- * points be tested without ever stepping into that direction.  The rail then
- * stays at the highest value it reached until the next boot, which is why this
- * is a debug switch and not the default.
+ * Arming.  Off by default, and that is the important part of this driver: while
+ * it is off nothing above the boot operating point is allowed and the CPU rails
+ * are never written, so a boot can only ever run at the frequencies and voltages
+ * the boot chain already validated.  Everything that has been suspected of
+ * hanging this board - the rail writes and the top operating points - is behind
+ * this switch.
+ *
+ * Arm it at runtime:
+ *
+ *	echo 1 > /sys/kernel/debug/exynos9610-cpuclk/arm
+ *
+ * or at boot with exynos9610_cpuclk.arm=1.  The point of the split is that a
+ * failed experiment is recoverable: the next boot starts inert again, so a
+ * freeze costs a power cycle instead of a reflash.
  */
-static bool boost_only;
+static bool arm;
+module_param(arm, bool, 0644);
+MODULE_PARM_DESC(arm, "Allow rates above the boot operating point from boot");
+
+static bool cpucl_armed;
+
+/*
+ * Only ever raise a rail, never write a lower value.
+ *
+ * Writing a CPU rail downward freezes this device, reproducibly, even with the
+ * cluster already sitting at a frequency that needs the lower voltage, and with
+ * the very same PMIC interface and register the firmware uses - so it is not an
+ * ordering or undervoltage problem that can be fixed here.  With this on, the
+ * full range of operating points is still usable: the rail is raised before the
+ * frequency goes up and simply left alone when it comes down.  The cost is that
+ * a rail stays at the highest value it reached until the next boot, where the
+ * boot chain programs the boot voltage again.
+ *
+ * Turn it off only to experiment with the downward direction.
+ */
+static bool boost_only = true;
 module_param(boost_only, bool, 0644);
 MODULE_PARM_DESC(boost_only, "Only ever raise the CPU rails, never lower them");
+
+/*
+ * Largest rail change written in one go, in selector steps (one step is
+ * 6.25 mV).  Every attempt at writing a rail downward so far used a single
+ * large jump; a buck can refuse or glitch on that, so the writes are slewed in
+ * small steps here.  0 means "write the target in one go".
+ */
+static unsigned int buck_step = 8;
+module_param(buck_step, uint, 0644);
+MODULE_PARM_DESC(buck_step, "Max rail change per write, in 6.25 mV selector steps");
 
 /*
  * Relocking one cluster while the other is relocking makes the lock wait
@@ -291,33 +346,65 @@ static int cpucl_wait_clear(void __iomem *reg, u32 bit)
 	return -ETIMEDOUT;
 }
 
-static int cpucl_wait_set(void __iomem *reg, u32 bit)
+/*
+ * Put the cluster back on its PLL once the PLL reports a lock.  The mux has its
+ * own busy bit, and the cores must not be handed a clock that is still moving.
+ */
+static void cpucl_mux_restore(struct exynos9610_cpucl *c, void __iomem *mux)
 {
-	unsigned int i;
-
-	for (i = 0; i < CPUCL_PLL_LOCK_US; i++) {
-		if (readl(reg) & bit)
-			return 0;
-		udelay(1);
-	}
-
-	return -ETIMEDOUT;
+	writel(readl(mux) & ~MUX_PLL_SEL, mux);
+	cpucl_wait_clear(mux, MUX_PLL_BUSY);
+	udelay(5);
 }
 
 /*
- * Program the PLL: lock time, then DIV_M/DIV_P/DIV_S together with the output
- * mux and the enable bit, in one write.  PLL_OUT_SEL must be part of that
- * write - it is what connects the VCO back into the CMU, and a CON0 write that
- * clears it leaves the PLL in bypass where it never reports lock.
+ * Shut the PLL down the way the vendor does it (ra_enable_pll() in cal-if/ra.c):
+ * first take the PLL out of the clock path by clearing its output mux select and
+ * waiting for the mux to report done, then clear the enable bit.
+ * Only then may DIV_M/DIV_P/DIV_S be written.
  *
- * The PLL is deliberately not disabled first: the vendor only disables it when
- * the cluster is already clocked from somewhere else, and a plain re-enable
- * from the disabled state is what failed here before.
+ * Reconfiguring a running PLL in one write - which is what this driver used to
+ * do - works most of the time and then wedges the lock detector: the PLL then
+ * reports ENABLE with STABLE clear, and no setting at all will lock again until
+ * the device is rebooted.  That is the lock failure this sequence exists to
+ * avoid.
  */
-static int cpucl_pll_program(struct exynos9610_cpucl *c, u32 pmsk)
+static int cpucl_pll_disable(struct exynos9610_cpucl *c)
 {
 	void __iomem *con0 = c->base + c->pll_con0;
-	unsigned int i;
+
+	writel(readl(con0) & ~PLL_OUT_SEL, con0);
+	if (cpucl_wait_clear(con0, PLL_MUX_BUSY)) {
+		pr_err("cpucl: %s PLL output mux does not settle\n", c->name);
+		return -ETIMEDOUT;
+	}
+
+	writel(readl(con0) & ~PLL_ENABLE, con0);
+
+	/* The VCO has to stop before it can be started again. */
+	usleep_range(20, 40);
+
+	return 0;
+}
+
+/*
+ * Start the PLL on one setting: lock time first, then DIV_M/DIV_P/DIV_S together
+ * with the output mux and the enable bit in a single write.  ra_pll_set_pmsk()
+ * in cal-if/ra.c is the same sequence, and the lock time register counts phase
+ * detector cycles, i.e. DIV_P * 150.
+ *
+ * The result is checked by reading the fields back out of the register, not by
+ * waiting for the STABLE bit: measured on this board, STABLE stays 0 for
+ * hundreds of consecutive, perfectly good rate changes and then only latches
+ * again when the cluster mux is switched back to the PLL.  It is a status bit
+ * to report, never a condition to act on - a driver that refuses to switch the
+ * cores back on STABLE == 0 leaves them on the 26 MHz oscillator while the PLL
+ * is running at the requested rate, which is exactly how this port used to
+ * "fail".
+ */
+static bool cpucl_pll_start(struct exynos9610_cpucl *c, u32 pmsk)
+{
+	void __iomem *con0 = c->base + c->pll_con0;
 	u32 val;
 
 	writel(FIELD_GET(PLL_P_MASK, pmsk) * CPUCL_PLL_LOCK_CYCLES,
@@ -326,33 +413,38 @@ static int cpucl_pll_program(struct exynos9610_cpucl *c, u32 pmsk)
 	val = readl(con0);
 	val &= ~(PLL_M_MASK | PLL_P_MASK | PLL_S_MASK);
 	val |= pmsk | PLL_OUT_SEL | PLL_ENABLE;
+	writel(val, con0);
 
-	/* Write and wait, twice: a lost first lock is usually a slow one. */
-	for (i = 0; i < 2; i++) {
-		writel(val, con0);
-		if (!cpucl_wait_set(con0, PLL_STABLE))
-			return 0;
-	}
+	/* A lock takes about 70 us; do not hand the cores a PLL inside that. */
+	udelay(CPUCL_PLL_LOCK_UDELAY);
 
-	pr_err("cpucl: %s PLL does not report stable (con0=%#010x)\n",
-	       c->name, readl(con0));
+	/* The register file has to carry what was written. */
+	return (readl(con0) & (PLL_M_MASK | PLL_P_MASK | PLL_S_MASK |
+			       PLL_ENABLE | PLL_OUT_SEL)) ==
+	       (pmsk | PLL_ENABLE | PLL_OUT_SEL);
+}
 
-	return -ETIMEDOUT;
+/* Full cycle: shut the PLL down, reconfigure it, bring it back. */
+static bool cpucl_pll_set(struct exynos9610_cpucl *c, u32 pmsk)
+{
+	if (cpucl_pll_disable(c))
+		return false;
+
+	return cpucl_pll_start(c, pmsk);
 }
 
 /*
  * Program one cluster.  The cluster is moved to the 26 MHz oscillator, the PLL
- * is reprogrammed and locked, and the cluster is moved back.  Interrupts stay
- * enabled: the cores simply run slowly for the duration of the relock.
- *
- * If the new settings do not lock, the boot settings are restored while the
- * cores are still on the oscillator, so the mux can be handed back and the
- * cluster is never left at 26 MHz.
+ * is reprogrammed and started, and the cluster is moved back.  The cluster is
+ * handed back even when the PLL reads back wrong: the fallback there is the
+ * setting the boot chain programmed, which is known to run on this silicon, so
+ * the cores always end up with a working clock.
  */
 static int cpucl_relock(struct exynos9610_cpucl *c, unsigned long hz)
 {
 	void __iomem *mux = c->base + CPUCL_MUX_PLL;
-	u32 new_con0, safe_con0;
+	u32 new_con0, boot_con0;
+	bool ok;
 	int ret;
 
 	if (hz < CPUCL_MIN_HZ || hz > c->max_hz)
@@ -365,10 +457,10 @@ static int cpucl_relock(struct exynos9610_cpucl *c, unsigned long hz)
 	/*
 	 * Two CPUs of the same cluster can ask for a rate at the same time; an
 	 * interleaved pair of sequences would leave the mux on the oscillator
-	 * with an unlocked PLL.
+	 * with an unlocked PLL.  The caller already holds c->lock; the global
+	 * one serialises the two clusters, whose lock waits interfere.
 	 */
 	guard(mutex)(&cpucl_relock_lock);
-	guard(mutex)(&c->lock);
 
 	/* Take the cluster off the PLL; SW_USER selects OSCCLK here. */
 	writel(readl(mux) | MUX_PLL_SEL, mux);
@@ -376,44 +468,32 @@ static int cpucl_relock(struct exynos9610_cpucl *c, unsigned long hz)
 	if (ret)
 		return ret;
 
-	/* Let the switch settle: the PLL is reprogrammed while unused. */
 	if (!(readl(mux) & MUX_PLL_SEL))
 		return -EIO;
+	/* Let the cluster clock settle on the oscillator before it runs again. */
 	udelay(5);
 
-	if (cpucl_pll_program(c, new_con0)) {
-		pr_err("cpucl: %s PLL did not lock at %lu Hz (con0=%#x)\n",
-		       c->name, hz, new_con0);
-
-		/*
-		 * Fall back to the last setting that did lock rather than to
-		 * the boot one: it was verified moments ago, so the cluster
-		 * keeps a working clock instead of being left on the
-		 * oscillator.
-		 */
-		safe_con0 = c->good_con0 & (PLL_M_MASK | PLL_P_MASK |
-					    PLL_S_MASK);
-		if (cpucl_pll_program(c, safe_con0)) {
-			safe_con0 = c->orig_con0 & (PLL_M_MASK | PLL_P_MASK |
-						    PLL_S_MASK);
-			if (cpucl_pll_program(c, safe_con0)) {
-				pr_err("cpucl: %s will not lock either, cluster left on OSCCLK\n",
-				       c->name);
-				return -ETIMEDOUT;
-			}
-		}
-		ret = -ETIMEDOUT;
-	} else {
+	ok = cpucl_pll_set(c, new_con0);
+	if (ok) {
 		c->good_con0 = readl(c->base + c->pll_con0);
-		ret = 0;
+	} else {
+		boot_con0 = c->orig_con0 & (PLL_M_MASK | PLL_P_MASK | PLL_S_MASK);
+		pr_err("cpucl: %s did not take %lu Hz (con0=%#010x), restoring %lu Hz\n",
+		       c->name, hz, readl(c->base + c->pll_con0),
+		       cpucl_pll_rate(boot_con0));
+		cpucl_pll_set(c, boot_con0);
+		ret = -ETIMEDOUT;
 	}
 
-	/* Hand the cluster back to the PLL. */
-	writel(readl(mux) & ~MUX_PLL_SEL, mux);
-	cpucl_wait_clear(mux, MUX_PLL_BUSY);
-	udelay(5);
+	/* Hand the cluster back to the PLL - always. */
+	cpucl_mux_restore(c, mux);
 
 	c->cur_hz = cpucl_pll_rate(readl(c->base + c->pll_con0));
+
+	if (!(readl(c->base + c->pll_con0) & PLL_STABLE))
+		pr_debug("cpucl: %s at %lu Hz (STABLE reads 0, ignoring it)\n",
+			 c->name, c->cur_hz);
+
 	if (ret)
 		pr_err("cpucl: %s kept at %lu Hz\n", c->name, c->cur_hz);
 
@@ -436,16 +516,28 @@ static unsigned int cpucl_uvolt_for(const struct exynos9610_cpucl *c,
 }
 
 /*
- * Set a CPU rail.  Only the output-select register is touched, so the enable
- * and mode bits of the matching control register are left alone.  The rails are
- * reached through the ACPM PMIC protocol, which is also how the vendor kernel
- * programs them.  Returns true when the register was written, so the caller
- * knows whether it has to wait out the ramp.
+ * Highest rate the driver currently allows: the boot operating point until it
+ * is armed, the rated maximum of the cluster after that - and never above the
+ * boot rate when there is no voltage table to raise the rail with.
  */
-static int cpucl_buck_set(struct exynos9610_cpucl *c, unsigned int uvolt)
+static unsigned long cpucl_ceiling_hz(const struct exynos9610_cpucl *c)
+{
+	return (cpucl_armed && volt_scale && c->uvolt) ? c->max_hz : c->boot_hz;
+}
+
+/*
+ * Write one rail selector through the ACPM PMIC protocol, in steps of at most
+ * buck_step so the buck sees a slew instead of a jump.  Returns the number of
+ * steps written (positive), 0 when the rail already held the target, or a
+ * negative errno.  A negative return after some steps were written looks like a
+ * failed change but the rail may be half way: callers treat any error as "the
+ * rail is not what was asked for" and do not touch the frequency.
+ */
+static int cpucl_buck_slew(struct exynos9610_cpucl *c, unsigned int uvolt,
+			   bool loud)
 {
 	const struct acpm_pmic_ops *ops;
-	unsigned int sel;
+	unsigned int sel, delta, n = 0;
 	u8 old;
 	int ret;
 
@@ -466,27 +558,87 @@ static int cpucl_buck_set(struct exynos9610_cpucl *c, unsigned int uvolt)
 	if (old == sel)
 		return 0;
 
-	ret = ops->write_reg(c->acpm, CPUCL_PMIC_CHAN, CPUCL_PMIC_TYPE,
-			     c->buck_reg, 0, sel);
-	if (ret)
-		return ret;
+	if (loud)
+		pr_emerg("cpucl: %s buck 0x%02x -> 0x%02x (%u -> %u uV) step %u\n",
+			 c->name, old, (u8)sel,
+			 old * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV,
+			 sel * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV, buck_step);
 
-	usleep_range(CPUCL_BUCK_RAMP_US, CPUCL_BUCK_RAMP_US + 2000);
+	while (old != sel) {
+		u8 next;
 
-	return 1;
+		delta = old > sel ? old - sel : sel - old;
+		if (buck_step && delta > buck_step)
+			delta = buck_step;
+
+		next = old > sel ? old - delta : old + delta;
+
+		if (loud)
+			pr_emerg("cpucl: %s buck 0x%02x <- 0x%02x\n",
+				 c->name, c->buck_reg, next);
+
+		ret = ops->write_reg(c->acpm, CPUCL_PMIC_CHAN, CPUCL_PMIC_TYPE,
+				     c->buck_reg, 0, next);
+		if (ret)
+			return ret;
+
+		/* Wait out the ramp of this step before asking for the next. */
+		usleep_range(CPUCL_BUCK_RAMP_US, CPUCL_BUCK_RAMP_US + 2000);
+
+		old = next;
+		n++;
+	}
+
+	if (loud)
+		pr_emerg("cpucl: %s buck 0x%02x ok, %u step(s)\n",
+			 c->name, c->buck_reg, n);
+
+	return n;
+}
+
+static int cpucl_buck_set(struct exynos9610_cpucl *c, unsigned int uvolt)
+{
+	int ret = cpucl_buck_slew(c, uvolt, false);
+
+	return ret < 0 ? ret : 1;
 }
 
 /*
  * Move a cluster to a rate and the voltage that belongs to it.  Voltage goes up
  * before the clock when speeding up and comes down after the clock when slowing
  * down, so the cores are never run outside the range their table entry covers.
+ *
+ * The ceiling is the boot rate until the driver is armed, so an unarmed boot
+ * never writes a rail and never leaves the operating points the boot chain
+ * validated.
  */
 static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
 {
-	unsigned int uvolt = volt_scale ? cpucl_uvolt_for(c, hz) : 0;
-	unsigned int boot_uv = volt_scale ? cpucl_uvolt_for(c, c->boot_hz) : 0;
-	bool raising = hz > c->cur_hz;
+	unsigned long ceiling = cpucl_ceiling_hz(c);
+	unsigned int uvolt, boot_uv;
+	unsigned long cur;
+	bool raising;
 	int ret;
+
+	if (hz > ceiling)
+		hz = ceiling;
+
+	guard(mutex)(&c->lock);
+
+	cur = cpucl_pll_rate(readl(c->base + c->pll_con0));
+	c->cur_hz = cur;
+
+	/*
+	 * Already there: do not cycle the PLL for nothing.  This matters because
+	 * a governor that asks for a clamped rate repeats the request on every
+	 * update, and each needless relock is a chance to lose the lock.
+	 */
+	if (cur == hz)
+		return 0;
+
+	uvolt = volt_scale ? cpucl_uvolt_for(c, hz) : 0;
+	boot_uv = volt_scale ? cpucl_uvolt_for(c, c->boot_hz) : 0;
+	raising = hz > cur;
 
 	/* Never step a rail down in bring-up mode. */
 	if (boost_only && uvolt && uvolt <= c->applied_uv)
@@ -501,6 +653,11 @@ static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
 
 	ret = cpucl_relock(c, hz);
 
+	if (ret == -ENODEV) {
+		pr_warn_once("cpucl: %s stopped: PLL will not lock\n", c->name);
+		return 0;
+	}
+
 	if (ret) {
 		/* The relock fell back to the boot PLL setting: match it. */
 		if (raising && boot_uv && !boost_only)
@@ -509,6 +666,9 @@ static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
 	}
 
 	if (uvolt && !raising) {
+		/* The cores must be off the old PLL before the rail drops. */
+		usleep_range(20, 50);
+
 		if (cpucl_buck_set(c, uvolt) < 0)
 			pr_warn("cpucl: %s could not set voltage %u uV\n",
 				c->name, uvolt);
@@ -869,6 +1029,16 @@ static int cpucl_cpufreq_init(struct cpufreq_policy *policy)
 		return -ENODEV;
 
 	/*
+	 * Every rate change moves the cluster to the oscillator and back, which
+	 * takes a few hundred microseconds and cannot be done at the rate
+	 * schedutil would like to: hammering the PLL is what produced lock
+	 * failures and left a cluster on the oscillator.  Ten milliseconds is
+	 * also the ballpark the vendor DVFS hardware uses.
+	 */
+	policy->cpuinfo.transition_latency = 500 * NSEC_PER_USEC;
+	policy->transition_delay_us = 10000;
+
+	/*
 	 * cpufreq_generic_init() is deliberately not used here: it calls
 	 * cpumask_setall(policy->cpus), which would merge both clusters into a
 	 * single policy.  The core derives the frequency limits from the table
@@ -876,7 +1046,6 @@ static int cpucl_cpufreq_init(struct cpufreq_policy *policy)
 	 */
 	cpumask_copy(policy->cpus, &c->cpus);
 	policy->freq_table = c->table;
-	policy->cpuinfo.transition_latency = 500 * NSEC_PER_USEC;
 
 	return 0;
 }
@@ -892,10 +1061,15 @@ static int cpucl_cpufreq_target(struct cpufreq_policy *policy,
 
 	hz = (unsigned long)policy->freq_table[index].frequency * 1000;
 
-	/* Never leave the boot rate without a voltage table behind it. */
-	if (hz > c->boot_hz && (!volt_scale || !c->uvolt)) {
-		pr_warn_once("cpucl: %s capped at the boot rate, voltage scaling is off\n",
-			     c->name);
+	/*
+	 * The table carries the whole range so the thermal cooling states keep
+	 * their numbering, but an unarmed driver stops at the boot operating
+	 * point: that is what makes a boot with this driver built in unable to
+	 * run faster than the boot chain validated.
+	 */
+	if (hz > cpucl_ceiling_hz(c)) {
+		pr_debug_once("cpucl: %s capped at the boot rate, not armed\n",
+			      c->name);
 		hz = c->boot_hz;
 	}
 
@@ -930,6 +1104,9 @@ static int cpucl_dump_show(struct seq_file *s, void *unused)
 {
 	unsigned int i;
 
+	seq_printf(s, "armed %d  volt_scale %d  boost_only %d  buck_step %u\n",
+		   cpucl_armed, volt_scale, boost_only, buck_step);
+
 	for (i = 0; i < num_clusters; i++) {
 		struct exynos9610_cpucl *c = &clusters[i];
 		u32 con0 = readl(c->base + c->pll_con0);
@@ -950,8 +1127,9 @@ static int cpucl_dump_show(struct seq_file *s, void *unused)
 			   (sw & SW_USER_SEL) ? 1UL : 0UL, mux,
 			   (mux & MUX_PLL_SEL) ? 1UL : 0UL);
 		seq_printf(s, "    cpus=%*pbl\n", cpumask_pr_args(&c->cpus));
-		seq_printf(s, "    boot=%lu Hz  last_set=%lu Hz  range=%lu-%lu Hz\n",
-			   c->boot_hz, c->cur_hz, c->min_hz, c->max_hz);
+		seq_printf(s, "    boot=%lu Hz  last_set=%lu Hz  range=%lu-%lu Hz  ceiling=%lu Hz\n",
+			   c->boot_hz, c->cur_hz, c->min_hz, c->max_hz,
+			   cpucl_ceiling_hz(c));
 
 		if (c->uvolt) {
 			unsigned int j;
@@ -970,7 +1148,55 @@ static int cpucl_dump_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(cpucl_dump);
 
-/* "set <cluster> <hz>" - debugfs interface for bring-up. */
+/*
+ * The arm switch.  Reading it reports the state, writing 1 allows the operating
+ * points above the boot rate (and with them the rail writes), writing 0 puts the
+ * ceiling back at the boot operating point.  Nothing is written to the PMIC by
+ * the switch itself; the rails follow the frequencies the governor asks for.
+ */
+static ssize_t cpucl_arm_write(struct file *file, const char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	char buf[16];
+	bool on;
+	int ret;
+
+	if (count == 0 || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+
+	cpucl_armed = on;
+	pr_info("cpucl: %s, ceiling is now the %s operating point\n",
+		on ? "armed" : "disarmed",
+		on ? "rated maximum" : "boot");
+
+	return count;
+}
+
+static ssize_t cpucl_arm_read(struct file *file, char __user *ubuf,
+			      size_t count, loff_t *ppos)
+{
+	char buf[8];
+	int len = snprintf(buf, sizeof(buf), "%d\n", cpucl_armed);
+
+	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
+}
+
+static const struct file_operations cpucl_arm_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.read	= cpucl_arm_read,
+	.write	= cpucl_arm_write,
+	.llseek	= noop_llseek,
+};
+
+/* "set <cluster> <hz>" - debugfs interface for bring-up.  It obeys the ceiling. */
 static ssize_t cpucl_set_write(struct file *file, const char __user *ubuf,
 			       size_t count, loff_t *ppos)
 {
@@ -1000,10 +1226,11 @@ static ssize_t cpucl_set_write(struct file *file, const char __user *ubuf,
 }
 
 /*
- * Raw access to the CPU buck output registers, for bring-up: reading shows what
- * the firmware left behind, writing lets a single register be moved by hand
- * (selector = (uV - 300000) / 6250) so the PMIC path can be exercised without
- * enabling voltage scaling for the whole cluster.
+ * Raw access to the CPU buck output registers: reading shows what the firmware
+ * left behind, writing moves a rail by hand (selector = (uV - 300000) / 6250).
+ * The write slews in buck_step steps and logs every step at KERN_EMERG, so it
+ * is the tool for settling the "writing a rail downward freezes the board"
+ * question without risking a boot: nothing here runs unless a human asks.
  */
 static int cpucl_buck_show(struct seq_file *s, void *unused)
 {
@@ -1044,15 +1271,18 @@ static ssize_t cpucl_buck_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	buf[count] = '\0';
 
-	if (sscanf(buf, "%u %x", &cluster, &val) != 2 || cluster >= num_clusters)
+	if (sscanf(buf, "%u %x", &cluster, &val) != 2 ||
+	    cluster >= num_clusters || val > 0xff)
 		return -EINVAL;
 
-	pr_info("cpucl: buck write %s reg 0x%02x <- 0x%02x\n",
-		clusters[cluster].name, clusters[cluster].buck_reg, val);
-	ret = cpucl_buck_set(&clusters[cluster], val * CPUCL_BUCK_STEP_UV +
-						 CPUCL_BUCK_MIN_UV);
-	pr_info("cpucl: buck write %s -> 0x%02x (%d)\n",
-		clusters[cluster].name, val, ret);
+	/*
+	 * Deliberately loud: this is the interface a freeze is investigated
+	 * with, so every step is written at KERN_EMERG and therefore lands in
+	 * the ramoops console buffer.  After a hard reset, boot stock Android
+	 * and read /sys/fs/pstore/console-ramoops-0 to see how far it got.
+	 */
+	ret = cpucl_buck_slew(&clusters[cluster],
+			      val * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV, true);
 
 	return ret < 0 ? ret : count;
 }
@@ -1329,24 +1559,31 @@ static int cpucl_probe(struct platform_device *pdev)
 			cpucl_drop_table(c);
 			ret = cpucl_build_table(c);
 		}
-		if (!c->uvolt) {
-			/*
-			 * Without a voltage table nothing above the boot rate may
-			 * be requested: the boot voltage is only known to be
-			 * correct for that rate.
-			 */
+		/*
+		 * Without a voltage table nothing above the boot rate may be
+		 * requested: the boot voltage is only known to be correct for
+		 * that rate.
+		 */
+		if (!c->uvolt)
 			c->max_hz = c->boot_hz;
-		}
 		if (ret)
 			return ret;
 
-		dev_info(&pdev->dev, "%s: %lu-%lu Hz, voltage %s\n",
-			 c->name, c->table[0].frequency * 1000UL,
-			 c->max_hz, c->uvolt ? "scaled" : "fixed");
+		dev_info(&pdev->dev, "%s: %lu-%lu Hz, ceiling %lu Hz, voltage %s\n",
+			 c->name, c->table[0].frequency * 1000UL, c->max_hz,
+			 cpucl_ceiling_hz(c), c->uvolt ? "scaled" : "fixed");
 	}
 
 	if (!cpucl_ect_base)
 		cpucl_ect_base = NULL;
+
+	/*
+	 * Arming is what turns the operating points above the boot rate on, and
+	 * with them the rail writes.  It is off unless the kernel command line
+	 * asks for it (exynos9610_cpuclk.arm=1), so a plain boot is limited to
+	 * the boot operating point and never touches the PMIC.
+	 */
+	cpucl_armed = arm;
 
 	ret = cpufreq_register_driver(&cpucl_cpufreq_driver);
 	if (ret)
@@ -1360,6 +1597,11 @@ static int cpucl_probe(struct platform_device *pdev)
 			    &cpucl_set_fops);
 	debugfs_create_file("buck", 0644, cpucl_debugfs, NULL,
 			    &cpucl_buck_fops);
+	debugfs_create_file("arm", 0644, cpucl_debugfs, NULL,
+			    &cpucl_arm_fops);
+
+	dev_info(&pdev->dev, "%s (exynos9610_cpuclk.arm=1 to unlock the top operating points)\n",
+		 cpucl_armed ? "armed" : "not armed");
 
 	platform_set_drvdata(pdev, clusters);
 
