@@ -194,29 +194,28 @@
  * learns which is which from the configuration, so the numbers only have to be
  * consistent between the two sides.
  */
+/*
+ * Interrupt bit indices, as the vendor's mifintrbit allocates them: bit 0 of
+ * the from-host bitmap is reserved for forcing a panic, so the first
+ * allocation lands on 1 and everything after it shifts by one.
+ */
+#define WLBT_BIT_MGMT_IN_READ		1
 #define WLBT_BIT_MGMT_IN_WRITE		0
-#define WLBT_BIT_MGMT_OUT_WRITE		1
+#define WLBT_BIT_MGMT_OUT_READ		1
+#define WLBT_BIT_MGMT_OUT_WRITE		2
+#define WLBT_BIT_GDB_R4_IN_READ		3
 #define WLBT_BIT_GDB_R4_IN_WRITE	2
-#define WLBT_BIT_GDB_R4_OUT_WRITE	3
+#define WLBT_BIT_GDB_R4_OUT_READ	3
+#define WLBT_BIT_GDB_R4_OUT_WRITE	0	/* reserved panic bit */
+#define WLBT_BIT_GDB_M4_IN_READ		1
 #define WLBT_BIT_GDB_M4_IN_WRITE	4
-#define WLBT_BIT_GDB_M4_OUT_WRITE	5
+#define WLBT_BIT_GDB_M4_OUT_READ	5
+#define WLBT_BIT_GDB_M4_OUT_WRITE	0	/* reserved panic bit */
+#define WLBT_BIT_LOG_READ		4
 #define WLBT_BIT_LOG_WRITE		6
 
-#define WLBT_BIT_MGMT_IN_READ		0
-#define WLBT_BIT_MGMT_OUT_READ		1
-#define WLBT_BIT_GDB_R4_IN_READ		2
-#define WLBT_BIT_GDB_R4_OUT_READ	0	/* the bit reserved for panics */
-#define WLBT_BIT_LOG_READ		3
-#define WLBT_BIT_GDB_M4_IN_READ		0
-#define WLBT_BIT_GDB_M4_OUT_READ	0	/* the bit reserved for panics */
-
-#define WLBT_IRQ_BITS			(BIT(WLBT_BIT_MGMT_IN_WRITE) | \
-					 BIT(WLBT_BIT_MGMT_OUT_WRITE) | \
-					 BIT(WLBT_BIT_GDB_R4_IN_WRITE) | \
-					 BIT(WLBT_BIT_GDB_R4_OUT_WRITE) | \
-					 BIT(WLBT_BIT_GDB_M4_IN_WRITE) | \
-					 BIT(WLBT_BIT_GDB_M4_OUT_WRITE) | \
-					 BIT(WLBT_BIT_LOG_WRITE))
+/* Every bit allocated to-host is one this side wants to hear about. */
+#define WLBT_IRQ_BITS			GENMASK(6, 0)
 
 #define MXCONF_FWCONFIG_UNUSED		0
 
@@ -651,8 +650,21 @@ static irqreturn_t wlbt_wdog_isr(int irq, void *data)
 	struct exynos_wlbt *w = data;
 	int ret;
 
+	/* During the config handshake the SoC can raise this spuriously; the
+	 * vendor just consumes it (platform_mif_9610.c:591).
+	 */
+	if (w->state == WLBT_WAIT_CFG_REQ)
+		return IRQ_HANDLED;
+
 	w->n_wdog++;
-	dev_warn(w->dev, "WLBT watchdog reset request\n");
+
+	/* The peer holds the line until something resets it, so a level
+	 * interrupt here storms the AP - which is exactly what the vendor
+	 * guards against by disabling the line when no reset handler is
+	 * registered.  One request is enough to know the peer is gone.
+	 */
+	disable_irq_nosync(irq);
+	dev_err(w->dev, "peer watchdog reset request, line disabled\n");
 
 	ret = regmap_update_bits(w->pmu, WLBT_CTRL_NS, WLBT_RESET_REQ_CLR,
 				 WLBT_RESET_REQ_CLR);
@@ -821,19 +833,27 @@ static void wlbt_mbox_init(struct exynos_wlbt *w)
  * streams, configuration - lives above it.  A bump allocator is all that is
  * needed, because nothing is ever freed while the peer is running.
  */
+/*
+ * miframman.c allocates size + align + sizeof(void *) per block and parks a
+ * back pointer just below the aligned block, with the alignment clamped up to
+ * sizeof(void *).  Spending the same slack puts every stream at the address
+ * the vendor's own driver would have picked, which is one less difference to
+ * explain when the peer refuses to read one of them.
+ */
 static u32 wlbt_heap_alloc(struct exynos_wlbt *w, u32 bytes)
 {
-	u32 offset;
+	const u32 align = sizeof(void *);
+	u32 offset, end;
 
-	bytes = ALIGN(bytes, 4);
-	if (!w->heap_next || w->heap_next + bytes > w->mem_size) {
+	end = w->heap_next + bytes + align + align;
+	if (!w->heap_next || end > w->mem_size) {
 		dev_err(w->dev, "MIF heap is full (%u of %pa used)\n",
 			w->heap_next, &w->mem_size);
 		return 0;
 	}
 
-	offset = w->heap_next;
-	w->heap_next += bytes;
+	offset = ALIGN(w->heap_next + align + align, align);
+	w->heap_next = end;
 	memset_io(w->dram + offset, 0, bytes);
 
 	return offset;
@@ -868,20 +888,19 @@ static int wlbt_stream_init(struct exynos_wlbt *w, struct wlbt_stream *s,
 }
 
 static void wlbt_stream_serialise(struct wlbt_stream *s,
-				 struct wlbt_stream_conf *conf, bool to_ap)
+				  struct wlbt_stream_conf *conf)
 {
 	conf->buf_conf.buffer_loc = s->buf;
 	conf->buf_conf.num_packets = s->num_packets;
 	conf->buf_conf.packet_size = s->packet_size;
 	conf->buf_conf.read_index_loc = s->ridx;
 	conf->buf_conf.write_index_loc = s->widx;
-	if (to_ap) {
-		conf->read_bit_idx = s->read_bit;
-		conf->write_bit_idx = s->write_bit;
-	} else {
-		conf->read_bit_idx = s->write_bit;
-		conf->write_bit_idx = s->read_bit;
-	}
+
+	/* Verbatim, as mif_stream_config_serialise() does: the two indices
+	 * already carry opposite direction on the two sides.
+	 */
+	conf->read_bit_idx = s->read_bit;
+	conf->write_bit_idx = s->write_bit;
 }
 
 /**
@@ -1080,12 +1099,6 @@ static int wlbt_build_mxconf(struct exynos_wlbt *w)
 			       WLBT_BIT_MGMT_OUT_WRITE, false);
 	if (ret)
 		return ret;
-	ret = wlbt_stream_init(w, &w->log, "log", LOG_NUM_PACKETS,
-			       LOG_PACKET_SIZE, WLBT_BIT_LOG_READ,
-			       WLBT_BIT_LOG_WRITE, true);
-	if (ret)
-		return ret;
-
 	/*
 	 * The firmware validates the four GDB streams during bring-up and
 	 * refuses to continue if one of them is missing, even though nothing
@@ -1112,6 +1125,12 @@ static int wlbt_build_mxconf(struct exynos_wlbt *w)
 	if (ret)
 		return ret;
 
+	ret = wlbt_stream_init(w, &w->log, "log", LOG_NUM_PACKETS,
+			       LOG_PACKET_SIZE, WLBT_BIT_LOG_READ,
+			       WLBT_BIT_LOG_WRITE, true);
+	if (ret)
+		return ret;
+
 	offset = wlbt_heap_alloc(w, sizeof(*conf));
 	if (!offset)
 		return -ENOMEM;
@@ -1127,13 +1146,13 @@ static int wlbt_build_mxconf(struct exynos_wlbt *w)
 	conf->flags = 0;
 	conf->soc_revision = 0;
 
-	wlbt_stream_serialise(&w->mgmt_in, &conf->trans.to_ap, true);
-	wlbt_stream_serialise(&w->mgmt_out, &conf->trans.from_ap, false);
-	wlbt_stream_serialise(&w->gdb_r4_in, &conf->gdb_r4.to_ap, true);
-	wlbt_stream_serialise(&w->gdb_r4_out, &conf->gdb_r4.from_ap, false);
-	wlbt_stream_serialise(&w->gdb_m4_in, &conf->gdb_m4.to_ap, true);
-	wlbt_stream_serialise(&w->gdb_m4_out, &conf->gdb_m4.from_ap, false);
-	wlbt_stream_serialise(&w->log, &conf->logconf.stream_conf, true);
+	wlbt_stream_serialise(&w->mgmt_in, &conf->trans.to_ap);
+	wlbt_stream_serialise(&w->mgmt_out, &conf->trans.from_ap);
+	wlbt_stream_serialise(&w->gdb_r4_in, &conf->gdb_r4.to_ap);
+	wlbt_stream_serialise(&w->gdb_r4_out, &conf->gdb_r4.from_ap);
+	wlbt_stream_serialise(&w->gdb_m4_in, &conf->gdb_m4.to_ap);
+	wlbt_stream_serialise(&w->gdb_m4_out, &conf->gdb_m4.from_ap);
+	wlbt_stream_serialise(&w->log, &conf->logconf.stream_conf);
 
 	conf->fwconfig.offset = MXCONF_FWCONFIG_UNUSED;
 	conf->fwconfig.size = 0;
@@ -1421,8 +1440,9 @@ static void wlbt_stream_status(struct exynos_wlbt *w, struct seq_file *s,
 	if (!w->dram)
 		return;
 
-	seq_printf(s, "stream %-10s cells %4u x %3u  read %u write %u\n",
-		   st->name, st->num_packets, st->packet_size,
+	seq_printf(s, "stream %-10s buffer +0x%06x cells %4u x %3u  bits %u/%u  read %u write %u\n",
+		   st->name, st->buf, st->num_packets, st->packet_size,
+		   st->read_bit, st->write_bit,
 		   readl(w->dram + st->ridx), readl(w->dram + st->widx));
 }
 
