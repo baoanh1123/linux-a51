@@ -140,6 +140,7 @@ struct exynos9610_cpucl {
 	struct mutex lock;	/* one rate change at a time per cluster */
 	struct acpm_handle *acpm;
 	u8 buck_reg;
+	unsigned int applied_uv;	/* highest rail value written so far */
 	unsigned int *uvolt;	/* parallel to table, NULL when unknown */
 };
 
@@ -153,6 +154,17 @@ struct exynos9610_cpucl {
 static bool volt_scale;
 module_param(volt_scale, bool, 0644);
 MODULE_PARM_DESC(volt_scale, "Allow rates above the boot rate (needs the ECT tables)");
+
+/*
+ * Bring-up mode: raise the rail when going up but never write a lower value.
+ * Walking a rail downward freezes this device, so this lets the top operating
+ * points be tested without ever stepping into that direction.  The rail then
+ * stays at the highest value it reached until the next boot, which is why this
+ * is a debug switch and not the default.
+ */
+static bool boost_only;
+module_param(boost_only, bool, 0644);
+MODULE_PARM_DESC(boost_only, "Only ever raise the CPU rails, never lower them");
 
 /*
  * Relocking one cluster while the other is relocking makes the lock wait
@@ -476,25 +488,33 @@ static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
 	bool raising = hz > c->cur_hz;
 	int ret;
 
+	/* Never step a rail down in bring-up mode. */
+	if (boost_only && uvolt && uvolt <= c->applied_uv)
+		uvolt = 0;
+
 	if (uvolt && raising) {
 		ret = cpucl_buck_set(c, uvolt);
 		if (ret < 0)
 			return ret;
+		c->applied_uv = uvolt;
 	}
 
 	ret = cpucl_relock(c, hz);
 
 	if (ret) {
 		/* The relock fell back to the boot PLL setting: match it. */
-		if (raising && boot_uv)
+		if (raising && boot_uv && !boost_only)
 			cpucl_buck_set(c, boot_uv);
 		return ret;
 	}
 
-	if (uvolt && !raising &&
-	    cpucl_buck_set(c, uvolt) < 0)
-		pr_warn("cpucl: %s could not lower voltage to %u uV\n",
-			c->name, uvolt);
+	if (uvolt && !raising) {
+		if (cpucl_buck_set(c, uvolt) < 0)
+			pr_warn("cpucl: %s could not set voltage %u uV\n",
+				c->name, uvolt);
+		else
+			c->applied_uv = uvolt;
+	}
 
 	return 0;
 }
@@ -1275,8 +1295,19 @@ static int cpucl_probe(struct platform_device *pdev)
 		struct exynos9610_cpucl *c = &clusters[i];
 
 		c->acpm = acpm;
-		if (!c->acpm || !c->buck_reg)
+		if (!c->acpm || !c->buck_reg) {
 			c->buck_reg = 0;
+		} else {
+			const struct acpm_pmic_ops *pops = &c->acpm->ops.pmic_ops;
+			u8 val;
+
+			/* Start from whatever the boot chain left behind. */
+			if (!pops->read_reg(c->acpm, CPUCL_PMIC_CHAN,
+					    CPUCL_PMIC_TYPE, c->buck_reg, 0,
+					    &val))
+				c->applied_uv = val * CPUCL_BUCK_STEP_UV +
+						CPUCL_BUCK_MIN_UV;
+		}
 
 		/*
 		 * The operating points above the boot rate need the voltage
