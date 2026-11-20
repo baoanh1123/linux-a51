@@ -364,6 +364,13 @@ static const u32 wlbt_rom_patch[] = {
 /**
  * struct exynos_wlbt - SCSC platform state
  */
+#define WLBT_PW_REGS	7
+
+struct wlbt_pw_reg {
+	u32 reg;
+	u32 val;
+};
+
 #define WLBT_TRACE_MAX	4096
 
 struct wlbt_trace_rec {
@@ -410,6 +417,12 @@ struct exynos_wlbt {
 	u32 last_mbox_status;
 	u32 peek_offset;		/* MIF-relative, set by debugfs write */
 	u32 peek_words;
+	/* The WLBT sequencer configuration is set by the bootloader; dropping it
+	 * in wlbt_power_down() is one way, so keep the original values to be able
+	 * to boot the peer again without reloading this module.
+	 */
+	struct wlbt_pw_reg pw_cfg[WLBT_PW_REGS];
+	bool pw_cfg_dirty;
 	char find_needle[32];
 	u32 find_len;
 	u32 find_hits[64];
@@ -444,6 +457,43 @@ MODULE_PARM_DESC(load_firmware, "Copy the firmware image into MIF DRAM and let t
 static char *trace_boot;
 module_param(trace_boot, charp, 0444);
 MODULE_PARM_DESC(trace_boot, "Sample one peer word from the moment the firmware boots: <hex offset>:<hex field>:<microseconds>");
+
+static const u32 wlbt_pw_regs[WLBT_PW_REGS] = {
+	CENTRAL_SEQ_WLBT_CONFIGURATION,
+	RESET_AHEAD_WLBT_SYS_PWR_REG,
+	CLEANY_BUS_WLBT_SYS_PWR_REG,
+	LOGIC_RESET_WLBT_SYS_PWR_REG,
+	TCXO_GATE_WLBT_SYS_PWR_REG,
+	WLBT_DISABLE_ISO_SYS_PWR_REG,
+	WLBT_RESET_ISO_SYS_PWR_REG,
+};
+
+static void wlbt_pw_cfg_save(struct exynos_wlbt *w)
+{
+	unsigned int i;
+
+	for (i = 0; i < WLBT_PW_REGS; i++) {
+		w->pw_cfg[i].reg = wlbt_pw_regs[i];
+		if (regmap_read(w->pmu, wlbt_pw_regs[i], &w->pw_cfg[i].val))
+			w->pw_cfg[i].val = 0;
+	}
+}
+
+static void wlbt_pw_cfg_restore(struct exynos_wlbt *w)
+{
+	unsigned int i;
+
+	if (!w->pw_cfg_dirty)
+		return;
+
+	for (i = 0; i < WLBT_PW_REGS; i++) {
+		if (regmap_write(w->pmu, w->pw_cfg[i].reg, w->pw_cfg[i].val))
+			dev_err(w->dev, "cannot restore PMU 0x%x to 0x%x\n",
+				w->pw_cfg[i].reg, w->pw_cfg[i].val);
+	}
+	w->pw_cfg_dirty = false;
+	dev_dbg(w->dev, "restored the WLBT sequencer configuration\n");
+}
 
 static const char *wlbt_state_name(enum wlbt_state state)
 {
@@ -1282,6 +1332,7 @@ static int wlbt_power_down(struct exynos_wlbt *w)
 	}
 
 	w->state = WLBT_IN_RESET;
+	w->pw_cfg_dirty = true;
 
 	/* The sequencer reports 0x80 once the domain is really down. */
 	timeout = jiffies + msecs_to_jiffies(500);
@@ -1323,6 +1374,8 @@ static void wlbt_boot(struct exynos_wlbt *w)
 		else
 			dev_err(w->dev, "no configuration: the peer will not find its streams\n");
 	}
+
+	wlbt_pw_cfg_restore(w);
 
 	if (trace_boot && w->trace) {
 		unsigned int off, field, us;
@@ -1947,6 +2000,7 @@ static int wlbt_probe(struct platform_device *pdev)
 	w->pmu = wlbt_syscon(w, "samsung,syscon-phandle");
 	if (IS_ERR(w->pmu))
 		return PTR_ERR(w->pmu);
+	wlbt_pw_cfg_save(w);
 
 	/*
 	 * The window controllers are optional here: they are only needed once
