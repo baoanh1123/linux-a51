@@ -571,10 +571,16 @@
 					cooling-device = <&cpu0 7 THERMAL_NO_LIMIT>,
 							 <&cpu4 7 THERMAL_NO_LIMIT>;
 				};
+				/*
+				 * 9 and not 11: a bound above the cooling
+				 * device's max_state makes the bind fail with
+				 * -EINVAL, and with the default volt_scale=0 the
+				 * policies only expose ten levels.
+				 */
 				map2 {
 					trip = <&cpu_alert2>;
-					cooling-device = <&cpu0 11 THERMAL_NO_LIMIT>,
-							 <&cpu4 11 THERMAL_NO_LIMIT>;
+					cooling-device = <&cpu0 9 THERMAL_NO_LIMIT>,
+							 <&cpu4 9 THERMAL_NO_LIMIT>;
 				};
 			};
 		};
