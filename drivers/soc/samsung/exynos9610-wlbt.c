@@ -42,6 +42,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/jiffies.h>
+#include <linux/kthread.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -363,6 +364,13 @@ static const u32 wlbt_rom_patch[] = {
 /**
  * struct exynos_wlbt - SCSC platform state
  */
+#define WLBT_TRACE_MAX	4096
+
+struct wlbt_trace_rec {
+	u32 us;
+	u32 val;
+};
+
 struct exynos_wlbt {
 	struct device *dev;
 	void __iomem *mbox;
@@ -400,6 +408,18 @@ struct exynos_wlbt {
 	unsigned int n_wdog;
 	unsigned int n_mbox;
 	u32 last_mbox_status;
+	u32 peek_offset;		/* MIF-relative, set by debugfs write */
+	u32 peek_words;
+	char find_needle[32];
+	u32 find_len;
+	u32 find_hits[64];
+	unsigned int n_find;
+	u32 trace_offset;		/* word to sample, MIF-relative */
+	u32 trace_field;		/* non-zero: dereference, then add this */
+	unsigned int trace_us;
+	unsigned int n_trace;
+	atomic_t trace_running;
+	struct wlbt_trace_rec *trace;
 	struct dentry *debugfs;
 };
 
@@ -411,6 +431,7 @@ static void wlbt_log_drain(struct exynos_wlbt *w);
 static bool wlbt_mgmt_send(struct exynos_wlbt *w, u8 channel, u8 ma_msg,
 			   u32 arg);
 static void wlbt_mgmt_drain(struct exynos_wlbt *w);
+static bool wlbt_trace_start(struct exynos_wlbt *w);
 
 static char *firmware_name = "mx140/mx140.bin";
 module_param(firmware_name, charp, 0444);
@@ -419,6 +440,10 @@ MODULE_PARM_DESC(firmware_name, "Firmware image for the WLBT subsystem");
 static bool load_firmware;
 module_param(load_firmware, bool, 0644);
 MODULE_PARM_DESC(load_firmware, "Copy the firmware image into MIF DRAM and let the peer run it");
+
+static char *trace_boot;
+module_param(trace_boot, charp, 0444);
+MODULE_PARM_DESC(trace_boot, "Sample one peer word from the moment the firmware boots: <hex offset>:<hex field>:<microseconds>");
 
 static const char *wlbt_state_name(enum wlbt_state state)
 {
@@ -1299,6 +1324,18 @@ static void wlbt_boot(struct exynos_wlbt *w)
 			dev_err(w->dev, "no configuration: the peer will not find its streams\n");
 	}
 
+	if (trace_boot && w->trace) {
+		unsigned int off, field, us;
+
+		if (sscanf(trace_boot, "%x:%x:%u", &off, &field, &us) == 3) {
+			w->trace_offset = off & ~3u;
+			w->trace_field = field & ~3u;
+			w->trace_us = min_t(unsigned int, us, 30 * USEC_PER_SEC);
+			if (!wlbt_trace_start(w))
+				dev_warn(w->dev, "trace already running\n");
+		}
+	}
+
 	ret = wlbt_power_up(w);
 	if (ret) {
 		dev_err(w->dev, "boot failed: %d\n", ret);
@@ -1383,6 +1420,300 @@ static ssize_t wlbt_debugfs_reset(struct file *file, const char __user *buf,
 		.write = (_write),					\
 		.llseek = noop_llseek,					\
 	}
+
+#define WLBT_PEEK_MAX_WORDS	4096
+
+/*
+ * The peer's RTOS keeps its kernel block, thread descriptors and stacks in MIF
+ * DRAM, so a plain read of the right offset shows what the peer is doing
+ * without touching a single doorbell.  Write "<hex offset> <words>" and read
+ * the words back.
+ */
+static int wlbt_debugfs_peek_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+	u32 i;
+
+	if (!w->dram)
+		return 0;
+
+	for (i = 0; i < w->peek_words; i++) {
+		u32 off = w->peek_offset + i * 4;
+
+		if (off + 4 > w->mem_size)
+			break;
+		seq_printf(s, "%06x %08x%s", off, readl(w->dram + off),
+			   i % 4 == 3 ? "\n" : "  ");
+	}
+	if (i % 4)
+		seq_putc(s, '\n');
+
+	return 0;
+}
+
+static int wlbt_peek_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_debugfs_peek_show, inode->i_private);
+}
+
+static ssize_t wlbt_debugfs_peek(struct file *file, const char __user *buf,
+				 size_t len, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct exynos_wlbt *w = s->private;
+	unsigned int off, words;
+	char cmd[64];
+
+	if (len >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = '\0';
+
+	if (sscanf(cmd, "%x %u", &off, &words) != 2)
+		return -EINVAL;
+
+	w->peek_offset = off & ~3u;
+	w->peek_words = min_t(unsigned int, words, WLBT_PEEK_MAX_WORDS);
+
+	return len;
+}
+
+/*
+ * The peer is a dual-core RTOS with a saved context per thread, so the PC it
+ * will resume at is a plain word in DRAM.  Sampling that word from here shows
+ * where the peer stops running, at the moment it stops, without a debugger.
+ * "<hex offset> <hex field> <microseconds>": field 0 samples the word itself,
+ * anything else treats the word as a pointer into MIF DRAM and samples the
+ * word at that address plus the field.
+ */
+static u32 wlbt_trace_sample(struct exynos_wlbt *w)
+{
+	u32 v = readl(w->dram + w->trace_offset);
+	u32 off;
+
+	if (!w->trace_field)
+		return v;
+
+	if (v < 0x80000000 || v - 0x80000000 + w->trace_field + 4 > w->mem_size)
+		return 0;
+	off = (v - 0x80000000) + w->trace_field;
+
+	return readl(w->dram + off);
+}
+
+static void wlbt_trace_run(struct exynos_wlbt *w)
+{
+	u64 start, now, end;
+	u32 v, last = 0;
+	unsigned int i = 0, n = 0;
+
+	if (!w->dram || !w->trace_us || !w->trace)
+		return;
+
+	start = ktime_get_ns();
+	end = start + (u64)w->trace_us * NSEC_PER_USEC;
+	do {
+		v = wlbt_trace_sample(w);
+		if (v != last && i < WLBT_TRACE_MAX) {
+			now = ktime_get_ns();
+			w->trace[i].us = (u32)((now - start) / NSEC_PER_USEC);
+			w->trace[i].val = v;
+			i++;
+			last = v;
+		}
+		now = ktime_get_ns();
+		if (!(++n & 0x3fff))
+			cond_resched();
+	} while (now < end);
+
+	w->n_trace = i;
+}
+
+static int wlbt_trace_thread(void *data)
+{
+	struct exynos_wlbt *w = data;
+
+	wlbt_trace_run(w);
+	atomic_set(&w->trace_running, 0);
+
+	return 0;
+}
+
+static bool wlbt_trace_start(struct exynos_wlbt *w)
+{
+	struct task_struct *task;
+
+	if (atomic_cmpxchg(&w->trace_running, 0, 1))
+		return false;
+
+	task = kthread_run(wlbt_trace_thread, w, "wlbt-trace");
+	if (IS_ERR(task)) {
+		atomic_set(&w->trace_running, 0);
+		return false;
+	}
+
+	return true;
+}
+
+static int wlbt_debugfs_trace_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+	unsigned int i;
+
+	if (!w->dram)
+		return 0;
+
+	seq_printf(s, "%u us sampling %06x%s, %u changes%s\n",
+		   w->trace_us, w->trace_offset,
+		   w->trace_field ? " (indirect)" : "", w->n_trace,
+		   atomic_read(&w->trace_running) ? " (still running)" : "");
+	for (i = 0; i < w->n_trace; i++)
+		seq_printf(s, "%8u us  %08x\n", w->trace[i].us, w->trace[i].val);
+
+	return 0;
+}
+
+static int wlbt_trace_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_debugfs_trace_show, inode->i_private);
+}
+
+static ssize_t wlbt_debugfs_trace(struct file *file, const char __user *buf,
+				  size_t len, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct exynos_wlbt *w = s->private;
+	unsigned int off, field, us;
+	char cmd[64];
+
+	if (len >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = '\0';
+
+	if (sscanf(cmd, "%x %x %u", &off, &field, &us) != 3)
+		return -EINVAL;
+
+	w->trace_offset = off & ~3u;
+	w->trace_field = field & ~3u;
+	w->trace_us = min_t(unsigned int, us, 30 * USEC_PER_SEC);
+
+	if (!wlbt_trace_start(w))
+		return -EBUSY;
+
+	return len;
+}
+
+#define WLBT_FIND_CHUNK	1024	/* words */
+
+/*
+ * The peer's thread descriptors carry their name inline, so looking for a name
+ * in MIF DRAM finds the descriptor without knowing the RTOS internals.
+ */
+static void wlbt_dram_find(struct exynos_wlbt *w)
+{
+	u32 limit, off, n;
+	u8 *buf;
+
+	w->n_find = 0;
+	if (!w->dram || !w->find_len)
+		return;
+
+	limit = min_t(u32, w->fw_runtime_length, w->mem_size);
+	buf = kzalloc(WLBT_FIND_CHUNK * 4, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	for (off = 0; off + 4 <= limit; off += WLBT_FIND_CHUNK * 4) {
+		u32 i;
+
+		n = min((u32)(WLBT_FIND_CHUNK * 4), limit - off);
+		memcpy_fromio(buf, w->dram + off, n);
+		for (i = 0; i + w->find_len <= n; i++) {
+			if (buf[i] != w->find_needle[0])
+				continue;
+			if (memcmp(buf + i, w->find_needle, w->find_len))
+				continue;
+			if (w->n_find < ARRAY_SIZE(w->find_hits))
+				w->find_hits[w->n_find++] = off + i;
+		}
+		if (w->n_find >= ARRAY_SIZE(w->find_hits))
+			break;
+	}
+
+	kfree(buf);
+}
+
+static int wlbt_debugfs_find_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+	unsigned int i;
+
+	seq_printf(s, "\"%s\": %u match(es) in %u bytes\n", w->find_needle,
+		   w->n_find, w->fw_runtime_length);
+	for (i = 0; i < w->n_find; i++)
+		seq_printf(s, "  %06x\n", w->find_hits[i]);
+
+	return 0;
+}
+
+static int wlbt_find_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_debugfs_find_show, inode->i_private);
+}
+
+static ssize_t wlbt_debugfs_find(struct file *file, const char __user *buf,
+				 size_t len, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct exynos_wlbt *w = s->private;
+	char needle[32];
+
+	if (!len || len >= sizeof(needle))
+		return -EINVAL;
+	if (copy_from_user(needle, buf, len))
+		return -EFAULT;
+	if (needle[len - 1] == '\n')
+		len--;
+	if (!len || len >= sizeof(w->find_needle))
+		return -EINVAL;
+
+	memcpy(w->find_needle, needle, len);
+	w->find_needle[len] = '\0';
+	w->find_len = len;
+	wlbt_dram_find(w);
+
+	return len;
+}
+
+static const struct file_operations wlbt_find_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_find_open,
+	.read = seq_read,
+	.write = wlbt_debugfs_find,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static const struct file_operations wlbt_trace_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_trace_open,
+	.read = seq_read,
+	.write = wlbt_debugfs_trace,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static const struct file_operations wlbt_peek_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_peek_open,
+	.read = seq_read,
+	.write = wlbt_debugfs_peek,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 
 static const struct file_operations wlbt_boot_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_boot);
@@ -1546,6 +1877,9 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("boot", 0200, w->debugfs, w, &wlbt_boot_fops);
 	debugfs_create_file("off", 0200, w->debugfs, w, &wlbt_reset_fops);
 	debugfs_create_file("halt", 0200, w->debugfs, w, &wlbt_halt_fops);
+	debugfs_create_file("peek", 0600, w->debugfs, w, &wlbt_peek_fops);
+	debugfs_create_file("trace", 0600, w->debugfs, w, &wlbt_trace_fops);
+	debugfs_create_file("find", 0600, w->debugfs, w, &wlbt_find_fops);
 }
 
 static struct regmap *wlbt_syscon(struct exynos_wlbt *w, const char *name)
@@ -1593,6 +1927,10 @@ static int wlbt_probe(struct platform_device *pdev)
 	int ret;
 
 	w = devm_kzalloc(&pdev->dev, sizeof(*w), GFP_KERNEL);
+	if (w)
+		w->trace = devm_kzalloc(&pdev->dev,
+					WLBT_TRACE_MAX * sizeof(*w->trace),
+					GFP_KERNEL);
 	if (!w)
 		return -ENOMEM;
 
