@@ -37,6 +37,7 @@
 #include <linux/cpumask.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/firmware/samsung/exynos-acpm-protocol.h>
 #include <linux/io.h>
 #include <linux/math64.h>
 #include <linux/module.h>
@@ -68,6 +69,13 @@
 #define CPUCL_FIN_HZ		26000000UL
 #define CPUCL_MIN_HZ		26000000UL
 #define CPUCL_PLL_LOCK_CYCLES	150	/* lock time in reference cycles per DIV_P */
+/*
+ * Budget for the PLL to report STABLE.  A lock takes LOCKTIME phase detector
+ * cycles, about 70 us with DIV_P 3, but the cluster is running from the 26 MHz
+ * oscillator while it is waited for, so the loop is slow and can be preempted.
+ * Timing out here is not harmless: it forces a rollback, so give it plenty.
+ */
+#define CPUCL_PLL_LOCK_US	20000
 
 /*
  * PLL limits from cal-if/pll_spec.c.  The reference divider must put the phase
@@ -89,21 +97,64 @@
 #define CPUCL_M_MAX		1023
 #define CPUCL_S_MAX		6
 
+/*
+ * The boot chain writes the vendor parameter block (ECT) to a fixed address; the
+ * live vendor DT describes it as  ect { parameter_address = <0xa0000000>;
+ * parameter_size = <0x3a000>; }.  It holds the per-ASV DVFS tables, i.e. the
+ * frequency of every operating point together with the voltage this specific
+ * chip needs.  /dev/mem refuses system RAM, so it is mapped here.
+ */
+#define CPUCL_ECT_PHYS		0xa0000000
+#define CPUCL_ECT_SIZE		0x3a000
+
+/* ASV eFuse word: bigcpu group [3:0], littlecpu group [19:16]. */
+#define CPUCL_ASV_EFUSE		0x10009000
+#define CPUCL_ASV_MODIFY_MASK	GENMASK(7, 4)
+#define CPUCL_ASV_LITTLE_SHIFT	16
+
+/* S2MPU09 buck layout, from mfd/samsung/s2mpu09-regulator.h. */
+#define CPUCL_BUCK_MIN_UV	300000
+#define CPUCL_BUCK_STEP_UV	6250
+#define CPUCL_BUCK_RAMP_US	12000	/* regulator-ramp-delay of the vendor DT */
+#define CPUCL_PMIC_CHAN		2
+#define CPUCL_PMIC_TYPE		1
+
 struct exynos9610_cpucl {
+	struct device *dev;
 	const char *name;
+	unsigned int id;
 	void __iomem *base;
+	phys_addr_t base_phys;
 	u32 pll_con0;
 	u32 sw_user;
 	unsigned long boot_hz;
 	unsigned long cur_hz;
+	unsigned long min_hz;
+	unsigned long max_hz;
 	unsigned long vco_min_hz;
 	unsigned long vco_max_hz;
 	u32 orig_con0;
+	u32 good_con0;		/* last PLL setting that locked */
 	cpumask_t cpus;
 	struct cpufreq_frequency_table *table;
 	struct mutex lock;	/* one rate change at a time per cluster */
+	struct acpm_handle *acpm;
+	u8 buck_reg;
+	unsigned int *uvolt;	/* parallel to table, NULL when unknown */
 };
 
+/*
+ * Voltage scaling is opt-in, and off by default: the boot chain leaves the
+ * clusters at their boot rate and boot voltage, which is always a valid state
+ * to boot into.  Writing 1 here (or exynos9610_cpuclk.volt_scale=1 on the
+ * command line) unlocks the operating points above the boot rate, which are
+ * only safe because their voltages come from the vendor tables.
+ */
+static bool volt_scale;
+module_param(volt_scale, bool, 0644);
+MODULE_PARM_DESC(volt_scale, "Allow rates above the boot rate (needs the ECT tables)");
+
+static void __iomem *cpucl_ect_base;
 static struct exynos9610_cpucl *clusters;
 static unsigned int num_clusters;
 static struct dentry *cpucl_debugfs;
@@ -225,7 +276,7 @@ static int cpucl_wait_set(void __iomem *reg, u32 bit)
 {
 	unsigned int i;
 
-	for (i = 0; i < 500; i++) {
+	for (i = 0; i < CPUCL_PLL_LOCK_US; i++) {
 		if (readl(reg) & bit)
 			return 0;
 		udelay(1);
@@ -247,6 +298,7 @@ static int cpucl_wait_set(void __iomem *reg, u32 bit)
 static int cpucl_pll_program(struct exynos9610_cpucl *c, u32 pmsk)
 {
 	void __iomem *con0 = c->base + c->pll_con0;
+	unsigned int i;
 	u32 val;
 
 	writel(FIELD_GET(PLL_P_MASK, pmsk) * CPUCL_PLL_LOCK_CYCLES,
@@ -255,9 +307,18 @@ static int cpucl_pll_program(struct exynos9610_cpucl *c, u32 pmsk)
 	val = readl(con0);
 	val &= ~(PLL_M_MASK | PLL_P_MASK | PLL_S_MASK);
 	val |= pmsk | PLL_OUT_SEL | PLL_ENABLE;
-	writel(val, con0);
 
-	return cpucl_wait_set(con0, PLL_STABLE);
+	/* Write and wait, twice: a lost first lock is usually a slow one. */
+	for (i = 0; i < 2; i++) {
+		writel(val, con0);
+		if (!cpucl_wait_set(con0, PLL_STABLE))
+			return 0;
+	}
+
+	pr_err("cpucl: %s PLL does not report stable (con0=%#010x)\n",
+	       c->name, readl(con0));
+
+	return -ETIMEDOUT;
 }
 
 /*
@@ -269,13 +330,13 @@ static int cpucl_pll_program(struct exynos9610_cpucl *c, u32 pmsk)
  * cores are still on the oscillator, so the mux can be handed back and the
  * cluster is never left at 26 MHz.
  */
-static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
+static int cpucl_relock(struct exynos9610_cpucl *c, unsigned long hz)
 {
 	void __iomem *mux = c->base + CPUCL_MUX_PLL;
 	u32 new_con0, safe_con0;
 	int ret;
 
-	if (hz < CPUCL_MIN_HZ || hz > c->boot_hz)
+	if (hz < CPUCL_MIN_HZ || hz > c->max_hz)
 		return -EINVAL;
 
 	new_con0 = cpucl_rate_to_con0(c, hz, readl(c->base + c->pll_con0));
@@ -295,18 +356,31 @@ static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
 	if (ret)
 		return ret;
 
-	ret = cpucl_pll_program(c, new_con0);
-	if (ret) {
+	if (cpucl_pll_program(c, new_con0)) {
 		pr_err("cpucl: %s PLL did not lock at %lu Hz (con0=%#x)\n",
 		       c->name, hz, new_con0);
 
-		safe_con0 = c->orig_con0 & (PLL_M_MASK | PLL_P_MASK |
+		/*
+		 * Fall back to the last setting that did lock rather than to
+		 * the boot one: it was verified moments ago, so the cluster
+		 * keeps a working clock instead of being left on the
+		 * oscillator.
+		 */
+		safe_con0 = c->good_con0 & (PLL_M_MASK | PLL_P_MASK |
 					    PLL_S_MASK);
 		if (cpucl_pll_program(c, safe_con0)) {
-			pr_err("cpucl: %s will not lock either, cluster left on OSCCLK\n",
-			       c->name);
-			return ret;
+			safe_con0 = c->orig_con0 & (PLL_M_MASK | PLL_P_MASK |
+						    PLL_S_MASK);
+			if (cpucl_pll_program(c, safe_con0)) {
+				pr_err("cpucl: %s will not lock either, cluster left on OSCCLK\n",
+				       c->name);
+				return -ETIMEDOUT;
+			}
 		}
+		ret = -ETIMEDOUT;
+	} else {
+		c->good_con0 = readl(c->base + c->pll_con0);
+		ret = 0;
 	}
 
 	/* Hand the cluster back to the PLL. */
@@ -320,11 +394,370 @@ static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
 	return ret;
 }
 
+static unsigned int cpucl_uvolt_for(const struct exynos9610_cpucl *c,
+				    unsigned long hz)
+{
+	unsigned int i;
+
+	if (!c->uvolt)
+		return 0;
+
+	for (i = 0; c->table[i].frequency != CPUFREQ_TABLE_END; i++)
+		if ((unsigned long)c->table[i].frequency * 1000 == hz)
+			return c->uvolt[i];
+
+	return 0;
+}
+
 /*
- * Frequency table: rates are generated as fractions of the boot rate, encoded
- * through the PLL (which quantises them), and then de-duplicated and sorted.
- * Nothing above the boot rate is ever offered, so the boot voltage - the only
- * voltage the firmware lets us rely on - always covers every entry.
+ * Set a CPU rail.  Only the output-select register is touched, so the enable
+ * and mode bits of the matching control register are left alone.  The rails are
+ * reached through the ACPM PMIC protocol, which is also how the vendor kernel
+ * programs them.  Returns true when the register was written, so the caller
+ * knows whether it has to wait out the ramp.
+ */
+static int cpucl_buck_set(struct exynos9610_cpucl *c, unsigned int uvolt)
+{
+	const struct acpm_pmic_ops *ops;
+	unsigned int sel;
+	u8 old;
+	int ret;
+
+	if (!c->acpm || !c->buck_reg || !uvolt)
+		return -EOPNOTSUPP;
+
+	if (uvolt < CPUCL_BUCK_MIN_UV ||
+	    uvolt > CPUCL_BUCK_MIN_UV + CPUCL_BUCK_STEP_UV * 255)
+		return -ERANGE;
+
+	ops = &c->acpm->ops.pmic_ops;
+	sel = (uvolt - CPUCL_BUCK_MIN_UV) / CPUCL_BUCK_STEP_UV;
+
+	ret = ops->read_reg(c->acpm, CPUCL_PMIC_CHAN, CPUCL_PMIC_TYPE,
+			    c->buck_reg, 0, &old);
+	if (ret)
+		return ret;
+	if (old == sel)
+		return 0;
+
+	ret = ops->write_reg(c->acpm, CPUCL_PMIC_CHAN, CPUCL_PMIC_TYPE,
+			     c->buck_reg, 0, sel);
+	if (ret)
+		return ret;
+
+	usleep_range(CPUCL_BUCK_RAMP_US, CPUCL_BUCK_RAMP_US + 2000);
+
+	return 1;
+}
+
+/*
+ * Move a cluster to a rate and the voltage that belongs to it.  Voltage goes up
+ * before the clock when speeding up and comes down after the clock when slowing
+ * down, so the cores are never run outside the range their table entry covers.
+ */
+static int cpucl_set_rate(struct exynos9610_cpucl *c, unsigned long hz)
+{
+	unsigned int uvolt = volt_scale ? cpucl_uvolt_for(c, hz) : 0;
+	unsigned int boot_uv = volt_scale ? cpucl_uvolt_for(c, c->boot_hz) : 0;
+	bool raising = hz > c->cur_hz;
+	int ret;
+
+	if (uvolt && raising) {
+		ret = cpucl_buck_set(c, uvolt);
+		if (ret < 0)
+			return ret;
+	}
+
+	ret = cpucl_relock(c, hz);
+
+	if (ret) {
+		/* The relock fell back to the boot PLL setting: match it. */
+		if (raising && boot_uv)
+			cpucl_buck_set(c, boot_uv);
+		return ret;
+	}
+
+	if (uvolt && !raising &&
+	    cpucl_buck_set(c, uvolt) < 0)
+		pr_warn("cpucl: %s could not lower voltage to %u uV\n",
+			c->name, uvolt);
+
+	return 0;
+}
+
+static u8 cpucl_ect_u8(unsigned int off)
+{
+	u8 val;
+
+	memcpy_fromio(&val, cpucl_ect_base + off, 1);
+
+	return val;
+}
+
+/*
+ * Walk the ECT block header and return the offset of a named block.  Each entry
+ * is {u32 name_len, name (padded to 4), u32 offset, u32 flags}.
+ */
+static bool cpucl_ect_find(const char *want, unsigned int *off)
+{
+	char name[16];
+	unsigned int i, pos, num;
+
+	if (!cpucl_ect_base)
+		return false;
+
+	memcpy_fromio(name, cpucl_ect_base, 4);
+	if (memcmp(name, "PARA", 4))
+		return false;
+
+	num = readl(cpucl_ect_base + 12);
+	if (!num || num > 32)
+		return false;
+
+	for (pos = 16, i = 0; i < num; i++) {
+		unsigned int len = readl(cpucl_ect_base + pos);
+
+		pos += 4;
+		if (len >= sizeof(name))
+			return false;
+		memcpy_fromio(name, cpucl_ect_base + pos, len);
+		name[len] = '\0';
+		pos += (len + 4) & ~3;
+
+		if (!strcmp(name, want)) {
+			*off = readl(cpucl_ect_base + pos);
+			return *off && *off < CPUCL_ECT_SIZE;
+		}
+
+		pos += 4;
+	}
+
+	return false;
+}
+
+/* The DVFS and ASV blocks share the same {parser, version, count, domains} header. */
+static int cpucl_ect_domain_at(unsigned int blk, unsigned int idx, char *name,
+			       size_t namelen, unsigned int *off)
+{
+	unsigned int i, pos = blk + 12;
+	unsigned int num = readl(cpucl_ect_base + blk + 8);
+
+	if (readl(cpucl_ect_base + blk) < 2 || idx >= num || num > 32)
+		return -EINVAL;
+
+	for (i = 0; i <= idx; i++) {
+		unsigned int len = readl(cpucl_ect_base + pos);
+
+		pos += 4;
+		if (len >= namelen)
+			return -EINVAL;
+		memcpy_fromio(name, cpucl_ect_base + pos, len);
+		name[len] = '\0';
+		pos += (len + 4) & ~3;
+		*off = readl(cpucl_ect_base + pos);
+		pos += 4;
+	}
+
+	return 0;
+}
+
+/*
+ * ASV group of this chip, from the eFuse word.  The vendor maps the "bigcpu"
+ * field to CPUCL0 and the "littlecpu" field to CPUCL1 (cal-if/exynos9610/
+ * asv_exynos9610.h), which is odd but is what the firmware that wrote the boot
+ * voltages used.  Both fields read 5 on the A51.
+ */
+static int cpucl_asv_group(unsigned int cluster)
+{
+	void __iomem *efuse;
+	unsigned int grp, modify;
+	u32 word;
+
+	efuse = ioremap(CPUCL_ASV_EFUSE, 4);
+	if (!efuse)
+		return -ENOMEM;
+	word = readl(efuse);
+	iounmap(efuse);
+
+	if (cluster == 0) {
+		grp = FIELD_GET(GENMASK(3, 0), word);
+		modify = FIELD_GET(CPUCL_ASV_MODIFY_MASK, word);
+	} else {
+		grp = FIELD_GET(GENMASK(19, 16), word);
+		modify = FIELD_GET(GENMASK(23, 20), word);
+	}
+
+	/* The modify field is a signed 4-bit delta. */
+	if (modify > 7)
+		return -ERANGE;
+
+	return grp + modify;
+}
+
+/*
+ * Build the operating points of a cluster from the vendor tables: frequencies
+ * from the DVFS block, the voltage this chip needs for each of them from the
+ * ASV block.  The cluster is identified by its PLL address so a rename or a
+ * different domain order cannot pick the wrong table.
+ *
+ * Entries above the rated maximum of this SoC are dropped: the ECT is shared
+ * across the Exynos 9610 family and lists the higher clocked members too.
+ */
+static int cpucl_ect_table(struct exynos9610_cpucl *c)
+{
+	phys_addr_t sfr = c->base_phys + c->pll_con0;
+	unsigned int dvfs_blk, asv_blk, dom = 0, asv_dom = 0;
+	unsigned int dvfs_levels, asv_steps, nlev_dvfs, nclk_dvfs, mode;
+	unsigned int ngroup, nlev_asv, ntable, blk_pv;
+	unsigned int i, count = 0, *khz, *uv;
+	char name[24] = "";
+	int group, ret = -ENOENT;
+
+	if (!cpucl_ect_find("DVFS", &dvfs_blk) ||
+	    !cpucl_ect_find("ASV", &asv_blk)) {
+		dev_info(c->dev, "ect: DVFS/ASV block not found\n");
+		return -ENOENT;
+	}
+	dev_info(c->dev, "ect: DVFS @0x%x ASV @0x%x\n", dvfs_blk, asv_blk);
+
+	/* Find our cluster among the DVFS domains by its first SFR address. */
+	for (i = 0; i < 32; i++) {
+		unsigned int a;
+
+		if (cpucl_ect_domain_at(dvfs_blk, i, name, sizeof(name), &dom))
+			break;
+		a = dvfs_blk + dom;
+		mode = readl(cpucl_ect_base + a + 16);
+		nclk_dvfs = readl(cpucl_ect_base + a + 20);
+		if (mode != 2 || !nclk_dvfs)
+			continue;	/* not an SFR-addressed domain */
+		if (readl(cpucl_ect_base + a + 28) == sfr)
+			break;
+	}
+	if (i == 32) {
+		dev_info(c->dev, "ect: no DVFS domain for PLL %pa\n", &sfr);
+		return -ENOENT;
+	}
+	dev_info(c->dev, "ect: domain %s\n", name);
+
+	/* {max, min, boot, resume, mode, clocks, levels} then the SFR list. */
+	nlev_dvfs = readl(cpucl_ect_base + dvfs_blk + dom + 24);
+	if (!nlev_dvfs || nlev_dvfs > 64)
+		return -EINVAL;
+	dvfs_levels = dvfs_blk + dom + 28 + 4 * nclk_dvfs;
+
+	group = cpucl_asv_group(c->id);
+	if (group < 0)
+		return group;
+	dev_info(c->dev, "ect: %u levels, ASV group %d\n", nlev_dvfs, group);
+
+	/* The ASV block names its domains the same way. */
+	for (i = 0; i < 32; i++) {
+		char aname[24];
+
+		if (cpucl_ect_domain_at(asv_blk, i, aname, sizeof(aname), &asv_dom))
+			break;
+		if (!strcmp(aname, name))
+			break;
+	}
+	if (i == 32) {
+		dev_info(c->dev, "ect: no ASV domain named %s\n", name);
+		return -ENOENT;
+	}
+
+	blk_pv = readl(cpucl_ect_base + asv_blk);
+	ngroup = readl(cpucl_ect_base + asv_blk + asv_dom);
+	nlev_asv = readl(cpucl_ect_base + asv_blk + asv_dom + 4);
+	ntable = readl(cpucl_ect_base + asv_blk + asv_dom + 8);
+	if (!ngroup || nlev_asv != nlev_dvfs || !ntable || blk_pv < 3 ||
+	    group >= ngroup) {
+		dev_info(c->dev, "ect: bad ASV domain (groups=%u levels=%u/%u tables=%u pv=%u)\n",
+			 ngroup, nlev_asv, nlev_dvfs, ntable, blk_pv);
+		return -EINVAL;
+	}
+
+	/*
+	 * The domain holds level_list[] (MHz) followed, for every table, by
+	 * {version, boot, resume, level_en[], voltages_step[]}.  Use the first
+	 * table: it is the ASV-group table, and its column for this chip
+	 * reproduces the voltage the boot chain programmed.
+	 */
+	/*
+	 * The two blocks have to describe the same levels, in the same order.
+	 * They do not always agree to the kHz (the ASV list carries the nominal
+	 * rate, e.g. 1560 MHz where the DVFS block has 1508 MHz), so compare
+	 * with a tolerance rather than exactly.
+	 */
+	for (i = 0; i < nlev_asv; i++) {
+		unsigned int mhz = readl(cpucl_ect_base + asv_blk + asv_dom + 12 + 4 * i);
+		unsigned int khz = readl(cpucl_ect_base + dvfs_levels + 8 * i);
+
+		if (!khz || mhz * 1000 / 10 < khz / 10 ||
+		    mhz * 1000 / 10 > khz / 10 + khz / 10)
+			return -EINVAL;
+	}
+
+	asv_steps = asv_blk + asv_dom + 12 + 4 * nlev_asv + 12 + 4 * nlev_asv;
+
+	khz = kcalloc(nlev_dvfs, sizeof(*khz), GFP_KERNEL);
+	uv = kcalloc(nlev_dvfs, sizeof(*uv), GFP_KERNEL);
+	if (!khz || !uv) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+
+	for (i = 0; i < nlev_dvfs; i++) {
+		unsigned int f = readl(cpucl_ect_base + dvfs_levels + 8 * i);
+		u8 step = cpucl_ect_u8(asv_steps + i * ngroup + group);
+
+		if (f < c->min_hz / 1000 || f > c->max_hz / 1000)
+			continue;
+		khz[count] = f;
+		uv[count] = step * CPUCL_BUCK_STEP_UV;
+		count++;
+	}
+
+	if (!count) {
+		ret = -ENOENT;
+		goto out_free;
+	}
+
+	c->table = kcalloc(count + 1, sizeof(*c->table), GFP_KERNEL);
+	c->uvolt = kcalloc(count, sizeof(*c->uvolt), GFP_KERNEL);
+	if (!c->table || !c->uvolt) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+
+	/* Ascending order, which is what the cpufreq core expects. */
+	for (i = 0; i < count; i++) {
+		unsigned int min = UINT_MAX, idx = 0, k;
+
+		for (k = 0; k < count; k++) {
+			if (khz[k] && khz[k] < min) {
+				min = khz[k];
+				idx = k;
+			}
+		}
+		c->table[i].frequency = min;
+		c->table[i].driver_data = i;
+		c->uvolt[i] = uv[idx];
+		khz[idx] = 0;
+	}
+	c->table[count].frequency = CPUFREQ_TABLE_END;
+
+	ret = 0;
+
+out_free:
+	kfree(khz);
+	kfree(uv);
+	return ret;
+}
+
+/*
+ * Fallback: rates generated as fractions of the boot rate, encoded through the
+ * PLL (which quantises them).  Nothing above the boot rate is offered, so the
+ * voltage the boot chain left behind covers every entry.
  */
 static int cpucl_build_table(struct exynos9610_cpucl *c)
 {
@@ -418,12 +851,21 @@ static int cpucl_cpufreq_target(struct cpufreq_policy *policy,
 				unsigned int index)
 {
 	struct exynos9610_cpucl *c = cpucl_for_cpu(policy->cpu);
+	unsigned long hz;
 
 	if (!c)
 		return -ENODEV;
 
-	return cpucl_set_rate(c, (unsigned long)policy->freq_table[index].frequency
-				   * 1000);
+	hz = (unsigned long)policy->freq_table[index].frequency * 1000;
+
+	/* Never leave the boot rate without a voltage table behind it. */
+	if (hz > c->boot_hz && (!volt_scale || !c->uvolt)) {
+		pr_warn_once("cpucl: %s capped at the boot rate, voltage scaling is off\n",
+			     c->name);
+		hz = c->boot_hz;
+	}
+
+	return cpucl_set_rate(c, hz);
 }
 
 static unsigned int cpucl_cpufreq_get(unsigned int cpu)
@@ -468,8 +910,20 @@ static int cpucl_dump_show(struct seq_file *s, void *unused)
 			   (sw & SW_USER_SEL) ? 1UL : 0UL, mux,
 			   (mux & MUX_PLL_SEL) ? 1UL : 0UL);
 		seq_printf(s, "    cpus=%*pbl\n", cpumask_pr_args(&c->cpus));
-		seq_printf(s, "    boot=%lu Hz  last_set=%lu Hz  ceiling=%lu Hz\n",
-			   c->boot_hz, c->cur_hz, c->boot_hz);
+		seq_printf(s, "    boot=%lu Hz  last_set=%lu Hz  range=%lu-%lu Hz\n",
+			   c->boot_hz, c->cur_hz, c->min_hz, c->max_hz);
+
+		if (c->uvolt) {
+			unsigned int j;
+
+			seq_printf(s, "    buck 0x%02x  asv group %d\n",
+				   c->buck_reg, cpucl_asv_group(c->id));
+			for (j = 0; c->table[j].frequency != CPUFREQ_TABLE_END; j++)
+				seq_printf(s, "    %7u kHz  %7u uV\n",
+					   c->table[j].frequency, c->uvolt[j]);
+		} else {
+			seq_puts(s, "    voltage: fixed at the boot level\n");
+		}
 	}
 
 	return 0;
@@ -505,6 +959,77 @@ static ssize_t cpucl_set_write(struct file *file, const char __user *ubuf,
 	return count;
 }
 
+/*
+ * Raw access to the CPU buck output registers, for bring-up: reading shows what
+ * the firmware left behind, writing lets a single register be moved by hand
+ * (selector = (uV - 300000) / 6250) so the PMIC path can be exercised without
+ * enabling voltage scaling for the whole cluster.
+ */
+static int cpucl_buck_show(struct seq_file *s, void *unused)
+{
+	unsigned int i;
+
+	for (i = 0; i < num_clusters; i++) {
+		struct exynos9610_cpucl *c = &clusters[i];
+		u8 val = 0;
+		int ret = -EOPNOTSUPP;
+
+		if (c->acpm && c->buck_reg)
+			ret = c->acpm->ops.pmic_ops.read_reg(c->acpm,
+							    CPUCL_PMIC_CHAN,
+							    CPUCL_PMIC_TYPE,
+							    c->buck_reg, 0, &val);
+		if (ret)
+			seq_printf(s, "%s buck 0x%02x: error %d\n",
+				   c->name, c->buck_reg, ret);
+		else
+			seq_printf(s, "%s buck 0x%02x = 0x%02x -> %u uV\n",
+				   c->name, c->buck_reg, val,
+				   val * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV);
+	}
+
+	return 0;
+}
+
+static ssize_t cpucl_buck_write(struct file *file, const char __user *ubuf,
+				size_t count, loff_t *ppos)
+{
+	char buf[32];
+	unsigned int cluster, val;
+	int ret;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	if (sscanf(buf, "%u %x", &cluster, &val) != 2 || cluster >= num_clusters)
+		return -EINVAL;
+
+	pr_info("cpucl: buck write %s reg 0x%02x <- 0x%02x\n",
+		clusters[cluster].name, clusters[cluster].buck_reg, val);
+	ret = cpucl_buck_set(&clusters[cluster], val * CPUCL_BUCK_STEP_UV +
+						 CPUCL_BUCK_MIN_UV);
+	pr_info("cpucl: buck write %s -> 0x%02x (%d)\n",
+		clusters[cluster].name, val, ret);
+
+	return ret < 0 ? ret : count;
+}
+
+static int cpucl_buck_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cpucl_buck_show, NULL);
+}
+
+static const struct file_operations cpucl_buck_fops = {
+	.open		= cpucl_buck_open,
+	.write		= cpucl_buck_write,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static const struct file_operations cpucl_set_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
@@ -529,6 +1054,7 @@ static int cpucl_add(struct platform_device *pdev, struct device_node *np,
 		return dev_err_probe(&pdev->dev, ret,
 				     "%pOF: missing samsung,cmu\n", np);
 
+	c->dev = &pdev->dev;
 	c->name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "%pOFn", np);
 	if (!c->name)
 		return -ENOMEM;
@@ -536,6 +1062,24 @@ static int cpucl_add(struct platform_device *pdev, struct device_node *np,
 	c->base = devm_ioremap(&pdev->dev, cmu[0], cmu[1]);
 	if (!c->base)
 		return -ENOMEM;
+	c->base_phys = cmu[0];
+
+	/* cluster id: the child node's reg, which is the cluster number. */
+	ret = of_property_read_u32(np, "reg", &val);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "%pOF: missing reg\n", np);
+	c->id = val;
+
+	/*
+	 * CPU rails on the S2MPU09: BUCK3 (0x1d) feeds CPUCL0, BUCK2 (0x1b)
+	 * feeds CPUCL1, see the vendor DT vdd_cpucl0/vdd_cpucl1 regulator
+	 * descriptions.
+	 */
+	ret = of_property_read_u32(np, "samsung,buck-out-reg", &val);
+	if (!ret)
+		c->buck_reg = val;
+	else
+		c->buck_reg = c->id ? 0x1b : 0x1d;
 
 	ret = of_property_read_u32(np, "samsung,pll-con0-offset", &val);
 	if (ret)
@@ -554,8 +1098,25 @@ static int cpucl_add(struct platform_device *pdev, struct device_node *np,
 	of_property_read_u32(np, "samsung,vco-max-hz", &val);
 	c->vco_max_hz = val;
 
+	/*
+	 * Rated range of this SoC.  The ECT also lists the higher clocked
+	 * members of the Exynos 9610 family, so the usable range has to be
+	 * stated: 403-1742 MHz for the A53 cluster and 936-2314 MHz for the
+	 * A73 cluster, which is what the vendor DT declares as the minimum
+	 * (0x62638 and 0xe4840) and what the A51 ships with.
+	 */
+	ret = of_property_read_u32(np, "samsung,min-hz", &val);
+	c->min_hz = ret ? (c->id ? 936000000UL : 403000000UL) : val;
+
+	ret = of_property_read_u32(np, "samsung,max-hz", &val);
+	c->max_hz = ret ? (c->id ? 2314000000UL : 1742000000UL) : val;
+
+	if (c->max_hz < c->min_hz || c->max_hz > 3000000000UL)
+		return -EINVAL;
+
 	mutex_init(&c->lock);
 	c->orig_con0 = readl(c->base + c->pll_con0);
+	c->good_con0 = c->orig_con0;
 	c->boot_hz = cpucl_pll_rate(c->orig_con0);
 	c->cur_hz = c->boot_hz;
 
@@ -608,9 +1169,49 @@ static void cpucl_build_cpu_masks(void)
 	of_node_put(cpus);
 }
 
+/*
+ * The boot chain programmed the voltage of the boot operating point from the
+ * same table, so reading it back is a direct check that the table was decoded
+ * for the right ASV group.  If it does not match, the operating points above
+ * the boot rate are not trusted and the cluster stays on the boot-rate table.
+ */
+static int cpucl_verify_boot_voltage(struct exynos9610_cpucl *c)
+{
+	const struct acpm_pmic_ops *ops = &c->acpm->ops.pmic_ops;
+	unsigned int uvolt = cpucl_uvolt_for(c, c->boot_hz);
+	u8 val;
+	int ret;
+
+	if (!uvolt)
+		return -ENOENT;
+
+	ret = ops->read_reg(c->acpm, CPUCL_PMIC_CHAN, CPUCL_PMIC_TYPE,
+			    c->buck_reg, 0, &val);
+	if (ret)
+		return ret;
+
+	if ((val * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV) != uvolt) {
+		dev_warn(c->dev,
+			 "boot voltage %u uV does not match the table (%u uV)\n",
+			 val * CPUCL_BUCK_STEP_UV + CPUCL_BUCK_MIN_UV, uvolt);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void cpucl_drop_table(struct exynos9610_cpucl *c)
+{
+	kfree(c->table);
+	kfree(c->uvolt);
+	c->table = NULL;
+	c->uvolt = NULL;
+}
+
 static int cpucl_probe(struct platform_device *pdev)
 {
-	struct device_node *np = pdev->dev.of_node, *child;
+	struct device_node *np = pdev->dev.of_node, *child, *pmic_np;
+	struct acpm_handle *acpm = NULL;
 	unsigned int i;
 	int ret;
 
@@ -622,6 +1223,28 @@ static int cpucl_probe(struct platform_device *pdev)
 				GFP_KERNEL);
 	if (!clusters)
 		return -ENOMEM;
+
+	/* The CPU rails are S2MPU09 bucks, reached over the ACPM PMIC protocol. */
+	pmic_np = of_parse_phandle(np, "samsung,pmic", 0);
+	if (!pmic_np)
+		pmic_np = of_find_compatible_node(NULL, NULL,
+						  "samsung,s2mpu09-pmic");
+	if (pmic_np) {
+		acpm = devm_acpm_get_by_node(&pdev->dev, pmic_np->parent);
+		of_node_put(pmic_np);
+		if (IS_ERR(acpm)) {
+			/* The ACPM device probes after this one. */
+			if (PTR_ERR(acpm) == -EPROBE_DEFER)
+				return -EPROBE_DEFER;
+			dev_warn(&pdev->dev, "no ACPM handle, voltage stays fixed: %ld\n",
+				 PTR_ERR(acpm));
+			acpm = NULL;
+		}
+	}
+
+	cpucl_ect_base = memremap(CPUCL_ECT_PHYS, CPUCL_ECT_SIZE, MEMREMAP_WB);
+	if (!cpucl_ect_base)
+		dev_warn(&pdev->dev, "no ECT block, using boot-rate table only\n");
 
 	i = 0;
 	for_each_available_child_of_node(np, child) {
@@ -635,10 +1258,44 @@ static int cpucl_probe(struct platform_device *pdev)
 
 	cpucl_build_cpu_masks();
 	for (i = 0; i < num_clusters; i++) {
-		ret = cpucl_build_table(&clusters[i]);
+		struct exynos9610_cpucl *c = &clusters[i];
+
+		c->acpm = acpm;
+		if (!c->acpm || !c->buck_reg)
+			c->buck_reg = 0;
+
+		/*
+		 * The operating points above the boot rate need the voltage
+		 * tables, so they are only offered when voltage scaling was
+		 * asked for.  Otherwise the boot rate stays the ceiling, which is
+		 * the state the boot chain leaves the clusters in.
+		 */
+		ret = volt_scale ? cpucl_ect_table(c) : -ENOENT;
+		if (ret == -ENOENT) {
+			ret = cpucl_build_table(c);
+		} else if (!ret && c->acpm && c->buck_reg &&
+			   cpucl_verify_boot_voltage(c)) {
+			cpucl_drop_table(c);
+			ret = cpucl_build_table(c);
+		}
+		if (!c->uvolt) {
+			/*
+			 * Without a voltage table nothing above the boot rate may
+			 * be requested: the boot voltage is only known to be
+			 * correct for that rate.
+			 */
+			c->max_hz = c->boot_hz;
+		}
 		if (ret)
 			return ret;
+
+		dev_info(&pdev->dev, "%s: %lu-%lu Hz, voltage %s\n",
+			 c->name, c->table[0].frequency * 1000UL,
+			 c->max_hz, c->uvolt ? "scaled" : "fixed");
 	}
+
+	if (!cpucl_ect_base)
+		cpucl_ect_base = NULL;
 
 	ret = cpufreq_register_driver(&cpucl_cpufreq_driver);
 	if (ret)
@@ -650,6 +1307,8 @@ static int cpucl_probe(struct platform_device *pdev)
 			    &cpucl_dump_fops);
 	debugfs_create_file("set", 0200, cpucl_debugfs, NULL,
 			    &cpucl_set_fops);
+	debugfs_create_file("buck", 0644, cpucl_debugfs, NULL,
+			    &cpucl_buck_fops);
 
 	platform_set_drvdata(pdev, clusters);
 
@@ -667,8 +1326,11 @@ static void cpucl_remove(struct platform_device *pdev)
 	for (i = 0; i < num_clusters; i++) {
 		if (clusters[i].base)
 			cpucl_set_rate(&clusters[i], clusters[i].boot_hz);
-		kfree(clusters[i].table);
+		cpucl_drop_table(&clusters[i]);
 	}
+
+	memunmap(cpucl_ect_base);
+	cpucl_ect_base = NULL;
 }
 
 static const struct of_device_id cpucl_of_match[] = {
