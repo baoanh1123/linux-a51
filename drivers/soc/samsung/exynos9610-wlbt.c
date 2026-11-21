@@ -255,6 +255,10 @@
 #define MIB_PROLOGUE_MARKER	0x0120
 
 #define HIP4_ALLOC_SIZE			0x280000	/* what hip4_init asks for */
+/* Received frames kept for the debugfs "frames" file. */
+#define WLBT_FRAME_RING			32
+#define WLBT_FRAME_DATA			64
+
 #define HIP4_Q_NUM			6
 #define HIP4_Q_LEN			256
 #define HIP4_Q_IDX_SIZE			1
@@ -398,6 +402,13 @@ struct wlbt_hip4_q {
 #define FAPI_SENDER_PID			0xc001
 #define FAPI_MLME_ADD_SCAN_REQ		0x2005
 #define FAPI_MLME_CONNECT_REQ		0x200b
+#define FAPI_MLME_CONNECT_RES		0x2200
+#define FAPI_MLME_CONNECTED_RES		0x2201
+#define FAPI_MLME_SET_ACL_REQ		0x2016
+#define FAPI_MLME_SET_CACHED_CHANNELS	0x201f
+
+/* Channels offered to the peer once a connection is up. */
+#define WLBT_CACHED_CHANNELS		11
 #define FAPI_MLME_ADD_VIF_REQ		0x2007
 #define FAPI_MLME_SET_HOST_STATE_REQ	0x2028
 #define FAPI_MLME_SETKEYS_REQ		0x2018
@@ -649,6 +660,20 @@ struct exynos_wlbt {
 	u32 hip4_control;
 	spinlock_t hip4_lock;		/* one reader of the peer's queues */
 	u32 hip4_scratch_seq;		/* rotates the reference segments */
+	/*
+	 * The types of frame seen recently, kept as data rather than as printk:
+	 * the drain runs with the queue lock held, so the console cannot be the
+	 * place a frame is inspected from.
+	 */
+	struct {
+		u32 ref;
+		u16 id;
+		u8 flag;
+		u8 len;
+		u8 data[64];
+	} frames[WLBT_FRAME_RING];
+	unsigned int frame_next;
+	unsigned int frame_total;
 	bool hip4_started;		/* peer took the service start request */
 	struct wlbt_hip4_pool hip4_pool[2];
 	unsigned int n_hip4_tx;
@@ -658,12 +683,24 @@ struct exynos_wlbt {
 	struct cfg80211_scan_request *scan_req;
 	struct delayed_work scan_work;
 	struct delayed_work connect_work;
+	struct work_struct peer_work;	/* answers the connect indications */
 	u8 connect_bssid[ETH_ALEN];
 	u16 scan_id;
 	bool connecting;
 	bool vif_created;		/* MLME_ADD_VIF was accepted */
 	bool connect_reported;		/* the peer answered the join */
 	u16 connect_status;		/* FAPI_RESULTCODE from MLME_CONNECT_IND */
+	/* Indications that need a reply, raised by the drain and answered by
+	 * the work item because the reply has to be sent outside the queue
+	 * lock and cfg80211 cannot be called from the interrupt.
+	 */
+	bool peer_connect_cfm;		/* the peer took the join request */
+	bool connect_res_sent;
+	bool peer_connect_ind;
+	bool peer_connected_ind;
+	bool peer_disconnected_ind;
+	u16 peer_aid;
+	u16 peer_disconnect_reason;
 	struct wlbt_stream log;
 	struct wlbt_stream mgmt_in;
 	struct wlbt_stream mgmt_out;
@@ -730,7 +767,7 @@ MODULE_PARM_DESC(hip4_return, "Hand received HIP4 segments back to the peer");
  */
 static bool hip4_log;
 module_param(hip4_log, bool, 0644);
-MODULE_PARM_DESC(hip4_log, "Print every received HIP4 frame");
+MODULE_PARM_DESC(hip4_log, "Record every received HIP4 frame for debugfs frames");
 
 static bool load_mib = true;
 module_param(load_mib, bool, 0644);
@@ -1994,6 +2031,24 @@ static void wlbt_hip4_release(struct exynos_wlbt *w)
 	}
 }
 
+static void wlbt_frame_record(struct exynos_wlbt *w, u32 ref, u8 flag, u16 id,
+			      const void *data, size_t len)
+{
+	unsigned int slot = w->frame_next & (WLBT_FRAME_RING - 1);
+
+	memset(&w->frames[slot], 0, sizeof(w->frames[slot]));
+	w->frames[slot].ref = ref;
+	w->frames[slot].id = id;
+	w->frames[slot].flag = flag;
+	if (len > WLBT_FRAME_DATA)
+		len = WLBT_FRAME_DATA;
+	w->frames[slot].len = len;
+	if (len)
+		memcpy(&w->frames[slot].data, data, len);
+	w->frame_next++;
+	w->frame_total++;
+}
+
 /*
  * Print one segment of a scatter/gather frame.  The scan indications carry the
  * beacon in a chained segment, so the head alone says nothing about what was
@@ -2003,28 +2058,12 @@ static void wlbt_hip4_release(struct exynos_wlbt *w)
 static void wlbt_hip4_show_segment(struct exynos_wlbt *w, u32 ref,
 				   const struct wlbt_mbulk *mb)
 {
-	u8 buf[256];
-	size_t len, sig;
-
-	sig = le16_to_cpu(mb->sig_bufsz);
-	len = le16_to_cpu(mb->len);
-	if (!hip4_log)
-		return;
-	dev_info(w->dev,
-		 "  chain seg 0x%x flag 0x%02x sig %u len %u head %u\n",
-		 ref, mb->flag, (unsigned int)sig, (unsigned int)len,
-		 le16_to_cpu(mb->head));
-
-	if (len) {
-		/* Only the head is printed: a frame is recognisable from its
-		 * first bytes and the SSID is never far in.
-		 */
-		if (len > sizeof(buf))
-			len = sizeof(buf);
-		memcpy_fromio(buf, w->dram + ref + HIP4_MBULK_SIZE + sig, len);
-		print_hex_dump(KERN_INFO, "   data: ", DUMP_PREFIX_NONE, 16, 1,
-			       buf, len, false);
-	}
+	/*
+	 * Nothing is kept per segment: a chained frame would push everything
+	 * else out of the ring, and the head record names the frame anyway.
+	 */
+	(void)mb;
+	(void)ref;
 }
 
 static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
@@ -2071,6 +2110,18 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 				 le16_to_cpu(hdr.sender_pid),
 				 le32_to_cpu(hdr.fw_reference));
 
+			/*
+			 * MLME_CONNECT_CFM is the peer saying it took the join
+			 * request.  For an open network the vendor answers the
+			 * connect at that point, not after the indication, and
+			 * without the answer the peer drops the link again a few
+			 * seconds after associating.
+			 */
+			if (le16_to_cpu(hdr.id) == 0x210b) {
+				w->peer_connect_cfm = true;
+				schedule_work(&w->peer_work);
+			}
+
 			/* MLME_CONNECT_IND is {le16 vif, le16 result} and is the
 			 * only place the outcome of a join shows up.
 			 */
@@ -2078,6 +2129,30 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			    len >= sizeof(hdr) + 4) {
 				w->connect_status = get_unaligned_le16(body + 2);
 				w->connect_reported = true;
+				w->peer_connect_ind = true;
+				schedule_work(&w->peer_work);
+			}
+
+			/*
+			 * MLME_CONNECTED_IND is {le16 vif, le16 aid}: the link is
+			 * up and the peer wants the association id confirmed.
+			 */
+			if (le16_to_cpu(hdr.id) == 0x2304) {
+				if (len >= sizeof(hdr) + 4)
+					w->peer_aid = get_unaligned_le16(body + 2);
+				w->peer_connected_ind = true;
+				schedule_work(&w->peer_work);
+			}
+
+			/* MLME_DISCONNECTED_IND is {le16 vif, u8 bssid[6], le16
+			 * reason}: the link the peer had is gone.
+			 */
+			if (le16_to_cpu(hdr.id) == 0x2309) {
+				if (len >= sizeof(hdr) + 10)
+					w->peer_disconnect_reason =
+						get_unaligned_le16(body + 8);
+				w->peer_disconnected_ind = true;
+				schedule_work(&w->peer_work);
 			}
 
 			if (len > sizeof(body))
@@ -2085,15 +2160,17 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			memcpy_fromio(body, m + HIP4_MBULK_SIZE +
 				      HIP4_SIG_RESERVED + sizeof(hdr),
 				      len > sizeof(hdr) ? len - sizeof(hdr) : 0);
-			if (!hip4_log)
-				goto next;
-			print_hex_dump(KERN_INFO, "  body: ",
-				       DUMP_PREFIX_NONE, 16, 1, body,
-				       len > sizeof(hdr) ? len - sizeof(hdr) : 0,
-				       false);
+			/*
+			 * The peer's own log frames would fill the ring on their
+			 * own, and it is the requests and indications that matter.
+			 */
+			if (hip4_log && le16_to_cpu(hdr.id) != 0x8301)
+				wlbt_frame_record(w, ref, mb.flag,
+						  le16_to_cpu(hdr.id), body,
+						  len > sizeof(hdr) ?
+						  len - sizeof(hdr) : 0);
 		}
 
-next:
 		/*
 		 * Hand every segment back so the peer can reuse it.  A
 		 * scatter/gather frame is a chain: the head carries the
@@ -3513,6 +3590,46 @@ static const struct file_operations wlbt_dump_fops = {
 	.release = single_release,
 };
 
+static int wlbt_frames_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+	unsigned int i, n;
+
+	if (!w->frame_total) {
+		seq_puts(s, "no frames recorded\n");
+		return 0;
+	}
+
+	seq_printf(s, "%u frame(s), last %u kept\n", w->frame_total,
+		   min_t(unsigned int, w->frame_total, WLBT_FRAME_RING));
+	n = min_t(unsigned int, w->frame_total, WLBT_FRAME_RING);
+	for (i = 0; i < n; i++) {
+		unsigned int slot = (w->frame_next - n + i) &
+				    (WLBT_FRAME_RING - 1);
+
+		seq_printf(s, "ref 0x%x flag 0x%02x id 0x%04x len %u\n",
+			   w->frames[slot].ref, w->frames[slot].flag,
+			   w->frames[slot].id, w->frames[slot].len);
+		seq_hex_dump(s, "  ", DUMP_PREFIX_NONE, 32, 1,
+			     w->frames[slot].data, w->frames[slot].len, false);
+	}
+
+	return 0;
+}
+
+static int wlbt_frames_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_frames_show, inode->i_private);
+}
+
+static const struct file_operations wlbt_frames_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_frames_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static void wlbt_debugfs_init(struct exynos_wlbt *w)
 {
 	w->debugfs = debugfs_create_dir("exynos9610-wlbt", NULL);
@@ -3532,6 +3649,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("trace", 0600, w->debugfs, w, &wlbt_trace_fops);
 	debugfs_create_file("find", 0600, w->debugfs, w, &wlbt_find_fops);
 	debugfs_create_file("bss", 0400, w->debugfs, w, &wlbt_bss_fops);
+	debugfs_create_file("frames", 0400, w->debugfs, w, &wlbt_frames_fops);
 }
 
 static struct regmap *wlbt_syscon(struct exynos_wlbt *w, const char *name)
@@ -4027,21 +4145,112 @@ static int wlbt_vif_up(struct exynos_wlbt *w)
  * it (INVALID_PARAMETERS) as well as one without an RSN element
  * (REJECTED_INVALID_IE).
  */
+/*
+ * The peer announces a connection with MLME_CONNECT_IND and then waits for the
+ * host to say how to proceed; without an answer it drops the link again a few
+ * seconds later (MLME_DISCONNECTED_IND, reason 3).  Both replies are the vif
+ * number and three spare words.
+ */
+static void wlbt_mlme_connect_res(struct exynos_wlbt *w)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14] = { };
+	struct wlbt_fapi_hdr hdr = { };
+	u16 vif = 1;
+	int ret;
+
+	hdr.id = cpu_to_le16(FAPI_MLME_CONNECT_RES);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+	put_unaligned_le16(vif, sig + sizeof(hdr));
+
+	ret = wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+	dev_info(w->dev, "connect: replied to MLME_CONNECT_IND (%d)\n", ret);
+}
+
+/*
+ * The peer keeps a list of the channels the host considers usable and wants it
+ * refreshed when a connection is up, not before: sent ahead of a join it makes
+ * the peer refuse the join with NOT_ALLOWED.  The list travels as a vendor
+ * element of channel entries.
+ */
+static int wlbt_mlme_set_cached_channels(struct exynos_wlbt *w)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14];
+	u8 dat[7 + 3 * WLBT_CACHED_CHANNELS];
+	struct wlbt_fapi_hdr hdr = { };
+	unsigned int i, n = 0;
+
+	memset(sig, 0, sizeof(sig));
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);	/* vif 1 */
+
+	dat[n++] = 0xdd;			/* vendor specific element */
+	dat[n++] = 5;				/* OUI, type and subtype */
+	dat[n++] = 0x00;
+	dat[n++] = 0x16;
+	dat[n++] = 0x32;
+	dat[n++] = 0x01;			/* scan parameters */
+	dat[n++] = 0x02;			/* channel list */
+
+	for (i = 0; i < WLBT_CACHED_CHANNELS; i++) {
+		put_unaligned_le16((2412 + 5 * i) * 2, dat + n);
+		dat[n + 2] = 0x18;		/* 2.4 GHz and 5 GHz */
+		n += 3;
+		dat[1] += 3;
+	}
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SET_CACHED_CHANNELS);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 14, dat, n);
+}
+
+/* MLME_SET_ACL with no entries: the station accepts its peer and nothing else. */
+static int wlbt_mlme_set_acl(struct exynos_wlbt *w)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 18] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SET_ACL_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+	put_unaligned_le16(1, sig + sizeof(hdr));	/* vif 1 */
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+}
+
+static void wlbt_mlme_connected_res(struct exynos_wlbt *w, u16 aid)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 16] = { };
+	struct wlbt_fapi_hdr hdr = { };
+	int ret;
+
+	hdr.id = cpu_to_le16(FAPI_MLME_CONNECTED_RES);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+	put_unaligned_le16(1, sig + sizeof(hdr));
+	put_unaligned_le16(aid, sig + sizeof(hdr) + 2);
+
+	ret = wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+	dev_info(w->dev, "connect: replied to MLME_CONNECTED_IND %u (%d)\n",
+		 aid, ret);
+}
+
 static int wlbt_mlme_connect(struct exynos_wlbt *w,
 			     const struct cfg80211_connect_params *sme,
-			     u16 freq)
+			     const u8 *bssid, u16 freq)
 {
 	u8 sig[sizeof(struct wlbt_fapi_hdr) + 24];
 	u8 dat[2 + IEEE80211_MAX_SSID_LEN + 512];
 	struct wlbt_fapi_hdr hdr = { };
 	size_t ssid_len = sme->ssid_len, n = 0;
 
-	if (!sme->bssid || ssid_len > IEEE80211_MAX_SSID_LEN)
+	if (!bssid || ssid_len > IEEE80211_MAX_SSID_LEN)
 		return -EINVAL;
 
 	memset(sig, 0, sizeof(sig));
 	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif 1 */
-	memcpy(sig + sizeof(hdr) + 2, sme->bssid, ETH_ALEN);
+	memcpy(sig + sizeof(hdr) + 2, bssid, ETH_ALEN);
 	put_unaligned_le16(sme->auth_type, sig + sizeof(hdr) + 8);
 	put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 10);
 
@@ -4062,6 +4271,84 @@ static int wlbt_mlme_connect(struct exynos_wlbt *w,
 	memcpy(sig, &hdr, sizeof(hdr));
 
 	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 24, dat, n);
+}
+
+/*
+ * Answer whatever the peer asked for in its connect indications, and tell
+ * cfg80211 about the outcome.  This cannot run in the drain: the replies are
+ * sends that take the queue lock, and cfg80211 may sleep.
+ */
+static void wlbt_peer_work(struct work_struct *work)
+{
+	struct exynos_wlbt *w = container_of(work, struct exynos_wlbt, peer_work);
+	unsigned long flags;
+	bool cfm, cind, cted, disc;
+	u16 status, aid, reason;
+
+	spin_lock_irqsave(&w->hip4_lock, flags);
+	cfm = w->peer_connect_cfm;
+	cind = w->peer_connect_ind;
+	cted = w->peer_connected_ind;
+	disc = w->peer_disconnected_ind;
+	status = w->connect_status;
+	aid = w->peer_aid;
+	reason = w->peer_disconnect_reason;
+	w->peer_connect_cfm = false;
+	w->peer_connect_ind = false;
+	w->peer_connected_ind = false;
+	w->peer_disconnected_ind = false;
+	spin_unlock_irqrestore(&w->hip4_lock, flags);
+
+	if ((cfm || cind) && !w->connect_res_sent) {
+		wlbt_mlme_connect_res(w);
+		w->connect_res_sent = true;
+	}
+
+	if (cind) {
+		if (status) {
+			dev_info(w->dev, "connect: peer refused the join: 0x%04x\n",
+				 status);
+			w->connecting = false;
+			cfg80211_disconnected(w->netdev, status, NULL, 0, true,
+					      GFP_KERNEL);
+			return;
+		}
+
+		/*
+		 * The vendor reports the connection here, on the indication,
+		 * and follows it with the access list and the channel list the
+		 * peer keeps for its own scans.  MLME_CONNECTED_IND arrives
+		 * later, if at all, so waiting for it means the supplicant has
+		 * already given up.
+		 */
+		wlbt_mlme_set_acl(w);
+		msleep(20);
+		wlbt_mlme_set_cached_channels(w);
+
+		if (w->connecting) {
+			w->connecting = false;
+			netif_carrier_on(w->netdev);
+			dev_info(w->dev, "connect: connected to %pM\n",
+				 w->connect_bssid);
+			cfg80211_connect_result(w->netdev, w->connect_bssid,
+						NULL, 0, NULL, 0,
+						WLAN_STATUS_SUCCESS, GFP_KERNEL);
+		}
+	}
+
+	if (cted) {
+		wlbt_mlme_connected_res(w, aid);
+		netif_carrier_on(w->netdev);
+	}
+
+	if (disc) {
+		netif_carrier_off(w->netdev);
+		dev_info(w->dev, "connect: peer lost the link, reason %u\n",
+			 reason);
+		w->connecting = false;
+		cfg80211_disconnected(w->netdev, reason, NULL, 0,
+				      !w->connect_reported, GFP_KERNEL);
+	}
 }
 
 static void wlbt_connect_work(struct work_struct *work)
@@ -4092,6 +4379,8 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 			    struct cfg80211_connect_params *sme)
 {
 	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+	struct cfg80211_bss *bss;
+	u8 bssid[ETH_ALEN];
 	u16 freq = 2437;
 	int ret;
 
@@ -4107,15 +4396,39 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	if (sme->channel && sme->channel->center_freq)
 		freq = sme->channel->center_freq;
 
+	/*
+	 * A connect request does not have to name an access point: when it does
+	 * not, the one the scan found is used, which is what "iw connect" and
+	 * the supplicant's first attempt rely on.
+	 */
+	if (sme->bssid) {
+		memcpy(bssid, sme->bssid, ETH_ALEN);
+	} else {
+		bss = cfg80211_get_bss(wiphy, sme->channel, NULL, sme->ssid,
+				       sme->ssid_len, IEEE80211_BSS_TYPE_ESS,
+				       IEEE80211_PRIVACY_ANY);
+		if (!bss) {
+			dev_info(w->dev, "connect: no access point for \"%.*s\"\n",
+				 (int)sme->ssid_len, sme->ssid);
+			return -ENOENT;
+		}
+		memcpy(bssid, bss->bssid, ETH_ALEN);
+		if (!sme->channel && bss->channel)
+			freq = bss->channel->center_freq;
+		cfg80211_put_bss(wiphy, bss);
+	}
+
 	dev_info(w->dev, "connect: %pM freq %u auth %u ssid \"%.*s\" ies %zu\n",
-		 sme->bssid, freq, sme->auth_type, (int)sme->ssid_len, sme->ssid,
+		 bssid, freq, sme->auth_type, (int)sme->ssid_len, sme->ssid,
 		 sme->ie_len);
 
-	memcpy(w->connect_bssid, sme->bssid, ETH_ALEN);
+	memcpy(w->connect_bssid, bssid, ETH_ALEN);
 	w->connect_reported = false;
 	w->connect_status = 0;
+	w->connect_res_sent = false;
+	w->peer_connect_cfm = false;
 
-	ret = wlbt_mlme_connect(w, sme, freq);
+	ret = wlbt_mlme_connect(w, sme, bssid, freq);
 	if (ret)
 		return ret;
 
@@ -4130,6 +4443,7 @@ static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
 
 	cancel_delayed_work_sync(&w->connect_work);
+	cancel_work_sync(&w->peer_work);
 	w->connecting = false;
 	cfg80211_disconnected(ndev, reason_code, NULL, 0, true, GFP_KERNEL);
 	return 0;
@@ -4312,6 +4626,7 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	w->netdev = ndev;
 	INIT_DELAYED_WORK(&w->scan_work, wlbt_scan_work);
 	INIT_DELAYED_WORK(&w->connect_work, wlbt_connect_work);
+	INIT_WORK(&w->peer_work, wlbt_peer_work);
 	dev_info(w->dev, "registered %s\n", netdev_name(ndev));
 	return 0;
 
