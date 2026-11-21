@@ -78,7 +78,14 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&dwmmc2_cd_ext_irq &sd2_clk &sd2_cmd &sd2_bus1
 			     &sd2_bus4>;
-		status = "okay";
+		/*
+		 * Disabled on purpose until the card slot is stable.  Nothing
+		 * at runtime depends on it: the board boots from the UFS
+		 * partitions (sda) and takes its root filesystem over NFS, so
+		 * leaving this controller unbound only stops the driver from
+		 * probing the card.  Set this back to "okay" to bring it up.
+		 */
+		status = "disabled";
 	};
 
 	/*
