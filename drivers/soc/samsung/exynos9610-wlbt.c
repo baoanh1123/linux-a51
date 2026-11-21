@@ -629,7 +629,8 @@ struct exynos_wlbt {
 	u32 heap_next;			/* MIF-relative bump pointer */
 	u32 mxconf_offset;
 	u32 hip4_ref;			/* MIF-relative HIP4 shared region */
-	u32 hip4_control;		/* MIF-relative control block */
+	u32 hip4_control;
+	u32 hip4_scratch;		/* MIF-relative control block */
 	bool hip4_started;		/* peer took the service start request */
 	struct wlbt_hip4_pool hip4_pool[2];
 	unsigned int n_hip4_tx;
@@ -1528,6 +1529,37 @@ static void wlbt_hip4_state(struct exynos_wlbt *w)
 	}
 }
 
+/*
+ * A throwaway segment for the firmware reference to name.  It carries nothing
+ * but a signal header, has one reference on it, and sits in the last data slot
+ * so the ordinary allocator never hands it out.
+ */
+static u32 wlbt_hip4_scratch(struct exynos_wlbt *w)
+{
+	u32 ref = w->hip4_ref + HIP4_TX_DAT_SIZE - HIP4_SLOT_SIZE;
+	struct wlbt_mbulk mb = { };
+	void *m = w->dram + ref;
+
+	if (w->hip4_scratch)
+		return ref;
+
+	w->hip4_scratch = ref;
+	mb.flag = MBULK_F_SIG | MBULK_F_OBOUND;
+	mb.clas = MBULK_CLASS_FROM_HOST_DAT;
+	mb.pid = MBULK_POOL_ID_DATA;
+	mb.refcnt = 1;
+	mb.sig_bufsz = cpu_to_le16(ALIGN(HIP4_SIG_RESERVED +
+					 sizeof(struct wlbt_fapi_hdr), 4));
+	mb.head = mb.sig_bufsz;
+	memcpy_toio(m, &mb, sizeof(mb));
+	memset_io(m + HIP4_MBULK_SIZE, 0, HIP4_SLOT_SIZE - HIP4_MBULK_SIZE);
+	/* The descriptor and the cleared signal area must be in DRAM before
+	 * the peer is handed a reference to this segment. */
+	wmb();
+
+	return ref;
+}
+
 static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 			  size_t sig_len, const void *data, size_t data_len)
 {
@@ -1569,13 +1601,14 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 		memcpy_toio(m + HIP4_MBULK_SIZE + sig_bufsz, data, data_len);
 	if (sig_self_ref) {
 		/*
-		 * The peer compares this word against the transmit and receive
-		 * window bounds it kept from the HIP4 configuration.  Those are
-		 * shared memory refs and the peer offsets them into the MIF
-		 * window itself, so the reference has to stay a ref: naming the
-		 * segment the signal travels in puts it inside both windows.
+		 * The peer validates this word against the transmit and receive
+		 * bounds it kept from the HIP4 configuration, and then treats the
+		 * segment it names as one of its own: it is handed back to the
+		 * pool when the request is done.  So it has to name a disposable
+		 * segment with a live reference count, not the frame the signal
+		 * travels in - freeing that one leaves the frame double freed.
 		 */
-		__le32 self = cpu_to_le32(ref);
+		__le32 self = cpu_to_le32(wlbt_hip4_scratch(w));
 
 		memcpy_toio(m + HIP4_MBULK_SIZE + HIP4_SIG_RESERVED +
 			    offsetof(struct wlbt_fapi_hdr, fw_reference),
