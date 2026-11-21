@@ -402,7 +402,6 @@ struct wlbt_hip4_q {
 #define FAPI_MLME_SET_HOST_STATE_REQ	0x2028
 #define FAPI_MLME_SETKEYS_REQ		0x2018
 #define FAPI_MLME_SET_COUNTRY_REQ	0x2033
-#define FAPI_MLME_SET_CACHED_CHANNELS	0x201f
 
 /* Key types the peer knows (fapi.h). */
 #define FAPI_KEYTYPE_GROUP	0
@@ -2835,6 +2834,49 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 		goto out;
 	}
 
+	/*
+	 * "mibset <psid> <hex bytes>" writes one entry into the peer's MIB database
+	 * at run time, which is how a setting is tried out without a reboot: the
+	 * files in the HIP4 area are only read when the peer starts.
+	 */
+	if (!strncmp(cmd, "mibset", 6)) {
+		u8 rec[4 + 64];
+		unsigned int psid, dlen = 0;
+		char *h;
+
+		if (sscanf(kbuf + 6, "%x", &psid) != 1 ||
+		    !w->hip4_started) {
+			ret = -EINVAL;
+			goto out;
+		}
+		h = strchr(kbuf + 6, ' ');
+		if (h) {
+			for (h++; *h && dlen < sizeof(rec) * 2; h++) {
+				if (!isxdigit(*h))
+					continue;
+				val = hex_to_bin(*h);
+				if (dlen & 1)
+					rec[5 + dlen / 2] |= val;
+				else
+					rec[5 + dlen / 2] = val << 4;
+				dlen++;
+			}
+		}
+		if (dlen & 1) {
+			ret = -EINVAL;
+			goto out;
+		}
+		dlen /= 2;
+		put_unaligned_le16(psid, rec);
+		put_unaligned_le16(dlen, rec + 2);
+		if (dlen & 1)
+			rec[5 + dlen / 2] = 0;
+		wlbt_mib_send_slice(w, rec, ALIGN(4 + dlen, 2));
+		dev_info(w->dev, "MIB 0x%04x set to %u bytes\n", psid, dlen);
+		ret = len;
+		goto out;
+	}
+
 	if (!strcmp(cmd, "ret")) {
 		unsigned int ref;
 
@@ -3887,46 +3929,6 @@ static int wlbt_mlme_set_country(struct exynos_wlbt *w, const char *alpha2)
 	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 14, NULL, 0);
 }
 
-/*
- * The peer keeps a list of the channels the host considers usable, and it will
- * neither report nor join on a frequency that is not in it - a join for channel 1
- * fails its frequency lookup (fault 0x2c0a) while channel 6 works.  The list is
- * the same vendor element the scan request carries, appended to a bare body.
- */
-#define WLBT_CACHED_CHANNELS	13
-
-static int wlbt_mlme_set_cached_channels(struct exynos_wlbt *w)
-{
-	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14];
-	u8 dat[7 + 3 * WLBT_CACHED_CHANNELS];
-	struct wlbt_fapi_hdr hdr = { };
-	unsigned int i, n = 0;
-
-	memset(sig, 0, sizeof(sig));
-	put_unaligned_le16(1, sig + sizeof(hdr) + 0);	/* vif 1 */
-
-	dat[n++] = 0xdd;			/* vendor specific element */
-	dat[n++] = 5;				/* OUI, type and subtype */
-	dat[n++] = 0x00;
-	dat[n++] = 0x16;
-	dat[n++] = 0x32;
-	dat[n++] = 0x01;			/* scan parameters */
-	dat[n++] = 0x02;			/* channel list */
-
-	for (i = 0; i < WLBT_CACHED_CHANNELS; i++) {
-		put_unaligned_le16((2412 + 5 * i) * 2, dat + n);
-		dat[n + 2] = 0x18;		/* 2.4 GHz and 5 GHz */
-		n += 3;
-		dat[1] += 3;
-	}
-
-	hdr.id = cpu_to_le16(FAPI_MLME_SET_CACHED_CHANNELS);
-	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
-	memcpy(sig, &hdr, sizeof(hdr));
-
-	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 14, dat, n);
-}
-
 static int wlbt_vif_up(struct exynos_wlbt *w)
 {
 	int ret;
@@ -3952,10 +3954,6 @@ static int wlbt_vif_up(struct exynos_wlbt *w)
 		return ret;
 	msleep(50);
 
-	ret = wlbt_mlme_set_cached_channels(w);
-	if (ret)
-		return ret;
-	msleep(50);
 
 	w->vif_created = true;
 	return 0;
