@@ -736,6 +736,16 @@ static unsigned int mib_slice_max = 1024;
 module_param(mib_slice_max, uint, 0644);
 MODULE_PARM_DESC(mib_slice_max, "Largest MIB batch handed over in one signal");
 
+/*
+ * The peer validates the reference in fw_reference against the HIP4 transmit
+ * and receive windows only (0x802e44f0..0x802e44fc hold their bounds), so it
+ * is a pointer into the segment memory rather than a cookie.  Send the
+ * address of the segment the signal itself travels in.
+ */
+static bool sig_self_ref;
+module_param(sig_self_ref, bool, 0644);
+MODULE_PARM_DESC(sig_self_ref, "Point fw_reference at the signal's own segment");
+
 static unsigned int send_ref;
 module_param(send_ref, uint, 0644);
 MODULE_PARM_DESC(send_ref, "fw_reference to put in signals sent from the hip4 node");
@@ -1523,6 +1533,14 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	memcpy_toio(m + HIP4_MBULK_SIZE + HIP4_SIG_RESERVED, sig, sig_len);
 	if (data_len)
 		memcpy_toio(m + HIP4_MBULK_SIZE + sig_bufsz, data, data_len);
+	if (sig_self_ref) {
+		/* The peer's window starts at 0x80000000 (see the MIF setup). */
+		__le32 self = cpu_to_le32((u32)(0x80000000 + ref));
+
+		memcpy_toio(m + HIP4_MBULK_SIZE + HIP4_SIG_RESERVED +
+			    offsetof(struct wlbt_fapi_hdr, fw_reference),
+			    &self, sizeof(self));
+	}
 	/* The whole segment has to be in DRAM before the peer sees the ref. */
 	wmb();
 
