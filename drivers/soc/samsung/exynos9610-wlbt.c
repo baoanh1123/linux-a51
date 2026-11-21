@@ -3645,8 +3645,9 @@ static void wlbt_dram_bsses(struct exynos_wlbt *w, struct seq_file *s)
 			u16 freq;
 			unsigned int k;
 			unsigned int j = 36;
-			const u8 *ssid = NULL;
+			const u8 *ssid = NULL, *rsn = NULL, *rsn_caps = NULL;
 			u8 ssid_len = 0;
+			bool wpa = false;
 
 			if (!wlbt_bss_frame(f, len - i, &flen, &freq))
 				continue;
@@ -3659,19 +3660,35 @@ static void wlbt_dram_bsses(struct exynos_wlbt *w, struct seq_file *s)
 				memcpy(seen[n_seen++], f + 16, ETH_ALEN);
 
 			while (j + 2 <= flen) {
-				if (f[j] == WLAN_EID_SSID) {
-					ssid = f + j + 2;
-					ssid_len = f[j + 1];
+				const u8 *ie = f + j + 2;
+				unsigned int ielen = f[j + 1];
+
+				if (j + 2 + ielen > flen)
 					break;
+				if (f[j] == WLAN_EID_SSID && !ssid) {
+					ssid = ie;
+					ssid_len = ielen;
+				} else if (f[j] == WLAN_EID_RSN) {
+					rsn = ie;
+					rsn_caps = ielen >= 4 ? ie + ielen - 2 : NULL;
+				} else if (f[j] == WLAN_EID_VENDOR_SPECIFIC &&
+					   ielen >= 4 && ie[0] == 0x00 &&
+					   ie[1] == 0x50 && ie[2] == 0xf2 &&
+					   ie[3] == 0x01) {
+					wpa = true;
 				}
-				j += 2 + f[j + 1];
+				j += 2 + ielen;
 			}
 
 			seq_printf(s, "%pM  %u MHz  ", f + 16, freq);
 			if (ssid)
-				seq_printf(s, "\"%.*s\"\n", ssid_len, ssid);
+				seq_printf(s, "\"%.*s\"  ", ssid_len, ssid);
 			else
-				seq_puts(s, "(no SSID)\n");
+				seq_puts(s, "(no SSID)  ");
+			seq_printf(s, "%s%s%s%s\n",
+				   (f[34] & 0x10) ? "privacy " : "open ",
+				   rsn ? "RSN " : "", wpa ? "WPA " : "",
+				   rsn && rsn_caps[0] != 0 ? "MFP " : "");
 			n++;
 		}
 	}
