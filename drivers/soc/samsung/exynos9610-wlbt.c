@@ -397,6 +397,8 @@ struct wlbt_hip4_q {
 #define FAPI_SENDER_PID			0xc001
 #define FAPI_MLME_ADD_SCAN_REQ		0x2005
 #define FAPI_MLME_CONNECT_REQ		0x200b
+#define FAPI_MLME_ADD_VIF_REQ		0x2007
+#define FAPI_MLME_SET_HOST_STATE_REQ	0x2028
 
 struct wlbt_mbulk {
 	__le32 next_offset;
@@ -648,6 +650,7 @@ struct exynos_wlbt {
 	u8 connect_bssid[ETH_ALEN];
 	u16 scan_id;
 	bool connecting;
+	bool vif_created;		/* MLME_ADD_VIF was accepted */
 	bool connect_reported;		/* the peer answered the join */
 	u16 connect_status;		/* FAPI_RESULTCODE from MLME_CONNECT_IND */
 	struct wlbt_stream log;
@@ -3398,6 +3401,20 @@ static struct ieee80211_rate wlbt_2ghz_rates[] = {
 	{ .bitrate = 540 },
 };
 
+/*
+ * cfg80211 validates the cipher and AKM suites a supplicant asks for against
+ * these before it ever calls the driver, so a wiphy that advertises none of
+ * them makes every connection attempt fail with -EINVAL.  The peer does the
+ * encryption, so all of them can be offered.
+ */
+static const u32 wlbt_cipher_suites[] = {
+	WLAN_CIPHER_SUITE_WEP40,
+	WLAN_CIPHER_SUITE_WEP104,
+	WLAN_CIPHER_SUITE_TKIP,
+	WLAN_CIPHER_SUITE_CCMP,
+	WLAN_CIPHER_SUITE_AES_CMAC,
+};
+
 static struct ieee80211_supported_band wlbt_band_2ghz = {
 	.band = NL80211_BAND_2GHZ,
 	.channels = wlbt_2ghz_channels,
@@ -3587,6 +3604,76 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
  * two bytes of the BSSID around the authentication type, the frequency at
  * +10, and the information elements as payload.
  */
+/*
+ * Bringing the interface up is a firmware sequence, not a driver one: the peer
+ * needs a vif record before it will accept a join against it, and it refuses
+ * the join with INVALID_VIF_INDEX (0x800a, fault 0x2614) otherwise.  The vendor
+ * driver sends MLME_ADD_VIF and then the host state when the net device opens;
+ * both are sent here on the first join instead, because the peer has to be
+ * running before either makes sense.
+ */
+static int wlbt_mlme_add_vif(struct exynos_wlbt *w)
+{
+	static const u8 mac[6] = { 0x8c, 0x77, 0x12, 0xaa, 0xbb, 0xcc };
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 28];
+	struct wlbt_fapi_hdr hdr = { };
+
+	/* Body: interface, own address, type, partner address - the order the
+	 * peer accepted when the vif was created by hand.
+	 */
+	memset(sig, 0, sizeof(sig));
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);	/* vif */
+	memcpy(sig + sizeof(hdr) + 2, mac, sizeof(mac));
+	put_unaligned_le16(2, sig + sizeof(hdr) + 8);	/* FAPI_VIFTYPE_STATION */
+	memcpy(sig + sizeof(hdr) + 10, mac, sizeof(mac));
+
+	hdr.id = cpu_to_le16(FAPI_MLME_ADD_VIF_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 28, NULL, 0);
+}
+
+static int wlbt_mlme_host_state(struct exynos_wlbt *w, u16 state)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 16];
+	struct wlbt_fapi_hdr hdr = { };
+
+	memset(sig, 0, sizeof(sig));
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);	/* vif */
+	put_unaligned_le16(0xffff, sig + sizeof(hdr) + 2);
+	put_unaligned_le16(state, sig + sizeof(hdr) + 4);
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SET_HOST_STATE_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 16, NULL, 0);
+}
+
+static int wlbt_vif_up(struct exynos_wlbt *w)
+{
+	int ret;
+
+	if (w->vif_created)
+		return 0;
+
+	ret = wlbt_mlme_add_vif(w);
+	if (ret)
+		return ret;
+	/* The peer answers on its own thread; give it the moment it needs
+	 * before the join that depends on the record.
+	 */
+	msleep(150);
+
+	ret = wlbt_mlme_host_state(w, 2);	/* cellular active */
+	if (ret)
+		return ret;
+	msleep(50);
+
+	w->vif_created = true;
+	return 0;
+}
 static int wlbt_mlme_connect(struct exynos_wlbt *w, const u8 *bssid, u16 auth,
 			     u16 freq, const u8 *ssid, size_t ssid_len)
 {
@@ -3655,6 +3742,10 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 		return -EIO;
 	if (w->connecting)
 		return -EBUSY;
+
+	ret = wlbt_vif_up(w);
+	if (ret)
+		return ret;
 
 	if (sme->channel && sme->channel->center_freq)
 		freq = sme->channel->center_freq;
@@ -3750,6 +3841,13 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	wiphy->max_scan_ssids = 1;
 	wiphy->bands[NL80211_BAND_2GHZ] = &wlbt_band_2ghz;
+	wiphy->cipher_suites = wlbt_cipher_suites;
+	wiphy->n_cipher_suites = ARRAY_SIZE(wlbt_cipher_suites);
+	wiphy->max_num_akm_suites = 8;
+	/* The supplicant names the EAPOL ethertype it wants; accepting the
+	 * attribute is enough for now, the peer's data path is not there yet.
+	 */
+	wiphy->flags |= WIPHY_FLAG_CONTROL_PORT_PROTOCOL;
 
 	ret = wiphy_register(wiphy);
 	if (ret)
@@ -3919,6 +4017,7 @@ static void wlbt_remove(struct platform_device *pdev)
 	wlbt_unregister_wiphy(w);
 
 	mutex_lock(&w->lock);
+	w->vif_created = false;
 	wlbt_power_down(w);
 	mutex_unlock(&w->lock);
 
