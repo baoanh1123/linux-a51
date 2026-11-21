@@ -1309,6 +1309,39 @@ static u32 wlbt_heap_alloc_aligned(struct exynos_wlbt *w, u32 bytes, u32 align)
  * them the WLAN service has no RF/driver parameters and its start never
  * completes (hip4.c:2416-2455).
  */
+/*
+ * The MIB files only carry the entries above PSID 0x08cf.  The golden, host owned
+ * ones below that range are not in any of the shipped variants, and the peer will
+ * not join a network without them: its join builds the basic rate set of the
+ * association from SLSI_PSID_UNIFI_SUPPORTED_DATA_RATES and refuses the request
+ * with fault 0x2c1f - reported as 0x0030 NOT_ALLOWED - when that set is empty.
+ *
+ * The rate list is N followed by N rates in units of 500 kbit/s, which is the
+ * 802.11b/g set: 1, 2, 5.5 and 11 Mbit/s then 6, 9, 12, 18, 24, 36, 48 and 54.
+ */
+#define MIB_PSID_SUPPORTED_DATA_RATES	0x07f9
+#define MIB_PSID_EXTENDED_CAPABILITIES	0x07ef
+
+static const u8 wlbt_golden_rates[] = {
+	12, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c,
+};
+
+/* The vendor driver advertises these extended capabilities and clears the rest. */
+static const u8 wlbt_golden_ext_caps[] = {
+	9, 0xff, 0xff, 0xf7, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff,
+};
+
+static const struct {
+	u16 psid;
+	const u8 *value;
+	size_t len;
+} wlbt_golden_mibs[] = {
+	{ MIB_PSID_SUPPORTED_DATA_RATES, wlbt_golden_rates,
+	  sizeof(wlbt_golden_rates) },
+	{ MIB_PSID_EXTENDED_CAPABILITIES, wlbt_golden_ext_caps,
+	  sizeof(wlbt_golden_ext_caps) },
+};
+
 static u32 wlbt_load_mib(struct exynos_wlbt *w)
 {
 	static const char *const names[] = {
@@ -1354,6 +1387,27 @@ static u32 wlbt_load_mib(struct exynos_wlbt *w)
 			    fw->data + skip, fw->size - skip);
 		total += fw->size - skip;
 		release_firmware(fw);
+	}
+
+	/*
+	 * The peer reads this area when it is started and caches what it finds,
+	 * so the golden entries have to be here and not only in a later request.
+	 */
+	for (i = 0; i < ARRAY_SIZE(wlbt_golden_mibs); i++) {
+		size_t len = 4 + wlbt_golden_mibs[i].len;
+		size_t padded = ALIGN(len, 2);
+		u8 rec[4 + 16];
+
+		if (len > sizeof(rec) || total + padded > HIP4_MIB_SIZE)
+			break;
+
+		put_unaligned_le16(wlbt_golden_mibs[i].psid, rec);
+		put_unaligned_le16(wlbt_golden_mibs[i].len, rec + 2);
+		memcpy(rec + 4, wlbt_golden_mibs[i].value, wlbt_golden_mibs[i].len);
+		memset(rec + len, 0, padded - len);
+		memcpy_toio(w->dram + w->hip4_ref + HIP4_MIB_OFFSET + total,
+			    rec, padded);
+		total += padded;
 	}
 
 	if (total)
@@ -1800,39 +1854,6 @@ static void wlbt_mib_send_slice(struct exynos_wlbt *w, const u8 *mib,
  * Walk the entry stream {u16 id, u16 len, data[len]} (padded to even) and hand
  * it over in slices the peer can take in one signal.
  */
-/*
- * The MIB files only carry the entries above PSID 0x08cf.  The golden, host owned
- * ones below that range are not in any of the shipped variants, and the peer will
- * not join a network without them: its join builds the basic rate set of the
- * association from SLSI_PSID_UNIFI_SUPPORTED_DATA_RATES and refuses the request
- * with fault 0x2c1f - reported as 0x0030 NOT_ALLOWED - when that set is empty.
- *
- * The rate list is N followed by N rates in units of 500 kbit/s, which is the
- * 802.11b/g set: 1, 2, 5.5 and 11 Mbit/s then 6, 9, 12, 18, 24, 36, 48 and 54.
- */
-#define MIB_PSID_SUPPORTED_DATA_RATES	0x07f9
-#define MIB_PSID_EXTENDED_CAPABILITIES	0x07ef
-
-static const u8 wlbt_golden_rates[] = {
-	12, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c,
-};
-
-/* The vendor driver advertises these extended capabilities and clears the rest. */
-static const u8 wlbt_golden_ext_caps[] = {
-	9, 0xff, 0xff, 0xf7, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff,
-};
-
-static const struct {
-	u16 psid;
-	const u8 *value;
-	size_t len;
-} wlbt_golden_mibs[] = {
-	{ MIB_PSID_SUPPORTED_DATA_RATES, wlbt_golden_rates,
-	  sizeof(wlbt_golden_rates) },
-	{ MIB_PSID_EXTENDED_CAPABILITIES, wlbt_golden_ext_caps,
-	  sizeof(wlbt_golden_ext_caps) },
-};
-
 static int wlbt_download_mibs(struct exynos_wlbt *w)
 {
 	static const char *const names[] = {
@@ -3314,6 +3335,10 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 		   firmware_name, w->fw_entry, w->fw_runtime_length,
 		   w->fw_loaded ? "loaded" : "not loaded");
 	seq_printf(s, "mailbox last status 0x%04x\n", w->last_mbox_status);
+	if (w->hip4_ref)
+		seq_printf(s, "hip4 0x%x control 0x%x mib 0x%x (%u bytes)\n",
+			   w->hip4_ref, w->hip4_control,
+			   w->hip4_ref + HIP4_MIB_OFFSET, HIP4_MIB_SIZE);
 
 	regmap_read(w->pmu, CENTRAL_SEQ_WLBT_STATUS, &val);
 	seq_printf(s, "CENTRAL_SEQ_WLBT_STATUS 0x%08x\n", val);
