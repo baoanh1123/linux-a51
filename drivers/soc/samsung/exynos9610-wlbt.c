@@ -2294,11 +2294,22 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 	}
 	p += used;
 
-	while (n < sizeof(sig) - sizeof(hdr) &&
-	       sscanf(p, "%x%n", &val, &used) == 1) {
-		sig[sizeof(hdr) + n++] = val;
-		p += used;
+	/* The payload is a hex string with the bytes run together. */
+	for (; *p && n < sizeof(sig) - sizeof(hdr); p++) {
+		if (!isxdigit(*p))
+			continue;
+		val = hex_to_bin(*p);
+		if (n & 1)
+			sig[sizeof(hdr) + n / 2] |= val;
+		else
+			sig[sizeof(hdr) + n / 2] = val << 4;
+		n++;
 	}
+	if (n & 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+	n /= 2;
 
 	hdr.id = cpu_to_le16(id);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
