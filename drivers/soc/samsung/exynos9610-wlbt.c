@@ -647,6 +647,7 @@ struct exynos_wlbt {
 	u32 mxconf_offset;
 	u32 hip4_ref;			/* MIF-relative HIP4 shared region */
 	u32 hip4_control;
+	spinlock_t hip4_lock;		/* one reader of the peer's queues */
 	u32 hip4_scratch_seq;		/* rotates the reference segments */
 	bool hip4_started;		/* peer took the service start request */
 	struct wlbt_hip4_pool hip4_pool[2];
@@ -721,6 +722,15 @@ MODULE_PARM_DESC(load_firmware, "Copy the firmware image into MIF DRAM and let t
 static bool hip4_return = true;
 module_param(hip4_return, bool, 0644);
 MODULE_PARM_DESC(hip4_return, "Hand received HIP4 segments back to the peer");
+
+/*
+ * The receive queue is walked with the queue lock held and interrupts off, so
+ * a frame by frame trace is only printed when it is asked for: at a few hundred
+ * frames the console time alone is enough to lose the mailbox interrupts.
+ */
+static bool hip4_log;
+module_param(hip4_log, bool, 0644);
+MODULE_PARM_DESC(hip4_log, "Print every received HIP4 frame");
 
 static bool load_mib = true;
 module_param(load_mib, bool, 0644);
@@ -1578,6 +1588,17 @@ static void wlbt_hip4_slot_put(struct exynos_wlbt *w, u32 ref)
 	}
 }
 
+/*
+ * The peer checks every reference it is handed against the two buffers named in
+ * the HIP4 configuration, and one that falls outside them is an assertion on its
+ * side, so a segment that is not plainly inside those buffers is never queued.
+ */
+static bool wlbt_hip4_ref_valid(struct exynos_wlbt *w, u32 ref)
+{
+	return ref >= w->hip4_ref + HIP4_TX_OFFSET &&
+	       ref < w->hip4_ref + HIP4_RX_OFFSET + HIP4_RX_SIZE;
+}
+
 static void wlbt_hip4_push(struct exynos_wlbt *w, u32 q, u32 ref)
 {
 	u8 *scb = wlbt_hip4_scb(w);
@@ -1747,6 +1768,7 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 {
 	struct wlbt_mbulk mb = { };
 	u32 sig_bufsz, ref;
+	unsigned long flags;
 	void *m;
 	int ret;
 
@@ -1755,9 +1777,13 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	if (sig_len < sizeof(struct wlbt_fapi_hdr))
 		return -EINVAL;
 
+	/* The pools are shared with the drain that runs in interrupt context. */
+	spin_lock_irqsave(&w->hip4_lock, flags);
 	ret = wlbt_hip4_slot_get(w, ctrl, &ref);
-	if (ret)
+	if (ret) {
+		spin_unlock_irqrestore(&w->hip4_lock, flags);
 		return ret;
+	}
 
 	sig_bufsz = ALIGN(sig_len + HIP4_SIG_RESERVED, 4);
 	mb.flag = MBULK_F_SIG | MBULK_F_OBOUND;
@@ -1801,6 +1827,7 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 
 	wlbt_hip4_push(w, ctrl ? HIP4_Q_FH_CTL : HIP4_Q_FH_DAT, ref);
 	w->n_hip4_tx++;
+	spin_unlock_irqrestore(&w->hip4_lock, flags);
 
 	return 0;
 }
@@ -1981,6 +2008,8 @@ static void wlbt_hip4_show_segment(struct exynos_wlbt *w, u32 ref,
 
 	sig = le16_to_cpu(mb->sig_bufsz);
 	len = le16_to_cpu(mb->len);
+	if (!hip4_log)
+		return;
 	dev_info(w->dev,
 		 "  chain seg 0x%x flag 0x%02x sig %u len %u head %u\n",
 		 ref, mb->flag, (unsigned int)sig, (unsigned int)len,
@@ -2011,7 +2040,7 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 		struct wlbt_mbulk mb;
 		void *m;
 
-		if (ref >= w->mem_size - HIP4_SLOT_SIZE) {
+		if (!wlbt_hip4_ref_valid(w, ref)) {
 			dev_warn(w->dev, "HIP4 q%u[%u]: bogus ref 0x%x\n",
 				 q, ridx, ref);
 			ridx = (ridx + 1) & (HIP4_Q_LEN - 1);
@@ -2020,10 +2049,11 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 
 		m = w->dram + ref;
 		memcpy_fromio(&mb, m, sizeof(mb));
-		dev_info(w->dev,
-			 "HIP4 q%u[%u]: ref 0x%x flag 0x%02x clas %u pid %u sig %u len %u\n",
-			 q, ridx, ref, mb.flag, mb.clas, mb.pid,
-			 le16_to_cpu(mb.sig_bufsz), le16_to_cpu(mb.len));
+		if (hip4_log)
+			dev_info(w->dev,
+				 "HIP4 q%u[%u]: ref 0x%x flag 0x%02x clas %u pid %u sig %u len %u\n",
+				 q, ridx, ref, mb.flag, mb.clas, mb.pid,
+				 le16_to_cpu(mb.sig_bufsz), le16_to_cpu(mb.len));
 
 		if (le16_to_cpu(mb.sig_bufsz) >= HIP4_SIG_RESERVED +
 						  sizeof(struct wlbt_fapi_hdr)) {
@@ -2055,12 +2085,15 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			memcpy_fromio(body, m + HIP4_MBULK_SIZE +
 				      HIP4_SIG_RESERVED + sizeof(hdr),
 				      len > sizeof(hdr) ? len - sizeof(hdr) : 0);
+			if (!hip4_log)
+				goto next;
 			print_hex_dump(KERN_INFO, "  body: ",
 				       DUMP_PREFIX_NONE, 16, 1, body,
 				       len > sizeof(hdr) ? len - sizeof(hdr) : 0,
 				       false);
 		}
 
+next:
 		/*
 		 * Hand every segment back so the peer can reuse it.  A
 		 * scatter/gather frame is a chain: the head carries the
@@ -2069,18 +2102,26 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 		 * or it walks into a segment it already recycled.
 		 */
 		chain[0] = ref;
-		for (n_chain = 1; n_chain < MBULK_MAX_CHAIN; n_chain++) {
+		n_chain = 1;
+		while (n_chain < MBULK_MAX_CHAIN && (mb.flag & MBULK_F_CHAIN)) {
 			struct wlbt_mbulk prev;
+			u32 next;
 
-			if (!(mb.flag & MBULK_F_CHAIN))
-				break;
 			memcpy_fromio(&prev, w->dram + chain[n_chain - 1],
 				      sizeof(prev));
-			chain[n_chain] = le32_to_cpu(prev.chain_next_offset);
-			if (chain[n_chain] >= w->mem_size - HIP4_SLOT_SIZE)
+			next = le32_to_cpu(prev.chain_next_offset);
+			/*
+			 * The link is only worth following once it is known to
+			 * name our buffers.  A last segment that still advertises
+			 * a successor usually terminates with zero, and passing
+			 * that on is what makes the peer assert when it drains
+			 * the queue of returned segments.
+			 */
+			if (!wlbt_hip4_ref_valid(w, next))
 				break;
-			memcpy_fromio(&mb, w->dram + chain[n_chain], sizeof(mb));
-			wlbt_hip4_show_segment(w, chain[n_chain], &mb);
+			memcpy_fromio(&mb, w->dram + next, sizeof(mb));
+			chain[n_chain++] = next;
+			wlbt_hip4_show_segment(w, next, &mb);
 		}
 		if (hip4_return)
 			for (i = 0; i < n_chain; i++)
@@ -2097,12 +2138,23 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 
 static void wlbt_hip4_drain(struct exynos_wlbt *w)
 {
+	unsigned long flags;
+
 	if (!w->hip4_control)
 		return;
 
+	/*
+	 * The queues are consumed by the mailbox interrupt and by hand from
+	 * debugfs, and no entry may be read twice: the peer marks a segment it
+	 * has been handed back as freed, so receiving the same one again is an
+	 * assertion on its side.  Holding the lock with interrupts off is what
+	 * keeps the two contexts off the same index.
+	 */
+	spin_lock_irqsave(&w->hip4_lock, flags);
 	wlbt_hip4_release(w);
 	wlbt_hip4_show(w, HIP4_Q_TH_CTL);
 	wlbt_hip4_show(w, HIP4_Q_TH_DAT);
+	spin_unlock_irqrestore(&w->hip4_lock, flags);
 }
 
 
@@ -2776,6 +2828,7 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 	const char *p, *q;
 	char *sep;
 	unsigned int id, val, n = 0, dn = 0;
+	unsigned long flags;
 	int ret, used = 0;
 
 	ret = simple_write_to_buffer(kbuf, sizeof(kbuf) - 1, ppos, buf, len);
@@ -2884,7 +2937,9 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 			ret = -EINVAL;
 			goto out;
 		}
+		spin_lock_irqsave(&w->hip4_lock, flags);
 		wlbt_hip4_push(w, HIP4_Q_TH_RFB, ref);
+		spin_unlock_irqrestore(&w->hip4_lock, flags);
 		dev_info(w->dev, "HIP4 returned segment 0x%x\n", ref);
 		ret = len;
 		goto out;
@@ -3377,6 +3432,8 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 		   firmware_name, w->fw_entry, w->fw_runtime_length,
 		   w->fw_loaded ? "loaded" : "not loaded");
 	seq_printf(s, "mailbox last status 0x%04x\n", w->last_mbox_status);
+	if (w->connect_reported)
+		seq_printf(s, "connect result 0x%04x\n", w->connect_status);
 	if (w->hip4_ref)
 		seq_printf(s, "hip4 0x%x control 0x%x mib 0x%x (%u bytes)\n",
 			   w->hip4_ref, w->hip4_control,
@@ -4324,6 +4381,7 @@ static int wlbt_probe(struct platform_device *pdev)
 	w->dev = &pdev->dev;
 	platform_set_drvdata(pdev, w);
 	mutex_init(&w->lock);
+	spin_lock_init(&w->hip4_lock);
 	init_completion(&w->cfg_ack);
 	w->state = WLBT_IN_RESET;
 
