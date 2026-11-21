@@ -366,6 +366,7 @@ struct wlbt_hip4_q {
  * the mirror image at +64.
  */
 #define HIP4_SLOT_SIZE			2048
+#define HIP4_SCRATCH_SLOTS		64
 #define HIP4_MBULK_SIZE			20
 #define HIP4_SIG_RESERVED		4	/* peer's own signal header */
 #define HIP4_MAX_SLOTS			512
@@ -630,7 +631,7 @@ struct exynos_wlbt {
 	u32 mxconf_offset;
 	u32 hip4_ref;			/* MIF-relative HIP4 shared region */
 	u32 hip4_control;
-	u32 hip4_scratch;		/* MIF-relative control block */
+	u32 hip4_scratch_seq;		/* rotates the reference segments */
 	bool hip4_started;		/* peer took the service start request */
 	struct wlbt_hip4_pool hip4_pool[2];
 	unsigned int n_hip4_tx;
@@ -1536,14 +1537,16 @@ static void wlbt_hip4_state(struct exynos_wlbt *w)
  */
 static u32 wlbt_hip4_scratch(struct exynos_wlbt *w)
 {
-	u32 ref = w->hip4_ref + HIP4_TX_DAT_SIZE - HIP4_SLOT_SIZE;
+	/*
+	 * The peer frees whatever the reference names, so each request gets its
+	 * own segment from the tail of the data pool rather than all of them
+	 * naming one buffer that is freed and then freed again.
+	 */
+	u32 slot = HIP4_DAT_SLOTS - 1 - w->hip4_scratch_seq % HIP4_SCRATCH_SLOTS;
+	u32 ref = w->hip4_ref + HIP4_TX_OFFSET + slot * HIP4_SLOT_SIZE;
 	struct wlbt_mbulk mb = { };
 	void *m = w->dram + ref;
 
-	if (w->hip4_scratch)
-		return ref;
-
-	w->hip4_scratch = ref;
 	mb.flag = MBULK_F_SIG | MBULK_F_OBOUND;
 	mb.clas = MBULK_CLASS_FROM_HOST_DAT;
 	mb.pid = MBULK_POOL_ID_DATA;
@@ -1551,11 +1554,12 @@ static u32 wlbt_hip4_scratch(struct exynos_wlbt *w)
 	mb.sig_bufsz = cpu_to_le16(ALIGN(HIP4_SIG_RESERVED +
 					 sizeof(struct wlbt_fapi_hdr), 4));
 	mb.head = mb.sig_bufsz;
+	memset_io(m, 0, HIP4_SLOT_SIZE);
 	memcpy_toio(m, &mb, sizeof(mb));
-	memset_io(m + HIP4_MBULK_SIZE, 0, HIP4_SLOT_SIZE - HIP4_MBULK_SIZE);
-	/* The descriptor and the cleared signal area must be in DRAM before
-	 * the peer is handed a reference to this segment. */
+	/* The descriptor must be in DRAM before the peer is handed the ref. */
 	wmb();
+
+	w->hip4_scratch_seq++;
 
 	return ref;
 }
