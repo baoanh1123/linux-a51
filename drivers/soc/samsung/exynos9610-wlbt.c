@@ -809,6 +809,14 @@ static bool post_channels = true;
 module_param(post_channels, bool, 0644);
 MODULE_PARM_DESC(post_channels, "Send the channel list after a connection");
 
+/*
+ * The vendor answers the connect only once the indication arrives; the confirm
+ * means the peer accepted the request, not that it has news for the host.
+ */
+static bool res_on_cfm;
+module_param(res_on_cfm, bool, 0644);
+MODULE_PARM_DESC(res_on_cfm, "Answer the connect on the confirm instead of the indication");
+
 static bool tx_ctl;
 module_param(tx_ctl, bool, 0644);
 MODULE_PARM_DESC(tx_ctl, "Send transmitted frames on the control queue");
@@ -3042,6 +3050,50 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 		goto out;
 	}
 
+	/*
+	 * "sendd" queues one unitdata request on the data queue whatever the
+	 * interface state is, so the peer can be asked whether it reads that
+	 * queue before a connection exists as well as after one.  The frame is a
+	 * real broadcast ARP request: if the peer does transmit it, it shows up
+	 * in a capture on the access point.
+	 */
+	if (!strcmp(cmd, "sendd")) {
+		static const u8 arp[42] = {
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0x8c, 0x77, 0x12, 0xaa, 0xbb, 0xcc,
+			0x08, 0x06,			/* ARP */
+			0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+			0x8c, 0x77, 0x12, 0xaa, 0xbb, 0xcc,
+			0xc0, 0xa8, 0x63, 0x02,		/* 192.168.99.2 */
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0xc0, 0xa8, 0x63, 0x01,		/* 192.168.99.1 */
+		};
+		u8 probe[sizeof(hdr) + 24];
+		struct wlbt_fapi_hdr dh = { };
+
+		dh.id = cpu_to_le16(0x1000);		/* MA_UNITDATA_REQ */
+		dh.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+		dh.fw_reference = cpu_to_le32(send_ref);
+		memcpy(probe, &dh, sizeof(dh));
+		put_unaligned_le16(1, probe + sizeof(dh) + 0);	/* vif */
+		put_unaligned_le16(w->host_tag++, probe + sizeof(dh) + 2);
+		put_unaligned_le16(FAPI_PRIORITY_CONTENTION,
+				   probe + sizeof(dh) + 4);
+		put_unaligned_le16(1, probe + sizeof(dh) + 6);	/* peer */
+		put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3,
+				   probe + sizeof(dh) + 8);
+
+		ret = wlbt_hip4_send(w, false, probe, sizeof(probe), arp,
+				     sizeof(arp));
+		dev_info(w->dev, "HIP4 data probe queued: %d\n", ret);
+		if (ret)
+			goto out;
+		msleep(1500);
+		wlbt_hip4_drain(w);
+		ret = len;
+		goto out;
+	}
+
 	/* Ring the from-host interrupt again without queueing anything. */
 	if (!strcmp(cmd, "kick")) {
 		writel(BIT(WLBT_BIT_HIP4_FROM_HOST), w->mbox + MBOX_INTGR1);
@@ -4497,7 +4549,7 @@ static void wlbt_peer_work(struct work_struct *work)
 	w->peer_disconnected_ind = false;
 	spin_unlock_irqrestore(&w->hip4_lock, flags);
 
-	if ((cfm || cind) && !w->connect_res_sent && post_res) {
+	if ((cind || (cfm && res_on_cfm)) && !w->connect_res_sent && post_res) {
 		wlbt_mlme_connect_res(w);
 		w->connect_res_sent = true;
 	}
