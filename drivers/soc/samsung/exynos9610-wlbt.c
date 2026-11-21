@@ -696,6 +696,50 @@ static bool load_mib = true;
 module_param(load_mib, bool, 0644);
 MODULE_PARM_DESC(load_mib, "Hand the peer its hardware configuration files (MIB)");
 
+/*
+ * The peer calibrates its PHY against the chip revision the host reports, and
+ * the vendor passes the value from the chipid block (mxman.c:1095).  The
+ * register lives at 0x10000000 with the revision in bits 23:16 for this
+ * family (drv_data_exynos9 in the vendor chipid driver).
+ */
+#define WLBT_CHIPID_PHYS	0x10000000
+#define WLBT_CHIPID_REV		0x10
+
+static int soc_rev = -1;
+module_param(soc_rev, int, 0644);
+MODULE_PARM_DESC(soc_rev, "SoC revision reported to the peer (-1 reads the chipid block)");
+
+static u32 wlbt_soc_revision(struct exynos_wlbt *w)
+{
+	void __iomem *id;
+	u32 val;
+
+	if (soc_rev >= 0)
+		return soc_rev;
+
+	id = ioremap(WLBT_CHIPID_PHYS, 0x100);
+	if (!id)
+		return 0;
+	val = readl(id + WLBT_CHIPID_REV);
+	iounmap(id);
+	dev_info(w->dev, "SoC revision 0x%02x (chipid 0x%08x)\n",
+		 (val >> 16) & 0xff, val);
+
+	/*
+	 * The vendor packs it as (main_rev << 4) | sub_rev out of bits 23:16
+	 * (exynos-chipid.c:167, drv_data_exynos9).
+	 */
+	return ((val >> 16) & 0xff);
+}
+
+static unsigned int mib_slice_max = 1024;
+module_param(mib_slice_max, uint, 0644);
+MODULE_PARM_DESC(mib_slice_max, "Largest MIB batch handed over in one signal");
+
+static bool mib_early;
+module_param(mib_early, bool, 0644);
+MODULE_PARM_DESC(mib_early, "Download the MIB entries before the WLAN start request");
+
 static char *trace_boot;
 module_param(trace_boot, charp, 0444);
 MODULE_PARM_DESC(trace_boot, "Sample one peer word from the moment the firmware boots: <hex offset>:<hex field>:<microseconds>");
@@ -1484,6 +1528,131 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	return 0;
 }
 
+/*
+ * The radio parameters live in the peer's MIB database, not in the buffers
+ * above: service start only tells it where the hardware configuration files
+ * are.  slsi_start() follows the service start with one MLME_SET_REQ per
+ * slice of those files, leaving out the entries the firmware owns (PSID bit
+ * 15) and keeping every signal inside the hostio limit (mgt.c:1679-1712).
+ * A confirm carrying data means the peer rejected those PSIDs.
+ */
+#define FAPI_MLME_SET_REQ	0x2002
+#define MIB_PSID_FW_ONLY	0x8000
+#define MIB_SLICE_MAX		1800
+
+static void wlbt_mib_send_slice(struct exynos_wlbt *w, const u8 *mib,
+				size_t len)
+{
+	struct wlbt_fapi_hdr hdr = { };
+	u8 *buf;
+	int ret;
+
+	buf = kmalloc(sizeof(hdr) + 14 + len, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SET_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(buf, &hdr, sizeof(hdr));
+	memset(buf + sizeof(hdr), 0, 14);	/* vif and three spares */
+	memcpy(buf + sizeof(hdr) + 14, mib, len);
+
+	ret = wlbt_hip4_send(w, true, buf, sizeof(hdr) + 14 + len, NULL, 0);
+	if (ret)
+		dev_err(w->dev, "MIB slice of %zu bytes rejected: %d\n",
+			len, ret);
+	kfree(buf);
+
+	/*
+	 * The peer applies a slice asynchronously, so give it room to finish
+	 * and to hand the segment back before the next one is queued: the
+	 * vendor waits for the MLME_SET confirm here (mgt.c:1701).
+	 */
+	msleep(100);
+	wlbt_hip4_drain(w);
+}
+
+/*
+ * Walk the entry stream {u16 id, u16 len, data[len]} (padded to even) and hand
+ * it over in slices the peer can take in one signal.
+ */
+static int wlbt_download_mibs(struct exynos_wlbt *w)
+{
+	static const char *const names[] = {
+		"mx140/mx140_wlan.hcf",
+		"mx140/mx140_wlan_sw.hcf",
+	};
+	unsigned int slices = 0, entries = 0, skipped = 0;
+	u8 *slice;
+	size_t slice_len = 0;
+	unsigned int i;
+
+	if (mib_slice_max > MIB_SLICE_MAX)
+		mib_slice_max = MIB_SLICE_MAX;
+	slice = kmalloc(MIB_SLICE_MAX, GFP_KERNEL);
+	if (!slice)
+		return -ENOMEM;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		const struct firmware *fw;
+		size_t off, skip;
+
+		if (request_firmware(&fw, names[i], w->dev)) {
+			dev_warn(w->dev, "MIB %s not available\n", names[i]);
+			continue;
+		}
+
+		skip = 0;
+		if (fw->size > MIB_PROLOGUE_SIZE &&
+		    get_unaligned_le16(fw->data + 6) == MIB_PROLOGUE_MARKER)
+			skip = MIB_PROLOGUE_SIZE;
+
+		for (off = skip; off + 4 <= fw->size;) {
+			u16 psid = get_unaligned_le16(fw->data + off);
+			size_t len = 4 + get_unaligned_le16(fw->data + off + 2);
+			size_t padded = ALIGN(len, 2);
+
+			if (off + padded > fw->size)
+				break;
+
+			if (psid & MIB_PSID_FW_ONLY) {
+				skipped++;
+				off += padded;
+				continue;
+			}
+
+			if (slice_len + padded > mib_slice_max) {
+				wlbt_mib_send_slice(w, slice, slice_len);
+				slices++;
+				slice_len = 0;
+			}
+
+			memcpy(slice + slice_len, fw->data + off, padded);
+			slice_len += padded;
+			entries++;
+			off += padded;
+		}
+
+		release_firmware(fw);
+
+		/* Each file ends its own slice, as the vendor does per file. */
+		if (slice_len) {
+			dev_info(w->dev, "MIB slice %u: %zu bytes\n",
+				 slices, slice_len);
+			wlbt_mib_send_slice(w, slice, slice_len);
+			slices++;
+			slice_len = 0;
+		}
+	}
+
+	kfree(slice);
+	dev_info(w->dev,
+		 "MIB download: %u entries (%u firmware owned) in %u slices\n",
+		 entries, skipped, slices);
+
+	return 0;
+}
+
 /* Take back the host segments the peer has finished with. */
 static void wlbt_hip4_release(struct exynos_wlbt *w)
 {
@@ -1884,7 +2053,7 @@ static int wlbt_build_mxconf(struct exynos_wlbt *w)
 	conf->version_major = MXCONF_VERSION_MAJOR;
 	conf->version_minor = MXCONF_VERSION_MINOR;
 	conf->flags = 0;
-	conf->soc_revision = 0;
+	conf->soc_revision = wlbt_soc_revision(w);
 
 	wlbt_stream_serialise(&w->mgmt_in, &conf->trans.to_ap);
 	wlbt_stream_serialise(&w->mgmt_out, &conf->trans.from_ap);
@@ -2203,6 +2372,13 @@ static ssize_t wlbt_debugfs_wlan(struct file *file, const char __user *buf,
 		return ret;
 	}
 
+	/* The vendor fills the peer's MIB database between opening the service
+	 * and starting it (mgt.c:800-870), so the entries are in place before
+	 * the WLAN driver there runs its own start.
+	 */
+	if (mib_early)
+		wlbt_download_mibs(w);
+
 	frame[0] = MMTRANS_CHAN_ID_SERVICE_MANAGEMENT;
 	frame[1] = WLBT_SERVICE_ID_WLAN;
 	frame[2] = WLBT_SM_MSG_START_REQ;
@@ -2241,8 +2417,8 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 {
 	struct exynos_wlbt *w = file->private_data;
 	struct wlbt_fapi_hdr hdr = { };
-	u8 sig[sizeof(hdr) + 256];
-	char kbuf[768];
+	u8 sig[sizeof(hdr) + 2048];
+	char kbuf[4608];
 	char cmd[16];
 	const char *p;
 	unsigned int id, val, n = 0;
@@ -2264,6 +2440,20 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 	}
 
 	if (!strcmp(cmd, "drain")) {
+		wlbt_hip4_drain(w);
+		ret = len;
+		goto out;
+	}
+
+	if (!strcmp(cmd, "mibs")) {
+		if (!w->hip4_started) {
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = wlbt_download_mibs(w);
+		if (ret < 0)
+			goto out;
+		msleep(200);
 		wlbt_hip4_drain(w);
 		ret = len;
 		goto out;
@@ -2538,7 +2728,10 @@ static void wlbt_dram_find(struct exynos_wlbt *w)
 	if (!w->dram || !w->find_len)
 		return;
 
-	limit = min_t(u32, w->fw_runtime_length, w->mem_size);
+	/* The peer allocates from the MIF heap above its runtime image, so the
+	 * whole window has to be searched, not only the loaded image.
+	 */
+	limit = w->mem_size;
 	buf = kzalloc(WLBT_FIND_CHUNK * 4, GFP_KERNEL);
 	if (!buf)
 		return;
