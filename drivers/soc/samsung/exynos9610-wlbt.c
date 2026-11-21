@@ -736,6 +736,10 @@ static unsigned int mib_slice_max = 1024;
 module_param(mib_slice_max, uint, 0644);
 MODULE_PARM_DESC(mib_slice_max, "Largest MIB batch handed over in one signal");
 
+static unsigned int send_ref;
+module_param(send_ref, uint, 0644);
+MODULE_PARM_DESC(send_ref, "fw_reference to put in signals sent from the hip4 node");
+
 static bool mib_early;
 module_param(mib_early, bool, 0644);
 MODULE_PARM_DESC(mib_early, "Download the MIB entries before the WLAN start request");
@@ -2503,6 +2507,7 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 
 	hdr.id = cpu_to_le16(id);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	hdr.fw_reference = cpu_to_le32(send_ref);
 	memcpy(sig, &hdr, sizeof(hdr));
 
 	ret = wlbt_hip4_send(w, true, sig, sizeof(hdr) + n, NULL, 0);
