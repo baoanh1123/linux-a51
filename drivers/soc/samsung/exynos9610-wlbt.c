@@ -1607,7 +1607,8 @@ static int wlbt_mlme_add_scan(struct exynos_wlbt *w, u16 scan_id)
  * but a signal header, has one reference on it, and sits in the last data slot
  * so the ordinary allocator never hands it out.
  */
-static u32 wlbt_hip4_scratch(struct exynos_wlbt *w)
+static u32 wlbt_hip4_scratch(struct exynos_wlbt *w, const void *data,
+			     size_t data_len)
 {
 	/*
 	 * The peer frees whatever the reference names, so each request gets its
@@ -1634,8 +1635,22 @@ static u32 wlbt_hip4_scratch(struct exynos_wlbt *w)
 		mb.sig_bufsz = cpu_to_le16(ALIGN(HIP4_SIG_RESERVED +
 						 sizeof(struct wlbt_fapi_hdr), 4));
 		mb.head = mb.sig_bufsz;
+		/*
+		 * The peer parses this segment: it reads a length and walks the
+		 * contents, and a segment with no data parses to nothing, which
+		 * it rejects.  Carry the payload the request carries so there is
+		 * something to walk.
+		 */
+		if (data_len && data_len <= HIP4_SLOT_SIZE - HIP4_SIG_RESERVED -
+						 sizeof(struct wlbt_fapi_hdr)) {
+			mb.len = cpu_to_le16(data_len);
+			mb.dat_bufsz = cpu_to_le16(data_len);
+		}
 		memset_io(m, 0, HIP4_SLOT_SIZE);
 		memcpy_toio(m, &mb, sizeof(mb));
+		if (le16_to_cpu(mb.len))
+			memcpy_toio(m + HIP4_MBULK_SIZE + le16_to_cpu(mb.head),
+				    data, data_len);
 	}
 	/* The descriptor must be in DRAM before the peer is handed the ref. */
 	wmb();
@@ -1693,7 +1708,7 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 		 * segment with a live reference count, not the frame the signal
 		 * travels in - freeing that one leaves the frame double freed.
 		 */
-		__le32 self = cpu_to_le32(wlbt_hip4_scratch(w));
+		__le32 self = cpu_to_le32(wlbt_hip4_scratch(w, data, data_len));
 
 		memcpy_toio(m + HIP4_MBULK_SIZE + HIP4_SIG_RESERVED +
 			    offsetof(struct wlbt_fapi_hdr, fw_reference),
