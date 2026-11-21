@@ -393,6 +393,7 @@ struct wlbt_hip4_q {
 
 /* FAPI signals name this side as the sender (mlme.c:3545). */
 #define FAPI_SENDER_PID			0xc001
+#define FAPI_MLME_ADD_SCAN_REQ		0x2005
 
 struct wlbt_mbulk {
 	__le32 next_offset;
@@ -1535,6 +1536,73 @@ static void wlbt_hip4_state(struct exynos_wlbt *w)
 }
 
 /*
+ * The peer's scan validator rejects a request whose scan id is below 0x100
+ * when the sender id carries the 0xc000 bits, which ours does, so scan ids
+ * start at 0x100 and the upper byte names the interface - the same encoding
+ * the vendor driver uses.  The information elements travel as payload: a
+ * wildcard SSID, the scan timing element and the channel list, in that order.
+ */
+static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
+			  size_t sig_len, const void *data, size_t data_len);
+
+static int wlbt_mlme_add_scan(struct exynos_wlbt *w, u16 scan_id)
+{
+	static const u8 scan_mac[6] = { 0x8c, 0x77, 0x12, 0xaa, 0xbb, 0xcc };
+	static const u16 channels[] = { 2412, 2437, 2462 };
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 26];
+	u8 dat[2 + 19 + 7 + 3 * ARRAY_SIZE(channels)];
+	struct wlbt_fapi_hdr hdr = { };
+	unsigned int i, n = 0;
+	u8 *c;
+
+	/* Body: interface 0 for a scan, because a scan is not tied to a vif. */
+	put_unaligned_le16(0, sig + sizeof(hdr) + 0);
+	put_unaligned_le16(scan_id, sig + sizeof(hdr) + 2);
+	put_unaligned_le16(2, sig + sizeof(hdr) + 4);	/* full scan */
+	memcpy(sig + sizeof(hdr) + 6, scan_mac, sizeof(scan_mac));
+	put_unaligned_le16(4, sig + sizeof(hdr) + 12);	/* real time results */
+	memset(sig + sizeof(hdr) + 14, 0, 12);
+
+	/* Wildcard SSID: a broadcast scan always carries one. */
+	dat[n++] = 0;
+	dat[n++] = 0;
+
+	/* Scan timing element, 19 bytes, body left at zero for a plain scan. */
+	dat[n++] = 0xdd;
+	dat[n++] = 0x11;
+	dat[n++] = 0x00;
+	dat[n++] = 0x16;
+	dat[n++] = 0x32;
+	dat[n++] = 0x01;
+	dat[n++] = 0x01;
+	memset(dat + n, 0, 12);
+	n += 12;
+
+	/* Channel list: the length byte starts at five and grows by three. */
+	c = dat + n;
+	c[0] = 0xdd;
+	c[1] = 5;
+	c[2] = 0x00;
+	c[3] = 0x16;
+	c[4] = 0x32;
+	c[5] = 0x01;
+	c[6] = 0x02;
+	n += 7;
+	for (i = 0; i < ARRAY_SIZE(channels); i++) {
+		put_unaligned_le16(channels[i] * 2, dat + n);
+		dat[n + 2] = 0;			/* active */
+		n += 3;
+		c[1] += 3;
+	}
+
+	hdr.id = cpu_to_le16(FAPI_MLME_ADD_SCAN_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 26, dat, n);
+}
+
+/*
  * A throwaway segment for the firmware reference to name.  It carries nothing
  * but a signal header, has one reference on it, and sits in the last data slot
  * so the ordinary allocator never hands it out.
@@ -2529,9 +2597,13 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 {
 	struct exynos_wlbt *w = file->private_data;
 	struct wlbt_fapi_hdr hdr = { };
-	u8 sig[sizeof(hdr) + 2048];
-	u8 dat[1024];
-	char kbuf[4608];
+	/*
+	 * Static because w->lock serialises this handler and the buffers are
+	 * too big for the stack.
+	 */
+	static u8 sig[sizeof(hdr) + 2048];
+	static u8 dat[1024];
+	static char kbuf[4608];
 	char cmd[16];
 	const char *p, *q;
 	char *sep;
@@ -2560,6 +2632,21 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 	}
 
 	if (!strcmp(cmd, "drain")) {
+		wlbt_hip4_drain(w);
+		ret = len;
+		goto out;
+	}
+
+	if (!strcmp(cmd, "scan")) {
+		if (!w->hip4_started) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		ret = wlbt_mlme_add_scan(w, 0x0100);
+		if (ret)
+			goto out;
+		msleep(500);
 		wlbt_hip4_drain(w);
 		ret = len;
 		goto out;
@@ -2660,7 +2747,7 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 
 	ret = wlbt_hip4_send(w, true, sig, sizeof(hdr) + n,
 			     dn ? dat : NULL, dn);
-	dev_info(w->dev, "HIP4 signal 0x%04x (%zu byte signal, %zu data): %d\n",
+	dev_info(w->dev, "HIP4 signal 0x%04x (%zu byte signal, %u data): %d\n",
 		 id, sizeof(hdr) + n, dn, ret);
 	if (ret)
 		goto out;
