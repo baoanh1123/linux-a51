@@ -405,6 +405,11 @@ struct wlbt_hip4_q {
 #define FAPI_MLME_CONNECT_RES		0x2200
 #define FAPI_MLME_CONNECTED_RES		0x2201
 #define FAPI_MLME_SET_ACL_REQ		0x2016
+#define FAPI_MA_UNITDATA_REQ		0x1000
+#define FAPI_MA_UNITDATA_IND		0x1300
+#define FAPI_PRIORITY_CONTENTION	0x8000
+/* The data the peer carries for a station is ethernet, not 802.11. */
+#define FAPI_DATAUNIT_IEEE802_3		0x0001
 #define FAPI_MLME_SET_CACHED_CHANNELS	0x201f
 
 /* Channels offered to the peer once a connection is up. */
@@ -694,6 +699,8 @@ struct exynos_wlbt {
 	 * the work item because the reply has to be sent outside the queue
 	 * lock and cfg80211 cannot be called from the interrupt.
 	 */
+	bool connected;			/* cfg80211 was told the link is up */
+	u16 host_tag;			/* names each transmitted frame */
 	bool peer_connect_cfm;		/* the peer took the join request */
 	bool connect_res_sent;
 	bool peer_connect_ind;
@@ -715,6 +722,7 @@ struct exynos_wlbt {
 	unsigned int n_cfg_bad;
 	unsigned int n_wdog;
 	unsigned int n_tx_dropped;
+	unsigned int n_tx_calls;
 	unsigned int n_mbox;
 	u32 last_mbox_status;
 	u32 peek_offset;		/* MIF-relative, set by debugfs write */
@@ -765,6 +773,23 @@ MODULE_PARM_DESC(hip4_return, "Hand received HIP4 segments back to the peer");
  * a frame by frame trace is only printed when it is asked for: at a few hundred
  * frames the console time alone is enough to lose the mailbox interrupts.
  */
+/*
+ * Data frames are sent on the data queue, which is what the class in the bulk
+ * header says; the control queue is an experiment because the peer does not
+ * consume the data queue yet.
+ */
+static bool post_acl = true;
+module_param(post_acl, bool, 0644);
+MODULE_PARM_DESC(post_acl, "Send the access list after a connection");
+
+static bool post_channels = true;
+module_param(post_channels, bool, 0644);
+MODULE_PARM_DESC(post_channels, "Send the channel list after a connection");
+
+static bool tx_ctl;
+module_param(tx_ctl, bool, 0644);
+MODULE_PARM_DESC(tx_ctl, "Send transmitted frames on the control queue");
+
 static bool hip4_log;
 module_param(hip4_log, bool, 0644);
 MODULE_PARM_DESC(hip4_log, "Record every received HIP4 frame for debugfs frames");
@@ -2066,6 +2091,32 @@ static void wlbt_hip4_show_segment(struct exynos_wlbt *w, u32 ref,
 	(void)ref;
 }
 
+/*
+ * A received frame arrives as a unitdata indication whose payload is already an
+ * ethernet frame.  It is copied into an skb and handed to the stack; nothing
+ * else is needed because the peer did the 802.11 part.
+ */
+static void wlbt_rx_frame(struct exynos_wlbt *w, const void *data, size_t len)
+{
+	struct sk_buff *skb;
+
+	if (len < ETH_HLEN || len > 4096)
+		return;
+
+	skb = netdev_alloc_skb_ip_align(w->netdev, len);
+	if (!skb) {
+		w->n_tx_dropped++;
+		return;
+	}
+
+	memcpy_fromio(skb_put(skb, len), data, len);
+	skb->protocol = eth_type_trans(skb, w->netdev);
+	skb->ip_summed = CHECKSUM_NONE;
+	w->netdev->stats.rx_packets++;
+	w->netdev->stats.rx_bytes += len;
+	netif_rx(skb);
+}
+
 static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 {
 	u8 *scb = wlbt_hip4_scb(w);
@@ -2109,6 +2160,20 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 				 le16_to_cpu(hdr.receiver_pid),
 				 le16_to_cpu(hdr.sender_pid),
 				 le32_to_cpu(hdr.fw_reference));
+
+			/*
+			 * MA_UNITDATA_IND carries a received frame: the payload
+			 * starts after the bulk header and runs for the length
+			 * the segment records.
+			 */
+			if (le16_to_cpu(hdr.id) == FAPI_MA_UNITDATA_IND) {
+				size_t dlen = le16_to_cpu(mb.len);
+				u16 off = le16_to_cpu(mb.head);
+
+				if (dlen && dlen <= HIP4_SLOT_SIZE - HIP4_MBULK_SIZE - off)
+					wlbt_rx_frame(w, m + HIP4_MBULK_SIZE + off,
+						      dlen);
+			}
 
 			/*
 			 * MLME_CONNECT_CFM is the peer saying it took the join
@@ -3511,6 +3576,10 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 	seq_printf(s, "mailbox last status 0x%04x\n", w->last_mbox_status);
 	if (w->connect_reported)
 		seq_printf(s, "connect result 0x%04x\n", w->connect_status);
+	seq_printf(s, "link %s, tx %lu called %u dropped %u, hip4 tx %u rx %u\n",
+		   w->connected ? "up" : "down",
+		   w->netdev ? w->netdev->stats.tx_packets : 0UL,
+		   w->n_tx_calls, w->n_tx_dropped, w->n_hip4_tx, w->n_hip4_rx);
 	if (w->hip4_ref)
 		seq_printf(s, "hip4 0x%x control 0x%x mib 0x%x (%u bytes)\n",
 			   w->hip4_ref, w->hip4_control,
@@ -3763,6 +3832,20 @@ static struct ieee80211_supported_band wlbt_band_2ghz = {
 static struct exynos_wlbt *wlbt_from_wiphy(struct wiphy *wiphy)
 {
 	return *(struct exynos_wlbt **)wiphy_priv(wiphy);
+}
+
+/*
+ * The private area of the net device is its wireless_dev, so the driver data is
+ * reached through the wiphy and not by casting that area.
+ */
+static struct exynos_wlbt *wlbt_from_netdev(struct net_device *ndev)
+{
+	struct wireless_dev *wdev = netdev_priv(ndev);
+
+	if (!wdev || !wdev->wiphy)
+		return NULL;
+
+	return wlbt_from_wiphy(wdev->wiphy);
 }
 
 /*
@@ -4205,6 +4288,23 @@ static int wlbt_mlme_set_cached_channels(struct exynos_wlbt *w)
 	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 14, dat, n);
 }
 
+/*
+ * MLME_SET_PACKET_FILTER with no patterns.  The vendor sends this on connect for
+ * an open network, and the peer appears to need it before it will carry frames.
+ */
+static int wlbt_mlme_set_packet_filter(struct exynos_wlbt *w)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	hdr.id = cpu_to_le16(0x2014);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+	put_unaligned_le16(1, sig + sizeof(hdr));	/* vif 1 */
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+}
+
 /* MLME_SET_ACL with no entries: the station accepts its peer and nothing else. */
 static int wlbt_mlme_set_acl(struct exynos_wlbt *w)
 {
@@ -4321,10 +4421,17 @@ static void wlbt_peer_work(struct work_struct *work)
 		 * later, if at all, so waiting for it means the supplicant has
 		 * already given up.
 		 */
-		wlbt_mlme_set_acl(w);
-		msleep(20);
-		wlbt_mlme_set_cached_channels(w);
+		if (post_acl) {
+			wlbt_mlme_set_packet_filter(w);
+			msleep(20);
+			wlbt_mlme_set_acl(w);
+		}
+		if (post_channels) {
+			msleep(20);
+			wlbt_mlme_set_cached_channels(w);
+		}
 
+		w->connected = true;
 		if (w->connecting) {
 			w->connecting = false;
 			netif_carrier_on(w->netdev);
@@ -4342,6 +4449,7 @@ static void wlbt_peer_work(struct work_struct *work)
 	}
 
 	if (disc) {
+		w->connected = false;
 		netif_carrier_off(w->netdev);
 		dev_info(w->dev, "connect: peer lost the link, reason %u\n",
 			 reason);
@@ -4545,7 +4653,17 @@ static const struct cfg80211_ops wlbt_cfg80211_ops = {
  */
 static int wlbt_net_open(struct net_device *ndev)
 {
-	netif_carrier_off(ndev);
+	struct exynos_wlbt *w = wlbt_from_netdev(ndev);
+
+	/*
+	 * The interface is usually brought up before the join, but it can also be
+	 * cycled afterwards, and the carrier then reflects the link that already
+	 * exists rather than being cleared.
+	 */
+	if (w->connected)
+		netif_carrier_on(ndev);
+	else
+		netif_carrier_off(ndev);
 	netif_start_queue(ndev);
 	return 0;
 }
@@ -4557,12 +4675,45 @@ static int wlbt_net_stop(struct net_device *ndev)
 	return 0;
 }
 
+/*
+ * The peer takes ethernet frames and does the 802.11 conversion itself, so a
+ * transmit is the frame handed over on the data queue with a MA_UNITDATA_REQ in
+ * front of it.  The body names the interface, a tag the confirm echoes, the
+ * contention priority and the peer, and says the payload is an 802.3 frame.
+ */
 static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
-	struct exynos_wlbt *w = *(struct exynos_wlbt **)netdev_priv(ndev);
+	struct exynos_wlbt *w = wlbt_from_netdev(ndev);
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 24] = { };
+	struct wlbt_fapi_hdr hdr = { };
+	int ret;
+
+	if (!w->hip4_control || !w->connected || skb->len < ETH_HLEN) {
+		dev_kfree_skb(skb);
+		w->n_tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+
+	hdr.id = cpu_to_le16(FAPI_MA_UNITDATA_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif 1 */
+	put_unaligned_le16(w->host_tag++, sig + sizeof(hdr) + 2);
+	put_unaligned_le16(FAPI_PRIORITY_CONTENTION, sig + sizeof(hdr) + 4);
+	put_unaligned_le16(1, sig + sizeof(hdr) + 6);		/* peer index */
+	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3, sig + sizeof(hdr) + 8);
+
+	w->n_tx_calls++;
+	ret = wlbt_hip4_send(w, tx_ctl, sig, sizeof(sig), skb->data, skb->len);
+	if (ret) {
+		w->n_tx_dropped++;
+		dev_info_ratelimited(w->dev, "tx: send failed: %d\n", ret);
+	} else {
+		ndev->stats.tx_packets++;
+		ndev->stats.tx_bytes += skb->len;
+	}
 
 	dev_kfree_skb(skb);
-	w->n_tx_dropped++;
 	return NETDEV_TX_OK;
 }
 
