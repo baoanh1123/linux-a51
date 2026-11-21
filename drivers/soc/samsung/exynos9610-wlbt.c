@@ -778,6 +778,14 @@ MODULE_PARM_DESC(hip4_return, "Hand received HIP4 segments back to the peer");
  * header says; the control queue is an experiment because the peer does not
  * consume the data queue yet.
  */
+static bool post_res = true;
+module_param(post_res, bool, 0644);
+MODULE_PARM_DESC(post_res, "Answer the join indication with MLME_CONNECT_RES");
+
+static bool post_connected = true;
+module_param(post_connected, bool, 0644);
+MODULE_PARM_DESC(post_connected, "Also answer with MLME_CONNECTED_RES and aid 1");
+
 static bool post_acl = true;
 module_param(post_acl, bool, 0644);
 MODULE_PARM_DESC(post_acl, "Send the access list after a connection");
@@ -4399,10 +4407,17 @@ static void wlbt_peer_work(struct work_struct *work)
 	w->peer_disconnected_ind = false;
 	spin_unlock_irqrestore(&w->hip4_lock, flags);
 
-	if ((cfm || cind) && !w->connect_res_sent) {
+	if ((cfm || cind) && !w->connect_res_sent && post_res) {
 		wlbt_mlme_connect_res(w);
 		w->connect_res_sent = true;
 	}
+
+	/* The peer never sends MLME_CONNECTED_IND, so the completion it would
+	 * carry is sent unsolicited to see whether that is what its request
+	 * processing is waiting for.
+	 */
+	if (cind && !status && post_connected)
+		wlbt_mlme_connected_res(w, 1);
 
 	if (cind) {
 		if (status) {
@@ -4684,7 +4699,7 @@ static int wlbt_net_stop(struct net_device *ndev)
 static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct exynos_wlbt *w = wlbt_from_netdev(ndev);
-	u8 sig[sizeof(struct wlbt_fapi_hdr) + 24] = { };
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 26] = { };
 	struct wlbt_fapi_hdr hdr = { };
 	int ret;
 
@@ -4697,11 +4712,18 @@ static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 	hdr.id = cpu_to_le16(FAPI_MA_UNITDATA_REQ);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
 	memcpy(sig, &hdr, sizeof(hdr));
-	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif 1 */
-	put_unaligned_le16(w->host_tag++, sig + sizeof(hdr) + 2);
-	put_unaligned_le16(FAPI_PRIORITY_CONTENTION, sig + sizeof(hdr) + 4);
-	put_unaligned_le16(1, sig + sizeof(hdr) + 6);		/* peer index */
-	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3, sig + sizeof(hdr) + 8);
+	/*
+	 * The interface is named twice: once in the header, and once as the first
+	 * word of the body the unitdata request carries.  Missing the second one
+	 * shifts every field after it, and the peer then reads a frame descriptor
+	 * of zero and quietly drops the frame.
+	 */
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* header vif */
+	put_unaligned_le16(1, sig + sizeof(hdr) + 2);		/* body vif */
+	put_unaligned_le16(w->host_tag++, sig + sizeof(hdr) + 4);
+	put_unaligned_le16(FAPI_PRIORITY_CONTENTION, sig + sizeof(hdr) + 6);
+	put_unaligned_le16(1, sig + sizeof(hdr) + 8);		/* peer index */
+	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3, sig + sizeof(hdr) + 10);
 
 	w->n_tx_calls++;
 	ret = wlbt_hip4_send(w, tx_ctl, sig, sizeof(sig), skb->data, skb->len);
