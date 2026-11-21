@@ -259,6 +259,15 @@
 #define WLBT_FRAME_RING			32
 #define WLBT_FRAME_DATA			64
 
+/*
+ * The peer reports its own faults as a DEBUG_FAULT_IND (0x8302) with the
+ * offending id and a DEBUG_WORD12IND (0x8301) carrying twelve words of context
+ * right behind it.  They are rare, so they get their own ring and survive the
+ * frame ring being recycled.
+ */
+#define WLBT_FAULT_RING			16
+#define WLBT_FAULT_DATA			28
+
 #define HIP4_Q_NUM			6
 #define HIP4_Q_LEN			256
 #define HIP4_Q_IDX_SIZE			1
@@ -679,6 +688,12 @@ struct exynos_wlbt {
 	} frames[WLBT_FRAME_RING];
 	unsigned int frame_next;
 	unsigned int frame_total;
+	struct {
+		u16 id;
+		u8 len;
+		u8 data[WLBT_FAULT_DATA];
+	} faults[WLBT_FAULT_RING];
+	unsigned int fault_next;
 	bool hip4_started;		/* peer took the service start request */
 	struct wlbt_hip4_pool hip4_pool[2];
 	unsigned int n_hip4_tx;
@@ -2064,6 +2079,19 @@ static void wlbt_hip4_release(struct exynos_wlbt *w)
 	}
 }
 
+static void wlbt_fault_record(struct exynos_wlbt *w, u16 id, const u8 *data,
+			      size_t len)
+{
+	unsigned int slot = w->fault_next & (WLBT_FAULT_RING - 1);
+
+	if (len > WLBT_FAULT_DATA)
+		len = WLBT_FAULT_DATA;
+	w->faults[slot].id = id;
+	w->faults[slot].len = len;
+	memcpy(w->faults[slot].data, data, len);
+	w->fault_next++;
+}
+
 static void wlbt_frame_record(struct exynos_wlbt *w, u32 ref, u8 flag, u16 id,
 			      const void *data, size_t len)
 {
@@ -2237,6 +2265,12 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			 * The peer's own log frames would fill the ring on their
 			 * own, and it is the requests and indications that matter.
 			 */
+			if (le16_to_cpu(hdr.id) == 0x8301 ||
+			    le16_to_cpu(hdr.id) == 0x8302)
+				wlbt_fault_record(w, le16_to_cpu(hdr.id), body,
+						  len > sizeof(hdr) ?
+						  len - sizeof(hdr) : 0);
+
 			if (hip4_log && le16_to_cpu(hdr.id) != 0x8301)
 				wlbt_frame_record(w, ref, mb.flag,
 						  le16_to_cpu(hdr.id), body,
@@ -3008,6 +3042,13 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 		goto out;
 	}
 
+	/* Ring the from-host interrupt again without queueing anything. */
+	if (!strcmp(cmd, "kick")) {
+		writel(BIT(WLBT_BIT_HIP4_FROM_HOST), w->mbox + MBOX_INTGR1);
+		ret = len;
+		goto out;
+	}
+
 	if (!strcmp(cmd, "scan")) {
 		if (!w->hip4_started) {
 			ret = -EINVAL;
@@ -3707,6 +3748,44 @@ static const struct file_operations wlbt_frames_fops = {
 	.release = single_release,
 };
 
+static int wlbt_faults_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+	unsigned int i, n;
+
+	if (!w->fault_next) {
+		seq_puts(s, "no fault reports\n");
+		return 0;
+	}
+
+	n = min_t(unsigned int, w->fault_next, WLBT_FAULT_RING);
+	seq_printf(s, "%u report(s), last %u kept\n", w->fault_next, n);
+	for (i = 0; i < n; i++) {
+		unsigned int slot = (w->fault_next - n + i) &
+				    (WLBT_FAULT_RING - 1);
+
+		seq_printf(s, "id 0x%04x len %u\n", w->faults[slot].id,
+			   w->faults[slot].len);
+		seq_hex_dump(s, "  ", DUMP_PREFIX_NONE, 28, 1,
+			     w->faults[slot].data, w->faults[slot].len, false);
+	}
+
+	return 0;
+}
+
+static int wlbt_faults_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_faults_show, inode->i_private);
+}
+
+static const struct file_operations wlbt_faults_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_faults_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static void wlbt_debugfs_init(struct exynos_wlbt *w)
 {
 	w->debugfs = debugfs_create_dir("exynos9610-wlbt", NULL);
@@ -3727,6 +3806,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("find", 0600, w->debugfs, w, &wlbt_find_fops);
 	debugfs_create_file("bss", 0400, w->debugfs, w, &wlbt_bss_fops);
 	debugfs_create_file("frames", 0400, w->debugfs, w, &wlbt_frames_fops);
+	debugfs_create_file("faults", 0400, w->debugfs, w, &wlbt_faults_fops);
 }
 
 static struct regmap *wlbt_syscon(struct exynos_wlbt *w, const char *name)
@@ -4110,6 +4190,16 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
 	if (!w->hip4_control)
 		return -EIO;
 	if (w->scan_req)
+		return -EBUSY;
+
+	/*
+	 * A scan request queued while the station is associated is never
+	 * consumed: the peer stays on the channel of the connection, and its
+	 * single reader walks the queues in order, so everything queued behind
+	 * the scan - data included - waits with it.  Refuse instead of
+	 * reporting a scan that will not happen.
+	 */
+	if (w->connected || netif_carrier_ok(w->netdev))
 		return -EBUSY;
 
 	/* The scan id names the interface in its upper byte and the peer
@@ -4699,7 +4789,7 @@ static int wlbt_net_stop(struct net_device *ndev)
 static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct exynos_wlbt *w = wlbt_from_netdev(ndev);
-	u8 sig[sizeof(struct wlbt_fapi_hdr) + 26] = { };
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 24] = { };
 	struct wlbt_fapi_hdr hdr = { };
 	int ret;
 
@@ -4713,17 +4803,15 @@ static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
 	memcpy(sig, &hdr, sizeof(hdr));
 	/*
-	 * The interface is named twice: once in the header, and once as the first
-	 * word of the body the unitdata request carries.  Missing the second one
-	 * shifts every field after it, and the peer then reads a frame descriptor
-	 * of zero and quietly drops the frame.
+	 * The header is the packed ten byte signal header, and the body of a
+	 * unitdata request starts with the interface index, so this word is both
+	 * the header's vif and the first word of the body.
 	 */
-	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* header vif */
-	put_unaligned_le16(1, sig + sizeof(hdr) + 2);		/* body vif */
-	put_unaligned_le16(w->host_tag++, sig + sizeof(hdr) + 4);
-	put_unaligned_le16(FAPI_PRIORITY_CONTENTION, sig + sizeof(hdr) + 6);
-	put_unaligned_le16(1, sig + sizeof(hdr) + 8);		/* peer index */
-	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3, sig + sizeof(hdr) + 10);
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
+	put_unaligned_le16(w->host_tag++, sig + sizeof(hdr) + 2);
+	put_unaligned_le16(FAPI_PRIORITY_CONTENTION, sig + sizeof(hdr) + 4);
+	put_unaligned_le16(1, sig + sizeof(hdr) + 6);		/* peer index */
+	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3, sig + sizeof(hdr) + 8);
 
 	w->n_tx_calls++;
 	ret = wlbt_hip4_send(w, tx_ctl, sig, sizeof(sig), skb->data, skb->len);
