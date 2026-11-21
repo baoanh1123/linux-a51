@@ -255,6 +255,8 @@
 #define HIP4_Q_NUM			6
 #define HIP4_Q_LEN			256
 #define HIP4_Q_IDX_SIZE			1
+#define HIP4_DAT_SLOTS			512
+#define HIP4_CTL_SLOTS			32
 
 #define HIP4_CONFIG_MAGIC		0xcaba0401
 #define HIP4_INIT_MAGIC			0xcaaa0400
@@ -339,11 +341,93 @@ struct wlbt_hip4_cfg_v5 {
 	u8 rsv3[16];
 } __packed;
 
+/*
+ * The peer cache-invalidates a queue array with DCIMVAC in 32 byte steps and
+ * asserts when the base is not 32 byte aligned, so each element is padded to a
+ * whole number of cache lines (1027 bytes of content, 1056 on the wire).
+ */
 struct wlbt_hip4_q {
 	__le32 array[HIP4_Q_LEN];
 	u8 idx_read;
 	u8 idx_write;
 	u8 total;
+	u8 rsv[29];
+};
+
+/*
+ * HIP4 datapath.  Control and data frames travel as "mbulk" segments: a 20 byte
+ * descriptor, then the FAPI signal with four bytes reserved in front of it for
+ * the peer, then the payload.  The host hands the peer the MIF offset of each
+ * segment through a 256 entry array and keeps the queue indices in the
+ * scoreboard, so both sides map the same memory.
+ *
+ * Scoreboard byte layout (hip4.c q_idx_layout): the host owns the write index
+ * of the from-host queues and the read index of the to-host ones, the peer owns
+ * the mirror image at +64.
+ */
+#define HIP4_SLOT_SIZE			2048
+#define HIP4_MBULK_SIZE			20
+#define HIP4_SIG_RESERVED		4	/* peer's own signal header */
+#define HIP4_MAX_SLOTS			512
+#define HIP4_SIG_DUMP			64
+#define HIP4_SCB_FW_OWN			64
+
+#define HIP4_Q_FH_CTL			0
+#define HIP4_Q_FH_DAT			1
+#define HIP4_Q_FH_RFB			2
+#define HIP4_Q_TH_CTL			3
+#define HIP4_Q_TH_DAT			4
+#define HIP4_Q_TH_RFB			5
+
+/* mbulk flags, classes and pool ids (mbulk_def.h, mbulk.h). */
+#define MBULK_F_SIG			0x01
+#define MBULK_F_OBOUND			0x04
+#define MBULK_F_CHAIN_HEAD		0x40
+#define MBULK_F_CHAIN			0x80
+#define MBULK_MAX_CHAIN			16
+#define MBULK_CLASS_FROM_HOST_DAT	4
+#define MBULK_CLASS_FROM_HOST_CTL	5
+#define MBULK_POOL_ID_DATA		0
+#define MBULK_POOL_ID_CTRL		1
+
+/* FAPI signals name this side as the sender (mlme.c:3545). */
+#define FAPI_SENDER_PID			0xc001
+
+struct wlbt_mbulk {
+	__le32 next_offset;
+	u8 flag;
+	u8 clas;
+	u8 pid;
+	u8 refcnt;
+	__le16 dat_bufsz;
+	__le16 sig_bufsz;
+	__le16 len;
+	__le16 head;
+	__le32 chain_next_offset;
+} __packed;
+
+struct wlbt_fapi_hdr {
+	__le16 id;
+	__le16 receiver_pid;
+	__le16 sender_pid;
+	__le32 fw_reference;
+} __packed;
+
+/* Producer and consumer index byte of every queue. */
+static const u8 wlbt_hip4_idx[HIP4_Q_NUM][2] = {
+	{ 0, HIP4_SCB_FW_OWN + 0 },		/* from host, control */
+	{ 1, HIP4_SCB_FW_OWN + 1 },		/* from host, data */
+	{ HIP4_SCB_FW_OWN + 2, 2 },		/* from host, freed */
+	{ HIP4_SCB_FW_OWN + 3, 3 },		/* to host, control */
+	{ HIP4_SCB_FW_OWN + 4, 4 },		/* to host, data */
+	{ 5, HIP4_SCB_FW_OWN + 5 },		/* to host, freed */
+};
+
+struct wlbt_hip4_pool {
+	u32 base;			/* MIF offset of the first slot */
+	u32 slots;
+	u32 next;
+	DECLARE_BITMAP(used, HIP4_MAX_SLOTS);
 };
 
 /*
@@ -546,6 +630,10 @@ struct exynos_wlbt {
 	u32 mxconf_offset;
 	u32 hip4_ref;			/* MIF-relative HIP4 shared region */
 	u32 hip4_control;		/* MIF-relative control block */
+	bool hip4_started;		/* peer took the service start request */
+	struct wlbt_hip4_pool hip4_pool[2];
+	unsigned int n_hip4_tx;
+	unsigned int n_hip4_rx;
 	struct wlbt_stream log;
 	struct wlbt_stream mgmt_in;
 	struct wlbt_stream mgmt_out;
@@ -599,6 +687,10 @@ MODULE_PARM_DESC(firmware_name, "Firmware image for the WLBT subsystem");
 static bool load_firmware;
 module_param(load_firmware, bool, 0644);
 MODULE_PARM_DESC(load_firmware, "Copy the firmware image into MIF DRAM and let the peer run it");
+
+static bool hip4_return = true;
+module_param(hip4_return, bool, 0644);
+MODULE_PARM_DESC(hip4_return, "Hand received HIP4 segments back to the peer");
 
 static bool load_mib = true;
 module_param(load_mib, bool, 0644);
@@ -937,6 +1029,8 @@ static void wlbt_mgmt_drain(struct exynos_wlbt *w)
 /*
  * Doorbell from the peer: one bit per stream, INTSR0[31:16].
  */
+static void wlbt_hip4_drain(struct exynos_wlbt *w);
+
 static irqreturn_t wlbt_mbox_isr(int irq, void *data)
 {
 	struct exynos_wlbt *w = data;
@@ -963,6 +1057,8 @@ static irqreturn_t wlbt_mbox_isr(int irq, void *data)
 		wlbt_log_drain(w);
 	if (status & BIT(w->mgmt_in.write_bit))
 		wlbt_mgmt_drain(w);
+	if (status & BIT(WLBT_BIT_HIP4_TO_HOST))
+		wlbt_hip4_drain(w);
 
 	return IRQ_HANDLED;
 }
@@ -1256,12 +1352,252 @@ static int wlbt_hip4_build(struct exynos_wlbt *w)
 	/* The peer reads the block over the bus as soon as the request lands. */
 	wmb();
 
+	/* Every segment is free until the peer hands one back on a release
+	 * queue, so start with an empty scoreboard and an empty bitmap.
+	 */
+	w->hip4_pool[0].base = w->hip4_ref + HIP4_TX_OFFSET;
+	w->hip4_pool[0].slots = HIP4_DAT_SLOTS;
+	w->hip4_pool[0].next = 0;
+	bitmap_zero(w->hip4_pool[0].used, HIP4_MAX_SLOTS);
+	w->hip4_pool[1].base = w->hip4_ref + HIP4_TX_CTL_OFFSET;
+	w->hip4_pool[1].slots = HIP4_CTL_SLOTS;
+	w->hip4_pool[1].next = 0;
+	bitmap_zero(w->hip4_pool[1].used, HIP4_MAX_SLOTS);
+
+	memset_io(w->dram + w->hip4_control +
+		  offsetof(struct wlbt_hip4_control, scoreboard), 0,
+		  sizeof(__le32) * 256 +
+		  HIP4_Q_NUM * sizeof(struct wlbt_hip4_q));
+	/* Empty queues and a zero scoreboard before the peer starts using them. */
+	wmb();
+
 	dev_info(w->dev, "HIP4 at MIF+0x%x: control 0x%x, TX 0x%x, RX 0x%x, %u KiB\n",
 		 w->hip4_ref, w->hip4_control, w->hip4_ref + HIP4_TX_OFFSET,
 		 w->hip4_ref + HIP4_RX_OFFSET, HIP4_ALLOC_SIZE / 1024);
 
 	return 0;
 }
+
+static u8 *wlbt_hip4_scb(struct exynos_wlbt *w)
+{
+	return w->dram + w->hip4_control +
+	       offsetof(struct wlbt_hip4_control, scoreboard);
+}
+
+static u32 *wlbt_hip4_q_slot(struct exynos_wlbt *w, u32 q, u8 idx)
+{
+	return w->dram + w->hip4_control +
+	       offsetof(struct wlbt_hip4_control, q) +
+	       q * sizeof(struct wlbt_hip4_q) + idx * sizeof(__le32);
+}
+
+/*
+ * A queue entry is free once the peer hands the segment back on the release
+ * queue, so the slots are tracked with a bitmap rather than a cursor.
+ */
+static int wlbt_hip4_slot_get(struct exynos_wlbt *w, bool ctrl, u32 *ref)
+{
+	struct wlbt_hip4_pool *p = &w->hip4_pool[ctrl ? 1 : 0];
+	unsigned int i;
+
+	for (i = 0; i < p->slots; i++) {
+		u32 slot = p->next;
+
+		p->next = (p->next + 1) & (p->slots - 1);
+		if (!test_and_set_bit(slot, p->used)) {
+			*ref = p->base + slot * HIP4_SLOT_SIZE;
+			return 0;
+		}
+	}
+
+	return -ENOSPC;
+}
+
+static void wlbt_hip4_slot_put(struct exynos_wlbt *w, u32 ref)
+{
+	struct wlbt_hip4_pool *p;
+	u32 off;
+
+	for (off = 0; off < ARRAY_SIZE(w->hip4_pool); off++) {
+		p = &w->hip4_pool[off];
+		if (ref < p->base || ref >= p->base + p->slots * HIP4_SLOT_SIZE)
+			continue;
+		clear_bit((ref - p->base) / HIP4_SLOT_SIZE, p->used);
+		return;
+	}
+}
+
+static void wlbt_hip4_push(struct exynos_wlbt *w, u32 q, u32 ref)
+{
+	u8 *scb = wlbt_hip4_scb(w);
+	u8 idx = readb(scb + wlbt_hip4_idx[q][0]);
+
+	writel(ref, wlbt_hip4_q_slot(w, q, idx));
+	/* The entry has to be visible before the index publishes it. */
+	wmb();
+	writeb((idx + 1) & (HIP4_Q_LEN - 1), scb + wlbt_hip4_idx[q][0]);
+	/* Publish the index before the doorbell the peer reads. */
+	wmb();
+
+	writel(BIT(WLBT_BIT_HIP4_FROM_HOST), w->mbox + MBOX_INTGR1);
+}
+
+static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
+			  size_t sig_len, const void *data, size_t data_len)
+{
+	struct wlbt_mbulk mb = { };
+	u32 sig_bufsz, ref;
+	void *m;
+	int ret;
+
+	if (!w->hip4_control)
+		return -ENODEV;
+	if (sig_len < sizeof(struct wlbt_fapi_hdr))
+		return -EINVAL;
+
+	ret = wlbt_hip4_slot_get(w, ctrl, &ref);
+	if (ret)
+		return ret;
+
+	sig_bufsz = ALIGN(sig_len + HIP4_SIG_RESERVED, 4);
+	mb.flag = MBULK_F_SIG | MBULK_F_OBOUND;
+	mb.clas = ctrl ? MBULK_CLASS_FROM_HOST_CTL : MBULK_CLASS_FROM_HOST_DAT;
+	mb.pid = ctrl ? MBULK_POOL_ID_CTRL : MBULK_POOL_ID_DATA;
+	mb.refcnt = data_len ? 1 : 0;
+	mb.dat_bufsz = cpu_to_le16(data_len);
+	mb.sig_bufsz = cpu_to_le16(sig_bufsz);
+	mb.len = cpu_to_le16(data_len);
+	mb.head = cpu_to_le16(sig_bufsz);
+
+	m = w->dram + ref;
+	memcpy_toio(m, &mb, sizeof(mb));
+	memset_io(m + HIP4_MBULK_SIZE, 0, HIP4_SIG_RESERVED);
+	memcpy_toio(m + HIP4_MBULK_SIZE + HIP4_SIG_RESERVED, sig, sig_len);
+	if (data_len)
+		memcpy_toio(m + HIP4_MBULK_SIZE + sig_bufsz, data, data_len);
+	/* The whole segment has to be in DRAM before the peer sees the ref. */
+	wmb();
+
+	wlbt_hip4_push(w, ctrl ? HIP4_Q_FH_CTL : HIP4_Q_FH_DAT, ref);
+	w->n_hip4_tx++;
+
+	return 0;
+}
+
+/* Take back the host segments the peer has finished with. */
+static void wlbt_hip4_release(struct exynos_wlbt *w)
+{
+	u8 *scb = wlbt_hip4_scb(w);
+	u8 q = HIP4_Q_FH_RFB;
+
+	while (readb(scb + wlbt_hip4_idx[q][1]) !=
+	       readb(scb + wlbt_hip4_idx[q][0])) {
+		u8 idx = readb(scb + wlbt_hip4_idx[q][1]);
+
+		wlbt_hip4_slot_put(w, readl(wlbt_hip4_q_slot(w, q, idx)));
+		writeb((idx + 1) & (HIP4_Q_LEN - 1), scb + wlbt_hip4_idx[q][1]);
+		/* Release the index before the segment is reused. */
+		wmb();
+	}
+}
+
+static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
+{
+	u8 *scb = wlbt_hip4_scb(w);
+	u8 ridx = readb(scb + wlbt_hip4_idx[q][1]);
+	u8 widx = readb(scb + wlbt_hip4_idx[q][0]);
+	u32 chain[MBULK_MAX_CHAIN];
+	unsigned int n = 0, n_chain, i;
+
+	while (ridx != widx && n < HIP4_Q_LEN) {
+		u32 ref = readl(wlbt_hip4_q_slot(w, q, ridx));
+		struct wlbt_mbulk mb;
+		void *m;
+
+		if (ref >= w->mem_size - HIP4_SLOT_SIZE) {
+			dev_warn(w->dev, "HIP4 q%u[%u]: bogus ref 0x%x\n",
+				 q, ridx, ref);
+			ridx = (ridx + 1) & (HIP4_Q_LEN - 1);
+			continue;
+		}
+
+		m = w->dram + ref;
+		memcpy_fromio(&mb, m, sizeof(mb));
+		dev_info(w->dev,
+			 "HIP4 q%u[%u]: ref 0x%x flag 0x%02x clas %u pid %u sig %u len %u\n",
+			 q, ridx, ref, mb.flag, mb.clas, mb.pid,
+			 le16_to_cpu(mb.sig_bufsz), le16_to_cpu(mb.len));
+
+		if (le16_to_cpu(mb.sig_bufsz) >= HIP4_SIG_RESERVED +
+						  sizeof(struct wlbt_fapi_hdr)) {
+			u8 body[HIP4_SIG_DUMP];
+			size_t len = le16_to_cpu(mb.sig_bufsz) -
+				     HIP4_SIG_RESERVED;
+			struct wlbt_fapi_hdr hdr;
+
+			memcpy_fromio(&hdr, m + HIP4_MBULK_SIZE +
+				      HIP4_SIG_RESERVED, sizeof(hdr));
+			dev_info(w->dev,
+				 "  fapi id 0x%04x receiver 0x%04x sender 0x%04x ref 0x%x\n",
+				 le16_to_cpu(hdr.id),
+				 le16_to_cpu(hdr.receiver_pid),
+				 le16_to_cpu(hdr.sender_pid),
+				 le32_to_cpu(hdr.fw_reference));
+
+			if (len > sizeof(body))
+				len = sizeof(body);
+			memcpy_fromio(body, m + HIP4_MBULK_SIZE +
+				      HIP4_SIG_RESERVED + sizeof(hdr),
+				      len > sizeof(hdr) ? len - sizeof(hdr) : 0);
+			print_hex_dump(KERN_INFO, "  body: ",
+				       DUMP_PREFIX_NONE, 16, 1, body,
+				       len > sizeof(hdr) ? len - sizeof(hdr) : 0,
+				       false);
+		}
+
+		/*
+		 * Hand every segment back so the peer can reuse it.  A
+		 * scatter/gather frame is a chain: the head carries the
+		 * chain_next_offset of the next segment and every segment but
+		 * the last says it is chained, so the peer needs all of them
+		 * or it walks into a segment it already recycled.
+		 */
+		chain[0] = ref;
+		for (n_chain = 1; n_chain < MBULK_MAX_CHAIN; n_chain++) {
+			struct wlbt_mbulk prev;
+
+			if (!(mb.flag & MBULK_F_CHAIN))
+				break;
+			memcpy_fromio(&prev, w->dram + chain[n_chain - 1],
+				      sizeof(prev));
+			chain[n_chain] = le32_to_cpu(prev.chain_next_offset);
+			if (chain[n_chain] >= w->mem_size - HIP4_SLOT_SIZE)
+				break;
+			memcpy_fromio(&mb, w->dram + chain[n_chain], sizeof(mb));
+		}
+		if (hip4_return)
+			for (i = 0; i < n_chain; i++)
+				wlbt_hip4_push(w, HIP4_Q_TH_RFB, chain[i]);
+
+		ridx = (ridx + 1) & (HIP4_Q_LEN - 1);
+		writeb(ridx, scb + wlbt_hip4_idx[q][1]);
+		/* Only advance once the segment is handed back. */
+		wmb();
+		w->n_hip4_rx++;
+		n++;
+	}
+}
+
+static void wlbt_hip4_drain(struct exynos_wlbt *w)
+{
+	if (!w->hip4_control)
+		return;
+
+	wlbt_hip4_release(w);
+	wlbt_hip4_show(w, HIP4_Q_TH_CTL);
+	wlbt_hip4_show(w, HIP4_Q_TH_DAT);
+}
+
 
 /*
  * One stream is a ring of fixed-size cells plus the two cursors the peer reads
@@ -1876,6 +2212,8 @@ static ssize_t wlbt_debugfs_wlan(struct file *file, const char __user *buf,
 	ret = wlbt_stream_write(w, &w->mgmt_out, frame, sizeof(frame));
 	dev_info(w->dev, "WLAN start request (%s), control block 0x%x\n",
 		 ret ? "written" : "failed", w->hip4_control);
+	if (ret)
+		w->hip4_started = true;
 
 	/* A start confirmation comes back on the same channel; give the peer a
 	 * moment and show whatever arrives.
@@ -1891,6 +2229,94 @@ static ssize_t wlbt_debugfs_wlan(struct file *file, const char __user *buf,
 	mutex_unlock(&w->lock);
 
 	return ret ? len : -EIO;
+}
+
+/*
+ * Talk to the peer's WLAN service over HIP4.  "send <hex signal id> [hex
+ * payload bytes]" puts one FAPI signal on the from-host control queue,
+ * "drain" collects whatever is waiting on the to-host queues.
+ */
+static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
+				 size_t len, loff_t *ppos)
+{
+	struct exynos_wlbt *w = file->private_data;
+	struct wlbt_fapi_hdr hdr = { };
+	u8 sig[sizeof(hdr) + 256];
+	char kbuf[768];
+	char cmd[16];
+	const char *p;
+	unsigned int id, val, n = 0;
+	int ret, used = 0;
+
+	ret = simple_write_to_buffer(kbuf, sizeof(kbuf) - 1, ppos, buf, len);
+	if (ret < 0)
+		return ret;
+	kbuf[ret] = '\0';
+
+	mutex_lock(&w->lock);
+	ret = wlbt_hip4_build(w);
+	if (ret)
+		goto out;
+
+	if (sscanf(kbuf, "%15s", cmd) != 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (!strcmp(cmd, "drain")) {
+		wlbt_hip4_drain(w);
+		ret = len;
+		goto out;
+	}
+
+	if (!strcmp(cmd, "ret")) {
+		unsigned int ref;
+
+		if (sscanf(kbuf + strlen(cmd), "%x", &ref) != 1) {
+			ret = -EINVAL;
+			goto out;
+		}
+		wlbt_hip4_push(w, HIP4_Q_TH_RFB, ref);
+		dev_info(w->dev, "HIP4 returned segment 0x%x\n", ref);
+		ret = len;
+		goto out;
+	}
+
+	if (strcmp(cmd, "send") || !w->hip4_started) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	p = kbuf + strlen(cmd);
+	if (sscanf(p, "%x%n", &id, &used) != 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+	p += used;
+
+	while (n < sizeof(sig) - sizeof(hdr) &&
+	       sscanf(p, "%x%n", &val, &used) == 1) {
+		sig[sizeof(hdr) + n++] = val;
+		p += used;
+	}
+
+	hdr.id = cpu_to_le16(id);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	ret = wlbt_hip4_send(w, true, sig, sizeof(hdr) + n, NULL, 0);
+	dev_info(w->dev, "HIP4 signal 0x%04x (%u bytes of payload): %d\n",
+		 id, n, ret);
+	if (ret)
+		goto out;
+
+	msleep(100);
+	wlbt_hip4_drain(w);
+	ret = len;
+
+out:
+	mutex_unlock(&w->lock);
+	return ret;
 }
 
 #define WLBT_DEBUGFS_OPS(_write)					\
@@ -2205,6 +2631,8 @@ static const struct file_operations wlbt_send_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_send);
 static const struct file_operations wlbt_wlan_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_wlan);
+static const struct file_operations wlbt_hip4_fops =
+	WLBT_DEBUGFS_OPS(wlbt_debugfs_hip4);
 
 /*
  * What did the peer do with its memory?  The image occupies [0, fw_size) and
@@ -2363,6 +2791,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("halt", 0200, w->debugfs, w, &wlbt_halt_fops);
 	debugfs_create_file("send", 0200, w->debugfs, w, &wlbt_send_fops);
 	debugfs_create_file("wlan", 0200, w->debugfs, w, &wlbt_wlan_fops);
+	debugfs_create_file("hip4", 0200, w->debugfs, w, &wlbt_hip4_fops);
 	debugfs_create_file("peek", 0600, w->debugfs, w, &wlbt_peek_fops);
 	debugfs_create_file("trace", 0600, w->debugfs, w, &wlbt_trace_fops);
 	debugfs_create_file("find", 0600, w->debugfs, w, &wlbt_find_fops);
