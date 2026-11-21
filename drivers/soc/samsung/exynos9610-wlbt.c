@@ -147,6 +147,17 @@
 #define WLBT_MM_SYSERR_IND		9
 
 #define MMTRANS_CHAN_ID_MAXWELL_MANAGEMENT	0
+#define MMTRANS_CHAN_ID_SERVICE_MANAGEMENT	1
+
+/* Service-management messages carry [service_id][msg][u32 optional_data]
+ * after the channel byte (servman_messages.h), unlike the management channel.
+ */
+#define WLBT_SM_MSG_START_REQ		0
+#define WLBT_SM_MSG_START_CFM		1
+#define WLBT_SM_MSG_STOP_REQ		2
+
+/* SCSC_SERVICE_ID_* (include/scsc/scsc_mx.h). */
+#define WLBT_SERVICE_ID_WLAN		1
 
 #define MBOX_ISSR_ENTRY			0	/* fw entry point */
 #define MBOX_ISSR_CONFIG		1	/* mxconf, MIF-relative */
@@ -214,6 +225,135 @@
 #define WLBT_BIT_GDB_M4_OUT_WRITE	0	/* reserved panic bit */
 #define WLBT_BIT_LOG_READ		4
 #define WLBT_BIT_LOG_WRITE		6
+
+/*
+ * HIP4, the frame transport the WLAN service runs on.  The peer is told where
+ * the shared region is and which interrupt bits belong to it (hip4.h), so these
+ * only have to stay clear of the management/log/gdb bits above.
+ */
+#define WLBT_BIT_HIP4_FROM_HOST		7	/* host -> peer */
+#define WLBT_BIT_HIP4_TO_HOST		8	/* peer -> host */
+
+#define HIP4_CONFIG_OFFSET		0x00000
+#define HIP4_CONFIG_SIZE		0x02000	/* 8 KiB, the control block */
+#define HIP4_MIB_OFFSET		(HIP4_CONFIG_OFFSET + HIP4_CONFIG_SIZE)
+#define HIP4_MIB_SIZE			0x08000	/* 32 KiB */
+#define HIP4_TX_OFFSET			(HIP4_MIB_OFFSET + HIP4_MIB_SIZE)
+#define HIP4_TX_DAT_SIZE		0x100000
+#define HIP4_TX_CTL_OFFSET		(HIP4_TX_OFFSET + HIP4_TX_DAT_SIZE)
+#define HIP4_TX_CTL_SIZE		0x10000
+#define HIP4_TX_SIZE			(HIP4_TX_DAT_SIZE + HIP4_TX_CTL_SIZE)
+#define HIP4_RX_OFFSET			(HIP4_TX_CTL_OFFSET + HIP4_TX_CTL_SIZE)
+#define HIP4_RX_SIZE			0x100000
+#define HIP4_TOTAL_MEM			(HIP4_CONFIG_SIZE + HIP4_MIB_SIZE + \
+					 HIP4_TX_SIZE + HIP4_RX_SIZE)
+#define HIP4_ALLOC_SIZE			0x280000	/* what hip4_init asks for */
+#define HIP4_Q_NUM			6
+#define HIP4_Q_LEN			256
+#define HIP4_Q_IDX_SIZE			1
+
+#define HIP4_CONFIG_MAGIC		0xcaba0401
+#define HIP4_INIT_MAGIC			0xcaaa0400
+
+/* Both configuration blocks are packed; only the container has alignment. */
+struct wlbt_hip4_init {
+	__le32 magic;
+	__le32 conf_ver;		/* peer owned: which block it chose */
+	__le32 version_a_ref;
+	__le32 version_b_ref;
+} __packed;
+
+struct wlbt_hip4_cfg_v4 {
+	__le32 magic;
+	__le16 ver;
+	__le16 len;
+	__le32 compat_flag;		/* peer owned */
+	__le16 sap_mlme_ver;
+	__le16 sap_ma_ver;
+	__le16 sap_debug_ver;
+	__le16 sap_test_ver;
+	__le32 fw_build_id;
+	__le32 fw_patch_id;
+	u8 unidat_req_headroom;
+	u8 unidat_req_tailroom;
+	u8 bulk_buffer_align;
+	u8 host_cache_line;
+	__le32 host_buf_loc;
+	__le32 host_buf_sz;
+	__le32 fw_buf_loc;
+	__le32 fw_buf_sz;
+	__le32 mib_loc;
+	__le32 mib_sz;
+	__le32 log_config_loc;
+	__le32 log_config_sz;
+	u8 mif_fh_int_n;		/* host -> peer bit */
+	u8 rsv1[3];
+	u8 mif_th_int_n[HIP4_Q_NUM];	/* peer -> host bit per queue */
+	u8 rsv2[2];
+	__le32 scbrd_loc;
+	__le16 q_num;
+	__le16 q_len;
+	__le16 q_idx_sz;
+	u8 rsv3[2];
+	__le32 q_loc[HIP4_Q_NUM];
+	u8 rsv_nosmapper[99];
+	u8 rsv4[16];
+} __packed;
+
+struct wlbt_hip4_cfg_v5 {
+	__le32 magic;
+	__le16 ver;
+	__le16 len;
+	__le32 compat_flag;		/* peer owned */
+	__le16 sap_mlme_ver;
+	__le16 sap_ma_ver;
+	__le16 sap_debug_ver;
+	__le16 sap_test_ver;
+	__le32 fw_build_id;
+	__le32 fw_patch_id;
+	u8 unidat_req_headroom;
+	u8 unidat_req_tailroom;
+	u8 bulk_buffer_align;
+	u8 host_cache_line;
+	__le32 host_buf_loc;
+	__le32 host_buf_sz;
+	__le32 fw_buf_loc;
+	__le32 fw_buf_sz;
+	__le32 mib_loc;
+	__le32 mib_sz;
+	__le32 log_config_loc;
+	__le32 log_config_sz;
+	u8 mif_fh_int_n;
+	u8 mif_th_int_n;
+	u8 rsv1[2];
+	__le32 scbrd_loc;
+	__le16 q_num;
+	__le16 q_len;
+	__le16 q_idx_sz;
+	u8 rsv2[2];
+	__le32 q_loc[HIP4_Q_NUM];
+	u8 rsv3[16];
+} __packed;
+
+struct wlbt_hip4_q {
+	__le32 array[HIP4_Q_LEN];
+	u8 idx_read;
+	u8 idx_write;
+	u8 total;
+};
+
+/*
+ * The peer finds both configuration blocks through this header, so the refs we
+ * store here are the only thing that has to line up with the firmware - the
+ * offsets inside the container are ours to choose.
+ */
+struct wlbt_hip4_control {
+	struct wlbt_hip4_init init;
+	struct wlbt_hip4_cfg_v5 v5 __aligned(32);
+	struct wlbt_hip4_cfg_v4 v4 __aligned(32);
+	__le32 scoreboard[256] __aligned(64);
+	struct wlbt_hip4_q q[HIP4_Q_NUM] __aligned(64);
+} __aligned(4096);
 
 /* Every bit allocated to-host is one this side wants to hear about. */
 #define WLBT_IRQ_BITS			GENMASK(6, 0)
@@ -400,6 +540,8 @@ struct exynos_wlbt {
 	bool fw_loaded;
 	u32 heap_next;			/* MIF-relative bump pointer */
 	u32 mxconf_offset;
+	u32 hip4_ref;			/* MIF-relative HIP4 shared region */
+	u32 hip4_control;		/* MIF-relative control block */
 	struct wlbt_stream log;
 	struct wlbt_stream mgmt_in;
 	struct wlbt_stream mgmt_out;
@@ -453,6 +595,10 @@ MODULE_PARM_DESC(firmware_name, "Firmware image for the WLBT subsystem");
 static bool load_firmware;
 module_param(load_firmware, bool, 0644);
 MODULE_PARM_DESC(load_firmware, "Copy the firmware image into MIF DRAM and let the peer run it");
+
+static bool load_mib = true;
+module_param(load_mib, bool, 0644);
+MODULE_PARM_DESC(load_mib, "Hand the peer its hardware configuration files (MIB)");
 
 static char *trace_boot;
 module_param(trace_boot, charp, 0444);
@@ -932,6 +1078,170 @@ static u32 wlbt_heap_alloc(struct exynos_wlbt *w, u32 bytes)
 	memset_io(w->dram + offset, 0, bytes);
 
 	return offset;
+}
+
+/*
+ * Same, but honouring a larger alignment.  HIP4 wants its control block on a
+ * 4 KiB boundary (hip4.h), which is the only caller of this.
+ */
+static u32 wlbt_heap_alloc_aligned(struct exynos_wlbt *w, u32 bytes, u32 align)
+{
+	u32 offset, end;
+
+	if (align < sizeof(void *))
+		align = sizeof(void *);
+
+	end = w->heap_next + bytes + align + align;
+	if (!w->heap_next || end > w->mem_size) {
+		dev_err(w->dev, "MIF heap is full (%u of %pa used)\n",
+			w->heap_next, &w->mem_size);
+		return 0;
+	}
+
+	offset = ALIGN(w->heap_next + align, align);
+	w->heap_next = end;
+	memset_io(w->dram + offset, 0, bytes);
+
+	return offset;
+}
+
+/*
+ * Copy the hardware configuration files (HCF) into the HIP4 MIB area.  The
+ * vendor concatenates them there and hands the firmware the address; without
+ * them the WLAN service has no RF/driver parameters and its start never
+ * completes (hip4.c:2416-2455).
+ */
+static u32 wlbt_load_mib(struct exynos_wlbt *w)
+{
+	static const char *const names[] = {
+		"mx140/mx140_wlan.hcf",
+		"mx140/mx140_wlan_sw.hcf",
+	};
+	u32 total = 0;
+	unsigned int i;
+
+	/* Clear the area so the peer never picks up a stale MIB. */
+	memset_io(w->dram + w->hip4_ref + HIP4_MIB_OFFSET, 0, HIP4_MIB_SIZE);
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		const struct firmware *fw;
+
+		if (request_firmware(&fw, names[i], w->dev)) {
+			dev_warn(w->dev, "MIB %s not available\n", names[i]);
+			continue;
+		}
+		if (total + fw->size > HIP4_MIB_SIZE) {
+			dev_warn(w->dev, "MIB %s does not fit (%u+%zu > %u)\n",
+				 names[i], total, fw->size, HIP4_MIB_SIZE);
+			release_firmware(fw);
+			break;
+		}
+
+		memcpy_toio(w->dram + w->hip4_ref + HIP4_MIB_OFFSET + total,
+			    fw->data, fw->size);
+		total += fw->size;
+		release_firmware(fw);
+	}
+
+	if (total)
+		dev_info(w->dev, "MIB in the HIP4 area: %u bytes at 0x%x\n",
+			 total, w->hip4_ref + HIP4_MIB_OFFSET);
+
+	return total;
+}
+
+/*
+ * Build the HIP4 shared region the WLAN service is started with.  The vendor
+ * allocates 2.5 MiB, drops a hip4_hip_control at the base and points the peer at
+ * it through the optional_data field of SM_MSG_START_REQ (hip4.c:2263-2560).
+ *
+ * The peer walks init.version_a_ref / version_b_ref to the two configuration
+ * blocks, so both versions are filled in even though this firmware build will
+ * pick one of them.  No MIB and no logging block are supplied: those are the
+ * hardware configuration files, and zero means "use what you were built with".
+ */
+static int wlbt_hip4_build(struct exynos_wlbt *w)
+{
+	struct wlbt_hip4_control *c;
+	u32 base, i, mib;
+
+	if (w->hip4_control)
+		return 0;
+
+	base = wlbt_heap_alloc_aligned(w, HIP4_ALLOC_SIZE, 4096);
+	if (!base)
+		return -ENOMEM;
+
+	w->hip4_ref = base;
+	w->hip4_control = base + HIP4_CONFIG_OFFSET;
+	c = (struct wlbt_hip4_control *)(w->dram + w->hip4_control);
+
+	/* Scoreboard and queue arrays first: their refs go into both blocks. */
+	c->init.magic = cpu_to_le32(HIP4_INIT_MAGIC);
+	c->init.conf_ver = 0;
+	c->init.version_a_ref = cpu_to_le32(w->hip4_control +
+					     offsetof(struct wlbt_hip4_control, v4));
+	c->init.version_b_ref = cpu_to_le32(w->hip4_control +
+					     offsetof(struct wlbt_hip4_control, v5));
+
+	c->v4.magic = cpu_to_le32(HIP4_CONFIG_MAGIC);
+	c->v4.ver = cpu_to_le16(4);
+	c->v4.len = cpu_to_le16(sizeof(c->v4));
+	c->v4.host_cache_line = 64;
+	c->v4.host_buf_loc = cpu_to_le32(w->hip4_ref + HIP4_TX_OFFSET);
+	c->v4.host_buf_sz = cpu_to_le32(HIP4_TX_SIZE);
+	c->v4.fw_buf_loc = cpu_to_le32(w->hip4_ref + HIP4_RX_OFFSET);
+	c->v4.fw_buf_sz = cpu_to_le32(HIP4_RX_SIZE);
+	c->v4.mif_fh_int_n = WLBT_BIT_HIP4_FROM_HOST;
+	c->v4.scbrd_loc = cpu_to_le32(w->hip4_control +
+				      offsetof(struct wlbt_hip4_control, scoreboard));
+	c->v4.q_num = cpu_to_le16(HIP4_Q_NUM);
+	c->v4.q_len = cpu_to_le16(HIP4_Q_LEN);
+	c->v4.q_idx_sz = cpu_to_le16(HIP4_Q_IDX_SIZE);
+
+	c->v5.magic = cpu_to_le32(HIP4_CONFIG_MAGIC);
+	c->v5.ver = cpu_to_le16(5);
+	c->v5.len = cpu_to_le16(sizeof(c->v5));
+	c->v5.host_cache_line = 64;
+	c->v5.host_buf_loc = cpu_to_le32(w->hip4_ref + HIP4_TX_OFFSET);
+	c->v5.host_buf_sz = cpu_to_le32(HIP4_TX_SIZE);
+	c->v5.fw_buf_loc = cpu_to_le32(w->hip4_ref + HIP4_RX_OFFSET);
+	c->v5.fw_buf_sz = cpu_to_le32(HIP4_RX_SIZE);
+	c->v5.mif_fh_int_n = WLBT_BIT_HIP4_FROM_HOST;
+	c->v5.mif_th_int_n = WLBT_BIT_HIP4_TO_HOST;
+	c->v5.scbrd_loc = cpu_to_le32(w->hip4_control +
+				      offsetof(struct wlbt_hip4_control, scoreboard));
+	c->v5.q_num = cpu_to_le16(HIP4_Q_NUM);
+	c->v5.q_len = cpu_to_le16(HIP4_Q_LEN);
+	c->v5.q_idx_sz = cpu_to_le16(HIP4_Q_IDX_SIZE);
+
+	for (i = 0; i < HIP4_Q_NUM; i++) {
+		u32 q = cpu_to_le32(w->hip4_control +
+				    offsetof(struct wlbt_hip4_control, q) +
+				    i * sizeof(struct wlbt_hip4_q) +
+				    offsetof(struct wlbt_hip4_q, array));
+
+		c->v4.q_loc[i] = q;
+		c->v5.q_loc[i] = q;
+		c->v4.mif_th_int_n[i] = WLBT_BIT_HIP4_TO_HOST;
+	}
+
+	mib = load_mib ? wlbt_load_mib(w) : 0;
+	if (mib) {
+		c->v4.mib_loc = cpu_to_le32(w->hip4_ref + HIP4_MIB_OFFSET);
+		c->v4.mib_sz = cpu_to_le32(mib);
+		c->v5.mib_loc = cpu_to_le32(w->hip4_ref + HIP4_MIB_OFFSET);
+		c->v5.mib_sz = cpu_to_le32(mib);
+	}
+
+	/* The peer reads the block over the bus as soon as the request lands. */
+	wmb();
+
+	dev_info(w->dev, "HIP4 at MIF+0x%x: control 0x%x, TX 0x%x, RX 0x%x, %u KiB\n",
+		 w->hip4_ref, w->hip4_control, w->hip4_ref + HIP4_TX_OFFSET,
+		 w->hip4_ref + HIP4_RX_OFFSET, HIP4_ALLOC_SIZE / 1024);
+
+	return 0;
 }
 
 /*
@@ -1505,8 +1815,7 @@ static ssize_t wlbt_debugfs_send(struct file *file, const char __user *buf,
 
 static ssize_t wlbt_debugfs_reset(struct file *file, const char __user *buf,
 				  size_t len, loff_t *ppos)
-{
-	struct exynos_wlbt *w = file->private_data;
+{	struct exynos_wlbt *w = file->private_data;
 	int ret;
 
 	mutex_lock(&w->lock);
@@ -1514,6 +1823,55 @@ static ssize_t wlbt_debugfs_reset(struct file *file, const char __user *buf,
 	mutex_unlock(&w->lock);
 
 	return ret ? ret : len;
+}
+
+/*
+ * Start the WLAN service.  The peer reads the optional_data field of
+ * SM_MSG_START_REQ as a MIF-relative address and walks it as a hip4_hip_control
+ * (0x801185f4 converts the reference, 0x801178f8 hands it to the service), so
+ * the HIP4 region has to exist before the request goes out - a zero reference
+ * makes the peer read the firmware header as a control block and stop.
+ */
+static ssize_t wlbt_debugfs_wlan(struct file *file, const char __user *buf,
+				 size_t len, loff_t *ppos)
+{
+	struct exynos_wlbt *w = file->private_data;
+	unsigned int before = w->n_mgmt;
+	u8 frame[7];
+	__le32 ref;
+	int ret, i;
+
+	mutex_lock(&w->lock);
+	ret = wlbt_hip4_build(w);
+	if (ret) {
+		mutex_unlock(&w->lock);
+		return ret;
+	}
+
+	frame[0] = MMTRANS_CHAN_ID_SERVICE_MANAGEMENT;
+	frame[1] = WLBT_SERVICE_ID_WLAN;
+	frame[2] = WLBT_SM_MSG_START_REQ;
+	ref = cpu_to_le32(w->hip4_control);
+	memcpy(frame + 3, &ref, sizeof(ref));
+
+	ret = wlbt_stream_write(w, &w->mgmt_out, frame, sizeof(frame));
+	dev_info(w->dev, "WLAN start request (%s), control block 0x%x\n",
+		 ret ? "written" : "failed", w->hip4_control);
+
+	/* A start confirmation comes back on the same channel; give the peer a
+	 * moment and show whatever arrives.
+	 */
+	for (i = 0; i < 20; i++) {
+		msleep(50);
+		wlbt_mgmt_drain(w);
+		if (w->n_mgmt != before)
+			break;
+	}
+	dev_info(w->dev, "%u management message(s) after WLAN start\n",
+		 w->n_mgmt - before);
+	mutex_unlock(&w->lock);
+
+	return ret ? len : -EIO;
 }
 
 #define WLBT_DEBUGFS_OPS(_write)					\
@@ -1826,6 +2184,8 @@ static const struct file_operations wlbt_halt_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_halt);
 static const struct file_operations wlbt_send_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_send);
+static const struct file_operations wlbt_wlan_fops =
+	WLBT_DEBUGFS_OPS(wlbt_debugfs_wlan);
 
 /*
  * What did the peer do with its memory?  The image occupies [0, fw_size) and
@@ -1983,6 +2343,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("off", 0200, w->debugfs, w, &wlbt_reset_fops);
 	debugfs_create_file("halt", 0200, w->debugfs, w, &wlbt_halt_fops);
 	debugfs_create_file("send", 0200, w->debugfs, w, &wlbt_send_fops);
+	debugfs_create_file("wlan", 0200, w->debugfs, w, &wlbt_wlan_fops);
 	debugfs_create_file("peek", 0600, w->debugfs, w, &wlbt_peek_fops);
 	debugfs_create_file("trace", 0600, w->debugfs, w, &wlbt_trace_fops);
 	debugfs_create_file("find", 0600, w->debugfs, w, &wlbt_find_fops);
