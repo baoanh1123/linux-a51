@@ -752,8 +752,12 @@ static unsigned int send_ref;
 static int sig_refcnt = -1;
 module_param(send_ref, uint, 0644);
 
+/* Name a plain zeroed buffer instead of a segment in the firmware reference. */
+static bool hip4_ref_bare;
+
 /* Override the mbulk reference count of frames sent on the datapath. */
 module_param(sig_refcnt, int, 0644);
+module_param(hip4_ref_bare, bool, 0644);
 MODULE_PARM_DESC(send_ref, "fw_reference to put in signals sent from the hip4 node");
 
 static bool mib_early;
@@ -1547,15 +1551,24 @@ static u32 wlbt_hip4_scratch(struct exynos_wlbt *w)
 	struct wlbt_mbulk mb = { };
 	void *m = w->dram + ref;
 
-	mb.flag = MBULK_F_SIG | MBULK_F_OBOUND;
-	mb.clas = MBULK_CLASS_FROM_HOST_DAT;
-	mb.pid = MBULK_POOL_ID_DATA;
-	mb.refcnt = 1;
-	mb.sig_bufsz = cpu_to_le16(ALIGN(HIP4_SIG_RESERVED +
-					 sizeof(struct wlbt_fapi_hdr), 4));
-	mb.head = mb.sig_bufsz;
-	memset_io(m, 0, HIP4_SLOT_SIZE);
-	memcpy_toio(m, &mb, sizeof(mb));
+	if (hip4_ref_bare) {
+		/*
+		 * A plain zeroed buffer: the peer's range check skips a
+		 * segment whose signal size is zero, and nothing else in the
+		 * request points at the reference.
+		 */
+		memset_io(m, 0, HIP4_SLOT_SIZE);
+	} else {
+		mb.flag = MBULK_F_SIG | MBULK_F_OBOUND;
+		mb.clas = MBULK_CLASS_FROM_HOST_DAT;
+		mb.pid = MBULK_POOL_ID_DATA;
+		mb.refcnt = 1;
+		mb.sig_bufsz = cpu_to_le16(ALIGN(HIP4_SIG_RESERVED +
+						 sizeof(struct wlbt_fapi_hdr), 4));
+		mb.head = mb.sig_bufsz;
+		memset_io(m, 0, HIP4_SLOT_SIZE);
+		memcpy_toio(m, &mb, sizeof(mb));
+	}
 	/* The descriptor must be in DRAM before the peer is handed the ref. */
 	wmb();
 
