@@ -400,6 +400,13 @@ struct wlbt_hip4_q {
 #define FAPI_MLME_CONNECT_REQ		0x200b
 #define FAPI_MLME_ADD_VIF_REQ		0x2007
 #define FAPI_MLME_SET_HOST_STATE_REQ	0x2028
+#define FAPI_MLME_SETKEYS_REQ		0x2018
+
+/* Key types the peer knows (fapi.h). */
+#define FAPI_KEYTYPE_GROUP	0
+#define FAPI_KEYTYPE_PAIRWISE	1
+#define FAPI_KEYTYPE_WEP	2
+#define FAPI_KEYTYPE_IGTK	3
 
 struct wlbt_mbulk {
 	__le32 next_offset;
@@ -3795,10 +3802,94 @@ static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	cfg80211_disconnected(ndev, reason_code, NULL, 0, true, GFP_KERNEL);
 	return 0;
 }
+/*
+ * MLME_SETKEYS is how the peer is told about the keys a host supplicant
+ * negotiated - the firmware does not do the four way handshake itself, so this
+ * is the only way a WPA2 connection can carry traffic.  The key material is
+ * appended to the signal right after the fixed body, which is what the
+ * vendor's fapi_append_data() produces; the length field is in bits, and the
+ * packet sequence numbers are packed as little endian half words.
+ */
+static int wlbt_mlme_setkeys(struct exynos_wlbt *w, u16 key_id, u16 key_type,
+			     const u8 *address, u32 cipher, const u8 *key,
+			     size_t key_len, const u8 *seq, size_t seq_len)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 46 + 32];
+	struct wlbt_fapi_hdr hdr = { };
+	size_t n = sizeof(hdr);
+	unsigned int i;
+
+	if (!key || !key_len || key_len > 32 || !address)
+		return -EINVAL;
+
+	memset(sig, 0, sizeof(sig));
+	put_unaligned_le16(1, sig + n + 0);		/* vif */
+	put_unaligned_le16(key_len * 8, sig + n + 2);	/* length in bits */
+	put_unaligned_le16(key_id, sig + n + 4);
+	put_unaligned_le16(key_type, sig + n + 6);
+	memcpy(sig + n + 8, address, ETH_ALEN);
+
+	for (i = 0; seq && i + 1 < seq_len && i < 16; i += 2)
+		put_unaligned_le16((seq[i + 1] << 8) | seq[i],
+				   sig + n + 14 + i);
+
+	put_unaligned_le32(cipher, sig + n + 30);
+	memcpy(sig + n + 46, key, key_len);
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SETKEYS_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, n + 46 + key_len, NULL, 0);
+}
+
+static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
+			    int link_id, u8 key_index, bool pairwise,
+			    const u8 *mac_addr, struct key_params *params)
+{
+	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+	u16 type;
+
+	if (!w->hip4_control)
+		return -EIO;
+	if (!mac_addr)
+		return -EINVAL;
+
+	if (params->cipher == WLAN_CIPHER_SUITE_WEP40 ||
+	    params->cipher == WLAN_CIPHER_SUITE_WEP104)
+		type = FAPI_KEYTYPE_WEP;
+	else if (pairwise)
+		type = FAPI_KEYTYPE_PAIRWISE;
+	else if (params->cipher == WLAN_CIPHER_SUITE_AES_CMAC ||
+		 params->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_128 ||
+		 params->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_256)
+		type = FAPI_KEYTYPE_IGTK;
+	else
+		type = FAPI_KEYTYPE_GROUP;
+
+	dev_info(w->dev, "setkeys: id %u type %u cipher 0x%x len %d %pM\n",
+		 key_index, type, params->cipher, params->key_len, mac_addr);
+
+	return wlbt_mlme_setkeys(w, key_index, type, mac_addr, params->cipher,
+				 params->key, params->key_len, params->seq,
+				 params->seq_len);
+}
+
+static int wlbt_cfg_del_key(struct wiphy *wiphy, struct net_device *ndev,
+			    int link_id, u8 key_index, bool pairwise,
+			    const u8 *mac_addr)
+{
+	/* This firmware has no delete-keys request and the vendor driver does
+	 * not send one either: a key is replaced by setting it again.
+	 */
+	return 0;
+}
 static const struct cfg80211_ops wlbt_cfg80211_ops = {
 	.scan = wlbt_cfg_scan,
 	.connect = wlbt_cfg_connect,
 	.disconnect = wlbt_cfg_disconnect,
+	.add_key = wlbt_cfg_add_key,
+	.del_key = wlbt_cfg_del_key,
 };
 
 /*
