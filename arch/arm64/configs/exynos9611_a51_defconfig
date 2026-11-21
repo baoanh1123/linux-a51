@@ -146,4 +146,7 @@ CONFIG_NFS_V4_2=y
 CONFIG_CPU_FREQ_STAT=y
 # CPU cluster clock control (ACPM DVFS is firmware-owned but unserviced)
 CONFIG_EXYNOS9610_CPUCLK=y
+# Wireless extensions and the WLAN configuration interface the peer's scan
+# results are fed into
+CONFIG_CFG80211=y
 CONFIG_EXYNOS9610_WLBT=m

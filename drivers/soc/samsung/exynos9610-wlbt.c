@@ -52,6 +52,8 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
+#include <linux/etherdevice.h>
+#include <net/cfg80211.h>
 #include <linux/slab.h>
 
 /* PMU (0x11860000) - WLBT power and reset control, Exynos 9610 UM 9.6.6. */
@@ -394,6 +396,7 @@ struct wlbt_hip4_q {
 /* FAPI signals name this side as the sender (mlme.c:3545). */
 #define FAPI_SENDER_PID			0xc001
 #define FAPI_MLME_ADD_SCAN_REQ		0x2005
+#define FAPI_MLME_CONNECT_REQ		0x200b
 
 struct wlbt_mbulk {
 	__le32 next_offset;
@@ -637,6 +640,16 @@ struct exynos_wlbt {
 	struct wlbt_hip4_pool hip4_pool[2];
 	unsigned int n_hip4_tx;
 	unsigned int n_hip4_rx;
+	struct wiphy *wiphy;
+	struct net_device *netdev;
+	struct cfg80211_scan_request *scan_req;
+	struct delayed_work scan_work;
+	struct delayed_work connect_work;
+	u8 connect_bssid[ETH_ALEN];
+	u16 scan_id;
+	bool connecting;
+	bool connect_reported;		/* the peer answered the join */
+	u16 connect_status;		/* FAPI_RESULTCODE from MLME_CONNECT_IND */
 	struct wlbt_stream log;
 	struct wlbt_stream mgmt_in;
 	struct wlbt_stream mgmt_out;
@@ -650,6 +663,7 @@ struct exynos_wlbt {
 	unsigned int n_cfg_req;
 	unsigned int n_cfg_bad;
 	unsigned int n_wdog;
+	unsigned int n_tx_dropped;
 	unsigned int n_mbox;
 	u32 last_mbox_status;
 	u32 peek_offset;		/* MIF-relative, set by debugfs write */
@@ -1865,6 +1879,37 @@ static void wlbt_hip4_release(struct exynos_wlbt *w)
 	}
 }
 
+/*
+ * Print one segment of a scatter/gather frame.  The scan indications carry the
+ * beacon in a chained segment, so the head alone says nothing about what was
+ * received - but it is also the only place the information elements ever
+ * appear, so they are worth dumping.
+ */
+static void wlbt_hip4_show_segment(struct exynos_wlbt *w, u32 ref,
+				   const struct wlbt_mbulk *mb)
+{
+	u8 buf[256];
+	size_t len, sig;
+
+	sig = le16_to_cpu(mb->sig_bufsz);
+	len = le16_to_cpu(mb->len);
+	dev_info(w->dev,
+		 "  chain seg 0x%x flag 0x%02x sig %u len %u head %u\n",
+		 ref, mb->flag, (unsigned int)sig, (unsigned int)len,
+		 le16_to_cpu(mb->head));
+
+	if (len) {
+		/* Only the head is printed: a frame is recognisable from its
+		 * first bytes and the SSID is never far in.
+		 */
+		if (len > sizeof(buf))
+			len = sizeof(buf);
+		memcpy_fromio(buf, w->dram + ref + HIP4_MBULK_SIZE + sig, len);
+		print_hex_dump(KERN_INFO, "   data: ", DUMP_PREFIX_NONE, 16, 1,
+			       buf, len, false);
+	}
+}
+
 static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 {
 	u8 *scb = wlbt_hip4_scb(w);
@@ -1908,6 +1953,15 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 				 le16_to_cpu(hdr.sender_pid),
 				 le32_to_cpu(hdr.fw_reference));
 
+			/* MLME_CONNECT_IND is {le16 vif, le16 result} and is the
+			 * only place the outcome of a join shows up.
+			 */
+			if (le16_to_cpu(hdr.id) == 0x2303 &&
+			    len >= sizeof(hdr) + 4) {
+				w->connect_status = get_unaligned_le16(body + 2);
+				w->connect_reported = true;
+			}
+
 			if (len > sizeof(body))
 				len = sizeof(body);
 			memcpy_fromio(body, m + HIP4_MBULK_SIZE +
@@ -1938,6 +1992,7 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			if (chain[n_chain] >= w->mem_size - HIP4_SLOT_SIZE)
 				break;
 			memcpy_fromio(&mb, w->dram + chain[n_chain], sizeof(mb));
+			wlbt_hip4_show_segment(w, chain[n_chain], &mb);
 		}
 		if (hip4_return)
 			for (i = 0; i < n_chain; i++)
@@ -3295,6 +3350,468 @@ static int wlbt_parse_memory(struct exynos_wlbt *w)
 	return 0;
 }
 
+/*
+ * cfg80211 front end
+ *
+ * The peer is a full MAC: it scans and joins by itself and the driver only
+ * carries requests in and results out.  Its scan indications are metadata
+ * only - frequency, RSSI and a scan id, never a frame - so the beacons and
+ * probe responses it keeps for its own use are read back out of its DRAM once
+ * the scan is done.  A scan result without information elements is worthless
+ * to a supplicant, and this is the only place they can be had.
+ */
+#define WLBT_SCAN_CHUNK		8192
+#define WLBT_SCAN_OVERLAP	1024
+#define WLBT_SCAN_SEEN		64
+#define WLBT_SCAN_IE_MAX	512
+#define WLBT_SCAN_RSSI		(-65 * 100)	/* dBm, this firmware reports none */
+#define WLBT_SCAN_DELAY_MS	5000
+
+static struct ieee80211_channel wlbt_2ghz_channels[] = {
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2412, .hw_value = 1 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2417, .hw_value = 2 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2422, .hw_value = 3 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2427, .hw_value = 4 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2432, .hw_value = 5 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2437, .hw_value = 6 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2442, .hw_value = 7 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2447, .hw_value = 8 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2452, .hw_value = 9 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2457, .hw_value = 10 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2462, .hw_value = 11 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2467, .hw_value = 12 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2472, .hw_value = 13 },
+};
+
+static struct ieee80211_rate wlbt_2ghz_rates[] = {
+	{ .bitrate = 10 },
+	{ .bitrate = 20, .flags = IEEE80211_RATE_SHORT_PREAMBLE },
+	{ .bitrate = 55, .flags = IEEE80211_RATE_SHORT_PREAMBLE },
+	{ .bitrate = 110, .flags = IEEE80211_RATE_SHORT_PREAMBLE },
+	{ .bitrate = 60 },
+	{ .bitrate = 90 },
+	{ .bitrate = 120 },
+	{ .bitrate = 180 },
+	{ .bitrate = 240 },
+	{ .bitrate = 360 },
+	{ .bitrate = 480 },
+	{ .bitrate = 540 },
+};
+
+static struct ieee80211_supported_band wlbt_band_2ghz = {
+	.band = NL80211_BAND_2GHZ,
+	.channels = wlbt_2ghz_channels,
+	.n_channels = ARRAY_SIZE(wlbt_2ghz_channels),
+	.bitrates = wlbt_2ghz_rates,
+	.n_bitrates = ARRAY_SIZE(wlbt_2ghz_rates),
+};
+
+static struct exynos_wlbt *wlbt_from_wiphy(struct wiphy *wiphy)
+{
+	return *(struct exynos_wlbt **)wiphy_priv(wiphy);
+}
+
+/*
+ * A management frame worth reporting: a beacon or a probe response, both
+ * addresses being the access point, with elements that parse to the end.  The
+ * peer's DRAM is full of everything else, so the test has to be strict.
+ */
+static bool wlbt_bss_frame(const u8 *buf, size_t avail, size_t *frame_len,
+			   u16 *freq)
+{
+	static const u8 bssid_ofs = 16;
+	size_t off = 36;
+	bool have_ssid = false;
+	u8 channel = 0;
+	u16 fc;
+
+	if (avail < 36)
+		return false;
+
+	fc = get_unaligned_le16(buf);
+	if (fc != (IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_BEACON) &&
+	    fc != (IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_PROBE_RESP))
+		return false;
+	if (memcmp(buf + 10, buf + bssid_ofs, ETH_ALEN))
+		return false;
+	/* A zeroed or multicast address is one of the peer's other buffers
+	 * being mistaken for a frame, not an access point.
+	 */
+	if (is_zero_ether_addr(buf + bssid_ofs) ||
+	    !is_valid_ether_addr(buf + bssid_ofs))
+		return false;
+
+	while (off + 2 <= avail) {
+		u8 id = buf[off];
+		u8 len = buf[off + 1];
+
+		if (off + 2 + len > avail)
+			break;
+		if (id == WLAN_EID_SSID) {
+			if (len > 32)
+				break;
+			have_ssid = true;
+		} else if (id == WLAN_EID_DS_PARAMS && len >= 1) {
+			channel = buf[off + 2];
+		}
+		off += 2 + len;
+		if (off - 36 > WLBT_SCAN_IE_MAX)
+			break;
+	}
+
+	/*
+	 * Zero length elements are a legal way to pad, so the only hard
+	 * requirement is that the information elements were there at all and
+	 * that an SSID was among them.
+	 */
+	if (!have_ssid || off <= 36)
+		return false;
+
+	*frame_len = off;
+	*freq = channel ? 2412 + 5 * (channel - 1) : 2437;
+	return true;
+}
+
+static void wlbt_scan_report_one(struct exynos_wlbt *w, const u8 *frame,
+				 size_t len, u16 freq)
+{
+	struct cfg80211_inform_bss data = {
+		.chan = ieee80211_get_channel(w->wiphy, freq),
+		.signal = WLBT_SCAN_RSSI,
+	};
+	struct cfg80211_bss *bss;
+
+	bss = cfg80211_inform_bss_frame_data(w->wiphy, &data,
+					     (struct ieee80211_mgmt *)frame,
+					     len, GFP_KERNEL);
+	dev_info(w->dev, "bss %pM freq %u len %zu chan %s -> %s\n",
+		 frame + 16, freq, len, data.chan ? "known" : "UNKNOWN",
+		 IS_ERR(bss) ? "rejected" : "ok");
+	if (!IS_ERR_OR_NULL(bss))
+		cfg80211_put_bss(w->wiphy, bss);
+}
+
+static void wlbt_scan_collect(struct exynos_wlbt *w)
+{
+	u8 seen[WLBT_SCAN_SEEN][ETH_ALEN];
+	unsigned int n_seen = 0, n_frame = 0;
+	u32 off, limit = w->mem_size;
+	u8 *buf;
+
+	if (!w->dram || !w->wiphy)
+		return;
+
+	buf = kvmalloc(WLBT_SCAN_CHUNK + WLBT_SCAN_OVERLAP, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	for (off = 0; off < limit; off += WLBT_SCAN_CHUNK) {
+		size_t n = min_t(u32, WLBT_SCAN_CHUNK + WLBT_SCAN_OVERLAP,
+				 limit - off);
+		size_t i;
+
+		memcpy_fromio(buf, w->dram + off, n);
+		for (i = 0; i + 36 <= n && i < WLBT_SCAN_CHUNK; i++) {
+			size_t flen;
+			u16 freq;
+			unsigned int k;
+
+			if (!wlbt_bss_frame(buf + i, n - i, &flen, &freq))
+				continue;
+			for (k = 0; k < n_seen; k++)
+				if (!memcmp(seen[k], buf + i + 16, ETH_ALEN))
+					break;
+			if (k < n_seen)
+				continue;
+			if (n_seen < WLBT_SCAN_SEEN)
+				memcpy(seen[n_seen++], buf + i + 16, ETH_ALEN);
+			wlbt_scan_report_one(w, buf + i, flen, freq);
+			n_frame++;
+		}
+	}
+
+	kvfree(buf);
+	dev_info(w->dev, "scan: %u beacon(s) reported from the peer's memory\n",
+		 n_frame);
+}
+
+static void wlbt_scan_work(struct work_struct *work)
+{
+	struct exynos_wlbt *w = container_of(to_delayed_work(work),
+					     struct exynos_wlbt, scan_work);
+	struct cfg80211_scan_info info = { };
+	struct cfg80211_scan_request *req = w->scan_req;
+
+	w->scan_req = NULL;
+	if (!req)
+		return;
+
+	mutex_lock(&w->lock);
+	wlbt_scan_collect(w);
+	mutex_unlock(&w->lock);
+
+	cfg80211_scan_done(req, &info);
+}
+
+static int wlbt_cfg_scan(struct wiphy *wiphy,
+			 struct cfg80211_scan_request *request)
+{
+	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+	int ret;
+
+	if (!w->hip4_control)
+		return -EIO;
+	if (w->scan_req)
+		return -EBUSY;
+
+	/* The scan id names the interface in its upper byte and the peer
+	 * refuses anything below 0x100, so the low byte just wraps.
+	 */
+	w->scan_id = 0x0100 | ((w->scan_id + 1) & 0xff);
+	ret = wlbt_mlme_add_scan(w, w->scan_id);
+	if (ret)
+		return ret;
+
+	w->scan_req = request;
+	schedule_delayed_work(&w->scan_work,
+			      msecs_to_jiffies(WLBT_SCAN_DELAY_MS));
+	return 0;
+}
+
+/*
+ * The join is the peer's job: the driver only builds MLME_CONNECT_REQ and waits
+ * for the firmware to report the outcome.  The request layout this firmware
+ * wants is still not fully known - only the authentication type (body + 4) and
+ * the interface (body + 0) could be pinned down with the fault channel - so the
+ * body keeps the arrangement that the peer accepted once: the first and last
+ * two bytes of the BSSID around the authentication type, the frequency at
+ * +10, and the information elements as payload.
+ */
+static int wlbt_mlme_connect(struct exynos_wlbt *w, const u8 *bssid, u16 auth,
+			     u16 freq, const u8 *ssid, size_t ssid_len)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 24];
+	u8 dat[2 + 32];
+	struct wlbt_fapi_hdr hdr = { };
+	size_t n = 0;
+
+	memset(sig, 0, sizeof(sig));
+	memset(dat, 0, sizeof(dat));
+
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);	/* vif 1, little endian */
+	memcpy(sig + sizeof(hdr) + 2, bssid, 2);
+	put_unaligned_le16(auth, sig + sizeof(hdr) + 4);
+	memcpy(sig + sizeof(hdr) + 6, bssid + 4, 2);
+	put_unaligned_le16(1, sig + sizeof(hdr) + 8);
+	put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 10);
+
+	if (ssid_len > 32)
+		ssid_len = 32;
+	dat[n++] = WLAN_EID_SSID;
+	dat[n++] = ssid_len;
+	memcpy(dat + n, ssid, ssid_len);
+	n += ssid_len;
+
+	hdr.id = cpu_to_le16(FAPI_MLME_CONNECT_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 24, dat, n);
+}
+
+static void wlbt_connect_work(struct work_struct *work)
+{
+	struct exynos_wlbt *w = container_of(to_delayed_work(work),
+					     struct exynos_wlbt, connect_work);
+
+	if (!w->connecting)
+		return;
+	w->connecting = false;
+
+	if (w->connect_reported && !w->connect_status) {
+		dev_info(w->dev, "connect: associated with %pM\n",
+			 w->connect_bssid);
+		cfg80211_connect_result(w->netdev, w->connect_bssid, NULL, 0,
+					NULL, 0, WLAN_STATUS_SUCCESS, GFP_KERNEL);
+		return;
+	}
+
+	dev_info(w->dev, "connect: failed, peer result 0x%04x%s\n",
+		 w->connect_status,
+		 w->connect_reported ? "" : " (no indication)");
+	cfg80211_connect_result(w->netdev, w->connect_bssid, NULL, 0, NULL, 0,
+				WLAN_STATUS_UNSPECIFIED_FAILURE, GFP_KERNEL);
+}
+
+static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
+			    struct cfg80211_connect_params *sme)
+{
+	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+	u16 freq = 2437;
+	u16 auth;
+	int ret;
+
+	if (!w->hip4_control)
+		return -EIO;
+	if (w->connecting)
+		return -EBUSY;
+
+	if (sme->channel && sme->channel->center_freq)
+		freq = sme->channel->center_freq;
+
+	/* The firmware knows the vendor's authentication enum, which happens to
+	 * match cfg80211's for open and shared key.
+	 */
+	auth = sme->auth_type;
+
+	dev_info(w->dev, "connect: %pM freq %u auth %u ssid \"%.*s\" ies %zu\n",
+		 sme->bssid, freq, auth, (int)sme->ssid_len, sme->ssid,
+		 sme->ie_len);
+
+	memcpy(w->connect_bssid, sme->bssid, ETH_ALEN);
+	w->connect_reported = false;
+	w->connect_status = 0;
+
+	ret = wlbt_mlme_connect(w, sme->bssid, auth, freq, sme->ssid,
+				sme->ssid_len);
+	if (ret)
+		return ret;
+
+	w->connecting = true;
+	schedule_delayed_work(&w->connect_work, msecs_to_jiffies(10000));
+	return 0;
+}
+
+static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
+			       u16 reason_code)
+{
+	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+
+	cancel_delayed_work_sync(&w->connect_work);
+	w->connecting = false;
+	cfg80211_disconnected(ndev, reason_code, NULL, 0, true, GFP_KERNEL);
+	return 0;
+}
+static const struct cfg80211_ops wlbt_cfg80211_ops = {
+	.scan = wlbt_cfg_scan,
+	.connect = wlbt_cfg_connect,
+	.disconnect = wlbt_cfg_disconnect,
+};
+
+/*
+ * The data path is not there yet, so the interface reports no carrier and
+ * drops whatever it is handed.  It still has to exist: registering a netdev
+ * goes through netdev_ops whatever the driver is able to do afterwards.
+ */
+static int wlbt_net_open(struct net_device *ndev)
+{
+	netif_carrier_off(ndev);
+	netif_start_queue(ndev);
+	return 0;
+}
+
+static int wlbt_net_stop(struct net_device *ndev)
+{
+	netif_stop_queue(ndev);
+	netif_carrier_off(ndev);
+	return 0;
+}
+
+static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
+{
+	struct exynos_wlbt *w = *(struct exynos_wlbt **)netdev_priv(ndev);
+
+	dev_kfree_skb(skb);
+	w->n_tx_dropped++;
+	return NETDEV_TX_OK;
+}
+
+static const struct net_device_ops wlbt_netdev_ops = {
+	.ndo_open = wlbt_net_open,
+	.ndo_stop = wlbt_net_stop,
+	.ndo_start_xmit = wlbt_net_xmit,
+};
+
+static const u8 wlbt_mac[ETH_ALEN] = { 0x8c, 0x77, 0x12, 0xaa, 0xbb, 0xcc };
+
+static int wlbt_register_wiphy(struct exynos_wlbt *w)
+{
+	struct wireless_dev *wdev;
+	struct net_device *ndev;
+	struct wiphy *wiphy;
+	int ret;
+
+	wiphy = wiphy_new(&wlbt_cfg80211_ops, sizeof(struct exynos_wlbt *));
+	if (!wiphy)
+		return -ENOMEM;
+
+	*(struct exynos_wlbt **)wiphy_priv(wiphy) = w;
+	set_wiphy_dev(wiphy, w->dev);
+	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	wiphy->max_scan_ssids = 1;
+	wiphy->bands[NL80211_BAND_2GHZ] = &wlbt_band_2ghz;
+
+	ret = wiphy_register(wiphy);
+	if (ret)
+		goto err_free;
+
+	ndev = alloc_netdev(sizeof(*wdev), "wlan%d", NET_NAME_ENUM, ether_setup);
+	if (!ndev) {
+		ret = -ENOMEM;
+		goto err_unregister;
+	}
+
+	wdev = netdev_priv(ndev);
+	wdev->wiphy = wiphy;
+	wdev->iftype = NL80211_IFTYPE_STATION;
+	ndev->ieee80211_ptr = wdev;
+	ndev->netdev_ops = &wlbt_netdev_ops;
+	SET_NETDEV_DEV(ndev, w->dev);
+	eth_hw_addr_set(ndev, wlbt_mac);
+
+	ret = cfg80211_register_netdevice(ndev);
+	if (ret) {
+		free_netdev(ndev);
+		goto err_unregister;
+	}
+
+	w->wiphy = wiphy;
+	w->netdev = ndev;
+	INIT_DELAYED_WORK(&w->scan_work, wlbt_scan_work);
+	INIT_DELAYED_WORK(&w->connect_work, wlbt_connect_work);
+	dev_info(w->dev, "registered %s\n", netdev_name(ndev));
+	return 0;
+
+err_unregister:
+	wiphy_unregister(wiphy);
+err_free:
+	wiphy_free(wiphy);
+	return ret;
+}
+
+static void wlbt_unregister_wiphy(struct exynos_wlbt *w)
+{
+	if (!w->wiphy)
+		return;
+
+	cancel_delayed_work_sync(&w->scan_work);
+	cancel_delayed_work_sync(&w->connect_work);
+	if (w->scan_req) {
+		struct cfg80211_scan_info info = { .aborted = true };
+
+		cfg80211_scan_done(w->scan_req, &info);
+		w->scan_req = NULL;
+	}
+	if (w->netdev) {
+		cfg80211_unregister_netdevice(w->netdev);
+		free_netdev(w->netdev);
+		w->netdev = NULL;
+	}
+	wiphy_unregister(w->wiphy);
+	wiphy_free(w->wiphy);
+	w->wiphy = NULL;
+}
+
 static int wlbt_probe(struct platform_device *pdev)
 {
 	struct exynos_wlbt *w;
@@ -3378,6 +3895,14 @@ static int wlbt_probe(struct platform_device *pdev)
 
 	wlbt_debugfs_init(w);
 
+	/* The interface is registered even when the peer is not started: the
+	 * scan op reports -EIO until the transport exists, which is a better
+	 * answer than no interface at all.
+	 */
+	ret = wlbt_register_wiphy(w);
+	if (ret)
+		dev_warn(w->dev, "no wireless interface: %d\n", ret);
+
 	dev_info(w->dev, "mailbox at %pR, MIF DRAM %pa (%pa)\n",
 		 platform_get_resource(pdev, IORESOURCE_MEM, 0),
 		 &w->mem_base, &w->mem_size);
@@ -3390,6 +3915,8 @@ static int wlbt_probe(struct platform_device *pdev)
 static void wlbt_remove(struct platform_device *pdev)
 {
 	struct exynos_wlbt *w = platform_get_drvdata(pdev);
+
+	wlbt_unregister_wiphy(w);
 
 	mutex_lock(&w->lock);
 	wlbt_power_down(w);
