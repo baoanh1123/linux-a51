@@ -401,6 +401,7 @@ struct wlbt_hip4_q {
 #define FAPI_MLME_ADD_VIF_REQ		0x2007
 #define FAPI_MLME_SET_HOST_STATE_REQ	0x2028
 #define FAPI_MLME_SETKEYS_REQ		0x2018
+#define FAPI_MLME_SET_COUNTRY_REQ	0x2033
 
 /* Key types the peer knows (fapi.h). */
 #define FAPI_KEYTYPE_GROUP	0
@@ -3615,21 +3616,12 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
 }
 
 /*
- * The join is the peer's job: the driver only builds MLME_CONNECT_REQ and waits
- * for the firmware to report the outcome.  The request layout this firmware
- * wants is still not fully known - only the authentication type (body + 4) and
- * the interface (body + 0) could be pinned down with the fault channel - so the
- * body keeps the arrangement that the peer accepted once: the first and last
- * two bytes of the BSSID around the authentication type, the frequency at
- * +10, and the information elements as payload.
- */
-/*
  * Bringing the interface up is a firmware sequence, not a driver one: the peer
  * needs a vif record before it will accept a join against it, and it refuses
  * the join with INVALID_VIF_INDEX (0x800a, fault 0x2614) otherwise.  The vendor
- * driver sends MLME_ADD_VIF and then the host state when the net device opens;
- * both are sent here on the first join instead, because the peer has to be
- * running before either makes sense.
+ * driver sends MLME_ADD_VIF, the host state and the country when the net device
+ * opens; all three are sent here on the first join instead, because the peer has
+ * to be running before any of them makes sense.
  */
 static int wlbt_mlme_add_vif(struct exynos_wlbt *w)
 {
@@ -3670,6 +3662,28 @@ static int wlbt_mlme_host_state(struct exynos_wlbt *w, u16 state)
 	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 16, NULL, 0);
 }
 
+/*
+ * The peer will not transmit on a channel its regulatory domain does not allow,
+ * which shows up as a join refused with NOT_ALLOWED rather than as an error at
+ * scan time.  The vendor sends this right after the host state.
+ */
+static int wlbt_mlme_set_country(struct exynos_wlbt *w, const char *alpha2)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14];
+	struct wlbt_fapi_hdr hdr = { };
+
+	memset(sig, 0, sizeof(sig));
+	put_unaligned_le16(0, sig + sizeof(hdr) + 0);	/* not tied to a vif */
+	put_unaligned_le16((alpha2[0] << 8) | alpha2[1],
+			   sig + sizeof(hdr) + 2);
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SET_COUNTRY_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 14, NULL, 0);
+}
+
 static int wlbt_vif_up(struct exynos_wlbt *w)
 {
 	int ret;
@@ -3690,33 +3704,55 @@ static int wlbt_vif_up(struct exynos_wlbt *w)
 		return ret;
 	msleep(50);
 
+	ret = wlbt_mlme_set_country(w, "VN");
+	if (ret)
+		return ret;
+	msleep(50);
+
 	w->vif_created = true;
 	return 0;
 }
-static int wlbt_mlme_connect(struct exynos_wlbt *w, const u8 *bssid, u16 auth,
-			     u16 freq, const u8 *ssid, size_t ssid_len)
+
+/*
+ * The join is the peer's job: the driver only builds MLME_CONNECT_REQ and waits
+ * for the firmware to report the outcome.  The body is the vendor's layout -
+ * interface, BSSID, authentication type at +8 and the channel frequency at +10
+ * as twice the real value - which is the one the peer accepts and acts on.
+ *
+ * The information elements are the association request's.  cfg80211 does not
+ * include the SSID in what it hands over, and the peer refuses a request without
+ * it (INVALID_PARAMETERS) as well as one without an RSN element
+ * (REJECTED_INVALID_IE).
+ */
+static int wlbt_mlme_connect(struct exynos_wlbt *w,
+			     const struct cfg80211_connect_params *sme,
+			     u16 freq)
 {
 	u8 sig[sizeof(struct wlbt_fapi_hdr) + 24];
-	u8 dat[2 + 32];
+	u8 dat[2 + IEEE80211_MAX_SSID_LEN + 512];
 	struct wlbt_fapi_hdr hdr = { };
-	size_t n = 0;
+	size_t ssid_len = sme->ssid_len, n = 0;
+
+	if (!sme->bssid || ssid_len > IEEE80211_MAX_SSID_LEN)
+		return -EINVAL;
 
 	memset(sig, 0, sizeof(sig));
-	memset(dat, 0, sizeof(dat));
-
-	put_unaligned_le16(1, sig + sizeof(hdr) + 0);	/* vif 1, little endian */
-	memcpy(sig + sizeof(hdr) + 2, bssid, 2);
-	put_unaligned_le16(auth, sig + sizeof(hdr) + 4);
-	memcpy(sig + sizeof(hdr) + 6, bssid + 4, 2);
-	put_unaligned_le16(1, sig + sizeof(hdr) + 8);
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif 1 */
+	memcpy(sig + sizeof(hdr) + 2, sme->bssid, ETH_ALEN);
+	put_unaligned_le16(sme->auth_type, sig + sizeof(hdr) + 8);
 	put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 10);
 
-	if (ssid_len > 32)
-		ssid_len = 32;
 	dat[n++] = WLAN_EID_SSID;
 	dat[n++] = ssid_len;
-	memcpy(dat + n, ssid, ssid_len);
+	memcpy(dat + n, sme->ssid, ssid_len);
 	n += ssid_len;
+
+	if (sme->ie_len) {
+		if (sme->ie_len > sizeof(dat) - n)
+			return -EINVAL;
+		memcpy(dat + n, sme->ie, sme->ie_len);
+		n += sme->ie_len;
+	}
 
 	hdr.id = cpu_to_le16(FAPI_MLME_CONNECT_REQ);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
@@ -3754,7 +3790,6 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 {
 	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
 	u16 freq = 2437;
-	u16 auth;
 	int ret;
 
 	if (!w->hip4_control)
@@ -3769,21 +3804,15 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	if (sme->channel && sme->channel->center_freq)
 		freq = sme->channel->center_freq;
 
-	/* The firmware knows the vendor's authentication enum, which happens to
-	 * match cfg80211's for open and shared key.
-	 */
-	auth = sme->auth_type;
-
 	dev_info(w->dev, "connect: %pM freq %u auth %u ssid \"%.*s\" ies %zu\n",
-		 sme->bssid, freq, auth, (int)sme->ssid_len, sme->ssid,
+		 sme->bssid, freq, sme->auth_type, (int)sme->ssid_len, sme->ssid,
 		 sme->ie_len);
 
 	memcpy(w->connect_bssid, sme->bssid, ETH_ALEN);
 	w->connect_reported = false;
 	w->connect_status = 0;
 
-	ret = wlbt_mlme_connect(w, sme->bssid, auth, freq, sme->ssid,
-				sme->ssid_len);
+	ret = wlbt_mlme_connect(w, sme, freq);
 	if (ret)
 		return ret;
 
