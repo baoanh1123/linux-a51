@@ -51,6 +51,7 @@
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/reboot.h>
 #include <linux/seq_file.h>
 #include <linux/etherdevice.h>
 #include <net/cfg80211.h>
@@ -623,6 +624,7 @@ struct exynos_wlbt {
 	struct regmap *remap;
 	struct regmap *boot_cfg;
 	struct mutex lock;		/* serialises boot and reset */
+	struct notifier_block reboot_nb;
 	struct completion cfg_ack;
 	enum wlbt_state state;
 	phys_addr_t mem_base;		/* MIF DRAM, 16 MiB */
@@ -2391,6 +2393,16 @@ static int wlbt_power_down(struct exynos_wlbt *w)
 	u32 val;
 	int ret;
 
+	/*
+	 * Mask both directions first: the peer can be mid-transfer when this is
+	 * called from a reboot notifier, and a line left asserted survives the
+	 * reset of the SoC in the WLBT block's own registers.
+	 */
+	if (w->mbox) {
+		writel(0xffff0000, w->mbox + MBOX_INTMR0);
+		writel(0x0000ffff, w->mbox + MBOX_INTMR1);
+	}
+
 	ret = regmap_update_bits(w->pmu, CENTRAL_SEQ_WLBT_CONFIGURATION,
 				 SYS_PWR_CFG_16, 0);
 	ret |= regmap_update_bits(w->pmu, RESET_AHEAD_WLBT_SYS_PWR_REG,
@@ -3910,6 +3922,25 @@ static void wlbt_unregister_wiphy(struct exynos_wlbt *w)
 	w->wiphy = NULL;
 }
 
+/*
+ * A warm reboot does not reset the WLBT block: its power configuration lives in
+ * the PMU and the peer keeps running across the reset of the SoC.  Leaving it
+ * like that is how a boot turns into a hang, so shut the peer down on the way
+ * out as well.
+ */
+static int wlbt_reboot_notifier(struct notifier_block *nb, unsigned long action,
+				void *data)
+{
+	struct exynos_wlbt *w = container_of(nb, struct exynos_wlbt, reboot_nb);
+
+	if (!mutex_trylock(&w->lock))
+		return NOTIFY_DONE;
+	wlbt_power_down(w);
+	mutex_unlock(&w->lock);
+
+	return NOTIFY_DONE;
+}
+
 static int wlbt_probe(struct platform_device *pdev)
 {
 	struct exynos_wlbt *w;
@@ -3992,6 +4023,10 @@ static int wlbt_probe(struct platform_device *pdev)
 		return ret;
 
 	wlbt_debugfs_init(w);
+
+	w->reboot_nb.notifier_call = wlbt_reboot_notifier;
+	if (devm_register_reboot_notifier(w->dev, &w->reboot_nb))
+		dev_warn(w->dev, "cannot register the reboot notifier\n");
 
 	/* The interface is registered even when the peer is not started: the
 	 * scan op reports -EIO until the transport exists, which is a better
