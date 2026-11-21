@@ -1800,6 +1800,39 @@ static void wlbt_mib_send_slice(struct exynos_wlbt *w, const u8 *mib,
  * Walk the entry stream {u16 id, u16 len, data[len]} (padded to even) and hand
  * it over in slices the peer can take in one signal.
  */
+/*
+ * The MIB files only carry the entries above PSID 0x08cf.  The golden, host owned
+ * ones below that range are not in any of the shipped variants, and the peer will
+ * not join a network without them: its join builds the basic rate set of the
+ * association from SLSI_PSID_UNIFI_SUPPORTED_DATA_RATES and refuses the request
+ * with fault 0x2c1f - reported as 0x0030 NOT_ALLOWED - when that set is empty.
+ *
+ * The rate list is N followed by N rates in units of 500 kbit/s, which is the
+ * 802.11b/g set: 1, 2, 5.5 and 11 Mbit/s then 6, 9, 12, 18, 24, 36, 48 and 54.
+ */
+#define MIB_PSID_SUPPORTED_DATA_RATES	0x07f9
+#define MIB_PSID_EXTENDED_CAPABILITIES	0x07ef
+
+static const u8 wlbt_golden_rates[] = {
+	12, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c,
+};
+
+/* The vendor driver advertises these extended capabilities and clears the rest. */
+static const u8 wlbt_golden_ext_caps[] = {
+	9, 0xff, 0xff, 0xf7, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff,
+};
+
+static const struct {
+	u16 psid;
+	const u8 *value;
+	size_t len;
+} wlbt_golden_mibs[] = {
+	{ MIB_PSID_SUPPORTED_DATA_RATES, wlbt_golden_rates,
+	  sizeof(wlbt_golden_rates) },
+	{ MIB_PSID_EXTENDED_CAPABILITIES, wlbt_golden_ext_caps,
+	  sizeof(wlbt_golden_ext_caps) },
+};
+
 static int wlbt_download_mibs(struct exynos_wlbt *w)
 {
 	static const char *const names[] = {
@@ -1867,6 +1900,26 @@ static int wlbt_download_mibs(struct exynos_wlbt *w)
 			slices++;
 			slice_len = 0;
 		}
+	}
+
+	/* The golden host owned entries the firmware files do not carry. */
+	for (i = 0; i < ARRAY_SIZE(wlbt_golden_mibs); i++) {
+		size_t len = 4 + wlbt_golden_mibs[i].len;
+		size_t padded = ALIGN(len, 2);
+
+		if (slice_len + padded > mib_slice_max) {
+			wlbt_mib_send_slice(w, slice, slice_len);
+			slices++;
+			slice_len = 0;
+		}
+
+		put_unaligned_le16(wlbt_golden_mibs[i].psid, slice + slice_len);
+		put_unaligned_le16(wlbt_golden_mibs[i].len, slice + slice_len + 2);
+		memcpy(slice + slice_len + 4, wlbt_golden_mibs[i].value,
+		       wlbt_golden_mibs[i].len);
+		memset(slice + slice_len + len, 0, padded - len);
+		slice_len += padded;
+		entries++;
 	}
 
 	kfree(slice);
