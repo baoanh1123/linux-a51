@@ -247,6 +247,10 @@
 #define HIP4_RX_SIZE			0x100000
 #define HIP4_TOTAL_MEM			(HIP4_CONFIG_SIZE + HIP4_MIB_SIZE + \
 					 HIP4_TX_SIZE + HIP4_RX_SIZE)
+/* Hardware configuration files carry this version word after their prologue. */
+#define MIB_PROLOGUE_SIZE	8
+#define MIB_PROLOGUE_MARKER	0x0120
+
 #define HIP4_ALLOC_SIZE			0x280000	/* what hip4_init asks for */
 #define HIP4_Q_NUM			6
 #define HIP4_Q_LEN			256
@@ -1118,6 +1122,7 @@ static u32 wlbt_load_mib(struct exynos_wlbt *w)
 		"mx140/mx140_wlan_sw.hcf",
 	};
 	u32 total = 0;
+	size_t skip;
 	unsigned int i;
 
 	/* Clear the area so the peer never picks up a stale MIB. */
@@ -1130,16 +1135,30 @@ static u32 wlbt_load_mib(struct exynos_wlbt *w)
 			dev_warn(w->dev, "MIB %s not available\n", names[i]);
 			continue;
 		}
-		if (total + fw->size > HIP4_MIB_SIZE) {
+		/*
+		 * The files carry an eight byte prologue (a hash, a checksum
+		 * and a format version) in front of the entry stream, but the
+		 * peer is handed the start of the stream: its walker reads
+		 * {u16 id, u16 len} from the first byte it is pointed at and
+		 * would otherwise take the prologue for an entry with a bogus
+		 * length and assert.
+		 */
+		skip = 0;
+		if (fw->size > MIB_PROLOGUE_SIZE &&
+		    get_unaligned_le16(fw->data + 6) == MIB_PROLOGUE_MARKER)
+			skip = MIB_PROLOGUE_SIZE;
+
+		if (total + fw->size - skip > HIP4_MIB_SIZE) {
 			dev_warn(w->dev, "MIB %s does not fit (%u+%zu > %u)\n",
-				 names[i], total, fw->size, HIP4_MIB_SIZE);
+				 names[i], total, fw->size - skip,
+				 HIP4_MIB_SIZE);
 			release_firmware(fw);
 			break;
 		}
 
 		memcpy_toio(w->dram + w->hip4_ref + HIP4_MIB_OFFSET + total,
-			    fw->data, fw->size);
-		total += fw->size;
+			    fw->data + skip, fw->size - skip);
+		total += fw->size - skip;
 		release_firmware(fw);
 	}
 
