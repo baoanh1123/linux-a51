@@ -747,7 +747,11 @@ module_param(sig_self_ref, bool, 0644);
 MODULE_PARM_DESC(sig_self_ref, "Point fw_reference at the signal's own segment");
 
 static unsigned int send_ref;
+static int sig_refcnt = -1;
 module_param(send_ref, uint, 0644);
+
+/* Override the mbulk reference count of frames sent on the datapath. */
+module_param(sig_refcnt, int, 0644);
 MODULE_PARM_DESC(send_ref, "fw_reference to put in signals sent from the hip4 node");
 
 static bool mib_early;
@@ -1500,6 +1504,30 @@ static void wlbt_hip4_push(struct exynos_wlbt *w, u32 q, u32 ref)
 	writel(BIT(WLBT_BIT_HIP4_FROM_HOST), w->mbox + MBOX_INTGR1);
 }
 
+/*
+ * Show the bookkeeping of every queue: the host half of the index pair and the
+ * mirror the peer maintains.  When the peer wedges on a segment reference this
+ * is what says whether it ran ahead, fell behind, or read a slot nobody wrote.
+ */
+static void wlbt_hip4_state(struct exynos_wlbt *w)
+{
+	static const char *const names[HIP4_Q_NUM] = {
+		"FH_CTL", "FH_DAT", "FH_RFB", "TH_CTL", "TH_DAT", "TH_RFB",
+	};
+	u8 *scb = wlbt_hip4_scb(w);
+	unsigned int q;
+
+	for (q = 0; q < HIP4_Q_NUM; q++) {
+		u8 hw = readb(scb + wlbt_hip4_idx[q][0]);
+		u8 hr = readb(scb + wlbt_hip4_idx[q][1]);
+		u32 next = hw & (HIP4_Q_LEN - 1);
+
+		dev_info(w->dev, "HIP4 %-6s host w %3u r %3u  next ref 0x%x\n",
+			 names[q], hw, hr,
+			 readl(wlbt_hip4_q_slot(w, q, next)));
+	}
+}
+
 static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 			  size_t sig_len, const void *data, size_t data_len)
 {
@@ -1521,7 +1549,13 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	mb.flag = MBULK_F_SIG | MBULK_F_OBOUND;
 	mb.clas = ctrl ? MBULK_CLASS_FROM_HOST_CTL : MBULK_CLASS_FROM_HOST_DAT;
 	mb.pid = ctrl ? MBULK_POOL_ID_CTRL : MBULK_POOL_ID_DATA;
-	mb.refcnt = data_len ? 1 : 0;
+	/*
+	 * The peer's allocator ties the reference count to the data buffer,
+	 * but its release path asserts when it finds zero, so the right value
+	 * is not obvious from either side alone.  -1 keeps the allocator rule,
+	 * anything else is written as given.
+	 */
+	mb.refcnt = sig_refcnt < 0 ? (data_len ? 1 : 0) : sig_refcnt;
 	mb.dat_bufsz = cpu_to_le16(data_len);
 	mb.sig_bufsz = cpu_to_le16(sig_bufsz);
 	mb.len = cpu_to_le16(data_len);
@@ -1534,8 +1568,14 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	if (data_len)
 		memcpy_toio(m + HIP4_MBULK_SIZE + sig_bufsz, data, data_len);
 	if (sig_self_ref) {
-		/* The peer's window starts at 0x80000000 (see the MIF setup). */
-		__le32 self = cpu_to_le32((u32)(0x80000000 + ref));
+		/*
+		 * The peer compares this word against the transmit and receive
+		 * window bounds it kept from the HIP4 configuration.  Those are
+		 * shared memory refs and the peer offsets them into the MIF
+		 * window itself, so the reference has to stay a ref: naming the
+		 * segment the signal travels in puts it inside both windows.
+		 */
+		__le32 self = cpu_to_le32(ref);
 
 		memcpy_toio(m + HIP4_MBULK_SIZE + HIP4_SIG_RESERVED +
 			    offsetof(struct wlbt_fapi_hdr, fw_reference),
@@ -2440,10 +2480,12 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 	struct exynos_wlbt *w = file->private_data;
 	struct wlbt_fapi_hdr hdr = { };
 	u8 sig[sizeof(hdr) + 2048];
+	u8 dat[1024];
 	char kbuf[4608];
 	char cmd[16];
-	const char *p;
-	unsigned int id, val, n = 0;
+	const char *p, *q;
+	char *sep;
+	unsigned int id, val, n = 0, dn = 0;
 	int ret, used = 0;
 
 	ret = simple_write_to_buffer(kbuf, sizeof(kbuf) - 1, ppos, buf, len);
@@ -2458,6 +2500,12 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 
 	if (sscanf(kbuf, "%15s", cmd) != 1) {
 		ret = -EINVAL;
+		goto out;
+	}
+
+	if (!strcmp(cmd, "state")) {
+		wlbt_hip4_state(w);
+		ret = len;
 		goto out;
 	}
 
@@ -2494,7 +2542,7 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 		goto out;
 	}
 
-	if (strcmp(cmd, "send") || !w->hip4_started) {
+	if ((strcmp(cmd, "send") && strcmp(cmd, "sendp")) || !w->hip4_started) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -2505,8 +2553,40 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 		goto out;
 	}
 	p += used;
+	while (*p == ' ')
+		p++;
 
-	/* The payload is a hex string with the bytes run together. */
+	/*
+	 * "sendp" takes a second, whitespace separated run of bytes: the
+	 * payload that follows the signal.  Requests carrying information
+	 * elements want them there, not inside the signal.
+	 */
+	if (!strcmp(cmd, "sendp")) {
+		sep = strchr(p, ' ');
+		if (!sep) {
+			ret = -EINVAL;
+			goto out;
+		}
+		*sep = '\0';
+		q = sep + 1;
+		for (; *q && dn < sizeof(dat); q++) {
+			if (!isxdigit(*q))
+				continue;
+			val = hex_to_bin(*q);
+			if (dn & 1)
+				dat[dn / 2] |= val;
+			else
+				dat[dn / 2] = val << 4;
+			dn++;
+		}
+		if (dn & 1) {
+			ret = -EINVAL;
+			goto out;
+		}
+		dn /= 2;
+	}
+
+	/* The signal is a hex string with the bytes run together. */
 	for (; *p && n < sizeof(sig) - sizeof(hdr); p++) {
 		if (!isxdigit(*p))
 			continue;
@@ -2528,9 +2608,10 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 	hdr.fw_reference = cpu_to_le32(send_ref);
 	memcpy(sig, &hdr, sizeof(hdr));
 
-	ret = wlbt_hip4_send(w, true, sig, sizeof(hdr) + n, NULL, 0);
-	dev_info(w->dev, "HIP4 signal 0x%04x (%u bytes of payload): %d\n",
-		 id, n, ret);
+	ret = wlbt_hip4_send(w, true, sig, sizeof(hdr) + n,
+			     dn ? dat : NULL, dn);
+	dev_info(w->dev, "HIP4 signal 0x%04x (%zu byte signal, %zu data): %d\n",
+		 id, sizeof(hdr) + n, dn, ret);
 	if (ret)
 		goto out;
 
