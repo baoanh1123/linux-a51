@@ -1453,6 +1453,56 @@ static ssize_t wlbt_debugfs_halt(struct file *file, const char __user *buf,
 	return sent ? len : -EIO;
 }
 
+/*
+ * Send one management frame: write "<channel> <ma_msg> <arg>" where the three
+ * fields are plain decimals and arg is optional.  This is how the peer is asked
+ * to start a service (channel 1), and it reports what the peer did with the
+ * frame so a silent peer cannot be mistaken for a working one.
+ */
+static ssize_t wlbt_debugfs_send(struct file *file, const char __user *buf,
+				 size_t len, loff_t *ppos)
+{
+	struct exynos_wlbt *w = file->private_data;
+	unsigned int channel, msg, arg = 0;
+	unsigned int before = w->n_mgmt;
+	char text[64];
+	bool sent;
+	int i;
+
+	if (len == 0 || len >= sizeof(text))
+		return -EINVAL;
+	if (copy_from_user(text, buf, len))
+		return -EFAULT;
+	text[len] = '\0';
+
+	if (sscanf(text, "%u %u %u", &channel, &msg, &arg) < 2)
+		return -EINVAL;
+	if (channel > 255 || msg > 255)
+		return -EINVAL;
+
+	mutex_lock(&w->lock);
+	sent = wlbt_mgmt_send(w, channel, msg, arg);
+
+	/* Same doorbell trick as halt: look before draining, because the peer's
+	 * log acknowledgements write the same register.
+	 */
+	for (i = 0; i < 10; i++) {
+		if (!(readl(w->mbox + MBOX_INTSR1) & BIT(WLBT_BIT_MGMT_OUT_WRITE)))
+			break;
+		msleep(100);
+	}
+	dev_info(w->dev, "sent ch%u msg %u arg 0x%x (%s), peer %s the doorbell, ring read %u write %u\n",
+		 channel, msg, arg, sent ? "written" : "failed",
+		 i < 10 ? "took" : "ignored",
+		 readl(w->dram + w->mgmt_out.ridx),
+		 readl(w->dram + w->mgmt_out.widx));
+	wlbt_mgmt_drain(w);
+	dev_info(w->dev, "%u management message(s) in reply\n", w->n_mgmt - before);
+	mutex_unlock(&w->lock);
+
+	return sent ? len : -EIO;
+}
+
 static ssize_t wlbt_debugfs_reset(struct file *file, const char __user *buf,
 				  size_t len, loff_t *ppos)
 {
@@ -1774,6 +1824,8 @@ static const struct file_operations wlbt_reset_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_reset);
 static const struct file_operations wlbt_halt_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_halt);
+static const struct file_operations wlbt_send_fops =
+	WLBT_DEBUGFS_OPS(wlbt_debugfs_send);
 
 /*
  * What did the peer do with its memory?  The image occupies [0, fw_size) and
@@ -1930,6 +1982,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("boot", 0200, w->debugfs, w, &wlbt_boot_fops);
 	debugfs_create_file("off", 0200, w->debugfs, w, &wlbt_reset_fops);
 	debugfs_create_file("halt", 0200, w->debugfs, w, &wlbt_halt_fops);
+	debugfs_create_file("send", 0200, w->debugfs, w, &wlbt_send_fops);
 	debugfs_create_file("peek", 0600, w->debugfs, w, &wlbt_peek_fops);
 	debugfs_create_file("trace", 0600, w->debugfs, w, &wlbt_trace_fops);
 	debugfs_create_file("find", 0600, w->debugfs, w, &wlbt_find_fops);
