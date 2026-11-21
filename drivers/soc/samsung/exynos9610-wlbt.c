@@ -1126,6 +1126,7 @@ static void wlbt_mgmt_drain(struct exynos_wlbt *w)
  * Doorbell from the peer: one bit per stream, INTSR0[31:16].
  */
 static void wlbt_hip4_drain(struct exynos_wlbt *w);
+static void wlbt_dram_bsses(struct exynos_wlbt *w, struct seq_file *s);
 
 static irqreturn_t wlbt_mbox_isr(int irq, void *data)
 {
@@ -3150,6 +3151,25 @@ static const struct file_operations wlbt_trace_fops = {
 	.release = single_release,
 };
 
+static int wlbt_bss_show(struct seq_file *s, void *unused)
+{
+	wlbt_dram_bsses(s->private, s);
+	return 0;
+}
+
+static int wlbt_bss_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_bss_show, inode->i_private);
+}
+
+static const struct file_operations wlbt_bss_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_bss_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static const struct file_operations wlbt_peek_fops = {
 	.owner = THIS_MODULE,
 	.open = wlbt_peek_open,
@@ -3333,6 +3353,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("peek", 0600, w->debugfs, w, &wlbt_peek_fops);
 	debugfs_create_file("trace", 0600, w->debugfs, w, &wlbt_trace_fops);
 	debugfs_create_file("find", 0600, w->debugfs, w, &wlbt_find_fops);
+	debugfs_create_file("bss", 0400, w->debugfs, w, &wlbt_bss_fops);
 }
 
 static struct regmap *wlbt_syscon(struct exynos_wlbt *w, const char *name)
@@ -3504,8 +3525,21 @@ static bool wlbt_bss_frame(const u8 *buf, size_t avail, size_t *frame_len,
 	if (!have_ssid || off <= 36)
 		return false;
 
+	/*
+	 * A channel the wiphy does not know makes cfg80211 dereference a NULL
+	 * channel pointer, and since this runs from the scan work that oops
+	 * takes cfg80211_scan_done() with it.  Anything outside the band is a
+	 * misread buffer, not an access point.
+	 */
+	if (channel) {
+		if (channel > 13)
+			return false;
+		*freq = 2412 + 5 * (channel - 1);
+	} else {
+		*freq = 2437;
+	}
+
 	*frame_len = off;
-	*freq = channel ? 2412 + 5 * (channel - 1) : 2437;
 	return true;
 }
 
@@ -3517,6 +3551,12 @@ static void wlbt_scan_report_one(struct exynos_wlbt *w, const u8 *frame,
 		.signal = WLBT_SCAN_RSSI,
 	};
 	struct cfg80211_bss *bss;
+
+	if (!data.chan) {
+		dev_warn_once(w->dev, "scan: frame on unknown frequency %u\n",
+			      freq);
+		return;
+	}
 
 	bss = cfg80211_inform_bss_frame_data(w->wiphy, &data,
 					     (struct ieee80211_mgmt *)frame,
@@ -3570,6 +3610,73 @@ static void wlbt_scan_collect(struct exynos_wlbt *w)
 	kvfree(buf);
 	dev_info(w->dev, "scan: %u beacon(s) reported from the peer's memory\n",
 		 n_frame);
+}
+
+/*
+ * List what the peer's memory holds, the same way the scan collector reads it.
+ * Choosing a target for a join by hand needs to know which access points the
+ * peer actually cached, and there is exactly one join attempt per boot - a failed
+ * join wedges the join state machine until the next boot.
+ */
+static void wlbt_dram_bsses(struct exynos_wlbt *w, struct seq_file *s)
+{
+	u8 seen[WLBT_SCAN_SEEN][ETH_ALEN];
+	unsigned int n_seen = 0, n = 0;
+	u32 off, limit = w->mem_size;
+	u8 *buf;
+
+	if (!w->dram)
+		return;
+
+	buf = kvmalloc(WLBT_SCAN_CHUNK + WLBT_SCAN_OVERLAP, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	for (off = 0; off < limit; off += WLBT_SCAN_CHUNK) {
+		size_t len = min_t(u32, WLBT_SCAN_CHUNK + WLBT_SCAN_OVERLAP,
+				   limit - off);
+		size_t i;
+
+		memcpy_fromio(buf, w->dram + off, len);
+		for (i = 0; i + 36 <= len && i < WLBT_SCAN_CHUNK; i++) {
+			const u8 *f = buf + i;
+			size_t flen;
+			u16 freq;
+			unsigned int k;
+			unsigned int j = 36;
+			const u8 *ssid = NULL;
+			u8 ssid_len = 0;
+
+			if (!wlbt_bss_frame(f, len - i, &flen, &freq))
+				continue;
+			for (k = 0; k < n_seen; k++)
+				if (!memcmp(seen[k], f + 16, ETH_ALEN))
+					break;
+			if (k < n_seen)
+				continue;
+			if (n_seen < WLBT_SCAN_SEEN)
+				memcpy(seen[n_seen++], f + 16, ETH_ALEN);
+
+			while (j + 2 <= flen) {
+				if (f[j] == WLAN_EID_SSID) {
+					ssid = f + j + 2;
+					ssid_len = f[j + 1];
+					break;
+				}
+				j += 2 + f[j + 1];
+			}
+
+			seq_printf(s, "%pM  %u MHz  ", f + 16, freq);
+			if (ssid)
+				seq_printf(s, "\"%.*s\"\n", ssid_len, ssid);
+			else
+				seq_puts(s, "(no SSID)\n");
+			n++;
+		}
+	}
+
+	kvfree(buf);
+	seq_printf(s, "%u access point(s)\n", n);
 }
 
 static void wlbt_scan_work(struct work_struct *work)
