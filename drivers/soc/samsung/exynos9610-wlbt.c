@@ -54,6 +54,7 @@
 #include <linux/reboot.h>
 #include <linux/seq_file.h>
 #include <linux/etherdevice.h>
+#include <linux/inet.h>
 #include <net/cfg80211.h>
 #include <linux/slab.h>
 
@@ -420,6 +421,7 @@ struct wlbt_hip4_q {
 #define FAPI_MLME_ADD_INFO_ELEMENTS_REQ	0x2004
 /* The peer reads the elements named this way as the link's own description. */
 #define FAPI_PURPOSE_ASSOCIATION_REQUEST	0x0010
+#define FAPI_MLME_SET_IP_ADDRESS_REQ	0x2015
 #define FAPI_MLME_CONNECT_REQ		0x200b
 #define FAPI_MLME_CONNECT_RES		0x2200
 #define FAPI_MLME_CONNECTED_RES		0x2201
@@ -849,6 +851,24 @@ MODULE_PARM_DESC(firmware_name, "Firmware image for the WLBT subsystem");
  * entirely when there are none.  The RSN IE travels in the connect request
  * instead, which is the copy that also reaches the air.
  */
+/*
+ * The vendor appends only the RSN and RSNX elements to the connect request,
+ * not the whole set the supplicant handed over: the peer parses that field as
+ * the link's security.
+ */
+/*
+ * The vendor tells the peer the station's address once the handshake is done
+ * (slsi_ip_address_changed from the M4 path), which is the last thing it does
+ * to the link before traffic is expected to flow.
+ */
+static char *set_ip;
+module_param(set_ip, charp, 0644);
+MODULE_PARM_DESC(set_ip, "Send MLME_SET_IP_ADDRESS with this address once the pairwise key is installed");
+
+static bool sec_ie_only;
+module_param(sec_ie_only, bool, 0644);
+MODULE_PARM_DESC(sec_ie_only, "Append only the RSN and RSNX elements to the connect request");
+
 static bool info_elements = true;
 module_param(info_elements, bool, 0644);
 MODULE_PARM_DESC(info_elements, "Send the association IEs with MLME_ADD_INFO_ELEMENTS");
@@ -4986,10 +5006,22 @@ static int wlbt_mlme_connect(struct exynos_wlbt *w,
 	n += ssid_len;
 
 	if (sme->ie_len) {
-		if (sme->ie_len > sizeof(dat) - n)
+		const u8 *ie = sme->ie;
+		size_t ie_len = sme->ie_len;
+
+		if (sec_ie_only) {
+			const u8 *rsn = cfg80211_find_ie(WLAN_EID_RSN, ie, ie_len);
+
+			if (rsn) {
+				ie = rsn;
+				ie_len = rsn[1] + 2;
+			}
+		}
+
+		if (ie_len > sizeof(dat) - n)
 			return -EINVAL;
-		memcpy(dat + n, sme->ie, sme->ie_len);
-		n += sme->ie_len;
+		memcpy(dat + n, ie, ie_len);
+		n += ie_len;
 	}
 
 	hdr.id = cpu_to_le16(FAPI_MLME_CONNECT_REQ);
@@ -5400,6 +5432,25 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 	ret = wlbt_mlme_setkeys(w, key_index, type, mac_addr, params->cipher,
 				params->key, params->key_len, params->seq,
 				params->seq_len);
+	if (!ret && pairwise && set_ip) {
+		u8 sig[sizeof(struct wlbt_fapi_hdr) + 20] = { };
+		struct wlbt_fapi_hdr hdr = { };
+		__be32 addr;
+
+		hdr.id = cpu_to_le16(FAPI_MLME_SET_IP_ADDRESS_REQ);
+		hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+		memcpy(sig, &hdr, sizeof(hdr));
+		put_unaligned_le16(1, sig + sizeof(hdr) + 0);	/* vif */
+		put_unaligned_le16(4, sig + sizeof(hdr) + 2);	/* IPv4 */
+		memset(sig + sizeof(hdr) + 4, 0xff, ETH_ALEN);	/* multicast */
+		if (!in4_pton(set_ip, -1, (u8 *)&addr, -1, NULL)) {
+			dev_warn(w->dev, "set_ip: cannot parse %s\n", set_ip);
+		} else {
+			wlbt_hip4_send(w, true, sig, sizeof(sig),
+				       (u8 *)&addr, sizeof(addr));
+		}
+	}
+
 	if (!ret && pairwise && (connect_res_at_key || connect_res_late)) {
 		wlbt_mlme_connect_res(w);
 		w->connect_res_sent = true;
