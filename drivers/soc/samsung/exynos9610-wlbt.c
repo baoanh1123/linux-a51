@@ -256,6 +256,22 @@
 #define MIB_PROLOGUE_MARKER	0x0120
 
 #define HIP4_ALLOC_SIZE			0x280000	/* what hip4_init asks for */
+/* Control frames kept for the debugfs "tx" file. */
+#define WLBT_TX_SLOTS	512
+#define WLBT_TX_BODY	40
+#define WLBT_TX_DATA	64
+
+/** struct wlbt_tx_rec - one control frame sent, as the vendor logs it */
+struct wlbt_tx_rec {
+	s64 t;
+	u16 id;
+	u16 len;
+	u16 dlen;		/* payload appended behind the signal */
+	u16 pad;
+	u8 body[WLBT_TX_BODY];
+	u8 data[WLBT_TX_DATA];
+};
+
 /* Received frames kept for the debugfs "frames" file. */
 #define WLBT_FRAME_RING			32
 #define WLBT_FRAME_DATA			64
@@ -708,6 +724,16 @@ struct exynos_wlbt {
 	} frames[WLBT_FRAME_RING];
 	unsigned int frame_next;
 	unsigned int frame_total;
+	/*
+	 * Control frames this side has handed to the peer, in order.  The vendor
+	 * stack logs the same thing (scsc logring bin_wifi_ctrl_tx, "HEX[n/n]"),
+	 * so a connect can be compared signal by signal against the one Android
+	 * makes on the same firmware - that is what says whether the peer's
+	 * refusal is about the requests or about its own state.
+	 */
+	struct wlbt_tx_rec *tx;
+	unsigned int tx_next;
+	unsigned int tx_used;
 	struct {
 		u16 id;
 		u8 len;
@@ -970,6 +996,11 @@ MODULE_PARM_DESC(hip4_return, "Hand received HIP4 segments back to the peer");
 static bool hip4_log;
 module_param(hip4_log, bool, 0644);
 MODULE_PARM_DESC(hip4_log, "Record every received HIP4 frame for debugfs frames");
+
+/* One line per control frame sent; cheap enough to leave on by default. */
+static bool tx_log = true;
+module_param(tx_log, bool, 0644);
+MODULE_PARM_DESC(tx_log, "Record every control frame sent for debugfs tx");
 
 /*
  * The peer's log records are far too many to keep, but the ones that a burst
@@ -2120,6 +2151,20 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 
 	wlbt_hip4_push(w, ctrl ? HIP4_Q_FH_CTL : HIP4_Q_FH_DAT, ref);
 	w->n_hip4_tx++;
+	if (ctrl && tx_log && w->tx) {
+		struct wlbt_tx_rec *r = &w->tx[w->tx_next % WLBT_TX_SLOTS];
+
+		r->t = ktime_get_ns();
+		r->id = get_unaligned_le16(sig);
+		r->len = min_t(size_t, sig_len, WLBT_TX_BODY);
+		r->dlen = data ? min_t(size_t, data_len, WLBT_TX_DATA) : 0;
+		memcpy(r->body, sig, r->len);
+		if (r->dlen)
+			memcpy(r->data, data, r->dlen);
+		w->tx_next++;
+		if (w->tx_used < WLBT_TX_SLOTS)
+			w->tx_used++;
+	}
 	spin_unlock_irqrestore(&w->hip4_lock, flags);
 
 	return 0;
@@ -2524,7 +2569,7 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 
 		if (le16_to_cpu(mb.sig_bufsz) >= HIP4_SIG_RESERVED +
 						  sizeof(struct wlbt_fapi_hdr)) {
-			u8 body[HIP4_SIG_DUMP];
+			u8 body[HIP4_SIG_DUMP] = { };
 			size_t len = le16_to_cpu(mb.sig_bufsz) -
 				     HIP4_SIG_RESERVED;
 			struct wlbt_fapi_hdr hdr;
@@ -2537,6 +2582,18 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 				 le16_to_cpu(hdr.receiver_pid),
 				 le16_to_cpu(hdr.sender_pid),
 				 le32_to_cpu(hdr.fw_reference));
+
+			/*
+			 * The signal body has to be in memory before any id specific
+			 * handling looks at it: every branch below reads it, and
+			 * reading it here rather than at the end is what keeps a
+			 * connect result or a rejected confirmation from being
+			 * taken out of whatever the previous frame left on the stack.
+			 */
+			memcpy_fromio(body, m + HIP4_MBULK_SIZE +
+				      HIP4_SIG_RESERVED + sizeof(hdr),
+				      len > sizeof(hdr) ?
+				      min_t(size_t, len - sizeof(hdr), sizeof(body)) : 0);
 
 			/*
 			 * MA_UNITDATA_IND carries a received frame: the payload
@@ -2644,9 +2701,6 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 
 			if (len > sizeof(body))
 				len = sizeof(body);
-			memcpy_fromio(body, m + HIP4_MBULK_SIZE +
-				      HIP4_SIG_RESERVED + sizeof(hdr),
-				      len > sizeof(hdr) ? len - sizeof(hdr) : 0);
 			wlbt_id_record(w, le16_to_cpu(hdr.id), body,
 				       len > sizeof(hdr) ? len - sizeof(hdr) : 0);
 
@@ -4382,6 +4436,63 @@ static ssize_t wlbt_evlog_write(struct file *file, const char __user *ubuf,
 	return len;
 }
 
+/*
+ * The control frames sent, oldest first, in the same shape the vendor's
+ * bin_wifi_ctrl_tx records have on Android: id first, then the body.  Only the
+ * head of each frame is kept - the signal id and the fields a comparison needs.
+ */
+static int wlbt_tx_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+	unsigned int i, first;
+
+	seq_printf(s, "%u frame(s) sent\n", w->tx_used);
+	if (!w->tx)
+		return 0;
+
+	first = w->tx_next >= w->tx_used ? w->tx_next - w->tx_used : 0;
+	for (i = first; i < w->tx_next; i++) {
+		struct wlbt_tx_rec *r = &w->tx[i % WLBT_TX_SLOTS];
+
+		seq_printf(s, "%14lld sig=0x%04x len=%u %*phN",
+			   r->t, r->id, r->len, r->len, r->body);
+		if (r->dlen)
+			seq_printf(s, " | data %*phN", r->dlen, r->data);
+		seq_putc(s, '\n');
+	}
+
+	return 0;
+}
+
+static ssize_t wlbt_tx_write(struct file *file, const char __user *ubuf,
+			     size_t len, loff_t *off)
+{
+	struct seq_file *s = file->private_data;
+	struct exynos_wlbt *w = s->private;
+	unsigned long flags;
+
+	spin_lock_irqsave(&w->hip4_lock, flags);
+	w->tx_next = 0;
+	w->tx_used = 0;
+	spin_unlock_irqrestore(&w->hip4_lock, flags);
+
+	return len;
+}
+
+static int wlbt_tx_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_tx_show, inode->i_private);
+}
+
+static const struct file_operations wlbt_tx_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_tx_open,
+	.read = seq_read,
+	.write = wlbt_tx_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int wlbt_evlog_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, wlbt_evlog_show, inode->i_private);
@@ -4549,6 +4660,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("faults", 0400, w->debugfs, w, &wlbt_faults_fops);
 	debugfs_create_file("ids", 0400, w->debugfs, w, &wlbt_ids_fops);
 	debugfs_create_file("evlog", 0600, w->debugfs, w, &wlbt_evlog_fops);
+	debugfs_create_file("tx", 0600, w->debugfs, w, &wlbt_tx_fops);
 	debugfs_create_file("ptk", 0600, w->debugfs, w, &wlbt_ptk_fops);
 }
 
@@ -5921,6 +6033,9 @@ static int wlbt_probe(struct platform_device *pdev)
 		w->trace = devm_kzalloc(&pdev->dev,
 					WLBT_TRACE_MAX * sizeof(*w->trace),
 					GFP_KERNEL);
+	if (w)
+		w->tx = devm_kzalloc(&pdev->dev,
+				     WLBT_TX_SLOTS * sizeof(*w->tx), GFP_KERNEL);
 	if (!w)
 		return -ENOMEM;
 
