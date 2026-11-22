@@ -424,6 +424,7 @@ struct wlbt_hip4_q {
 /* Channels offered to the peer once a connection is up. */
 #define WLBT_CACHED_CHANNELS		11
 #define FAPI_MLME_ADD_VIF_REQ		0x2007
+#define FAPI_MLME_SET_PMK_REQ		0x201c
 #define FAPI_MLME_SET_HOST_STATE_REQ	0x2028
 #define FAPI_MLME_SETKEYS_REQ		0x2018
 #define FAPI_MLME_SET_COUNTRY_REQ	0x2033
@@ -2243,6 +2244,20 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 					wlbt_rx_frame(w, m + HIP4_MBULK_SIZE + off,
 						      dlen);
 			}
+
+			/*
+			 * A confirmation carries the result code first; when it
+			 * is not success the request was refused, and knowing
+			 * which one is worth having.  It goes into the ring
+			 * rather than the log: this runs with the queue lock
+			 * held and interrupts off.
+			 */
+			if ((le16_to_cpu(hdr.id) & 0xff00) == 0x2100 &&
+			    len >= sizeof(hdr) + 2 &&
+			    get_unaligned_le16(body))
+				wlbt_fault_record(w, le16_to_cpu(hdr.id), body,
+						  min_t(size_t, len - sizeof(hdr),
+							WLBT_FAULT_DATA));
 
 			/*
 			 * MLME_CONNECT_CFM is the peer saying it took the join
@@ -4268,8 +4283,10 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
 
 	if (!w->hip4_control)
 		return -EIO;
-	if (w->scan_req)
+	if (w->scan_req) {
+		dev_info_ratelimited(w->dev, "scan refused: one is pending\n");
 		return -EBUSY;
+	}
 
 	/*
 	 * A scan request queued while the station is associated is never
@@ -4278,8 +4295,12 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
 	 * the scan - data included - waits with it.  Refuse instead of
 	 * reporting a scan that will not happen.
 	 */
-	if (w->connected || netif_carrier_ok(w->netdev))
+	if (w->connected || netif_carrier_ok(w->netdev)) {
+		dev_info_ratelimited(w->dev,
+				     "scan refused: connected %d carrier %d\n",
+				     w->connected, netif_carrier_ok(w->netdev));
 		return -EBUSY;
+	}
 
 	/* The scan id names the interface in its upper byte and the peer
 	 * refuses anything below 0x100, so the low byte just wraps.
@@ -4622,12 +4643,12 @@ static void wlbt_peer_work(struct work_struct *work)
 		}
 	}
 
-	if (cted) {
+	if (cted && !netif_carrier_ok(w->netdev)) {
 		wlbt_mlme_connected_res(w, aid);
 		netif_carrier_on(w->netdev);
 	}
 
-	if (disc) {
+	if (disc && w->connected) {
 		w->connected = false;
 		netif_carrier_off(w->netdev);
 		dev_info(w->dev, "connect: peer lost the link, reason %u\n",
@@ -4662,6 +4683,9 @@ static void wlbt_connect_work(struct work_struct *work)
 				WLAN_STATUS_UNSPECIFIED_FAILURE, GFP_KERNEL);
 }
 
+static int wlbt_mlme_set_pmk(struct exynos_wlbt *w, const u8 *pmk,
+			     size_t len);
+
 static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 			    struct cfg80211_connect_params *sme)
 {
@@ -4679,6 +4703,19 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	ret = wlbt_vif_up(w);
 	if (ret)
 		return ret;
+
+	/*
+	 * A PSK network hands the pairwise master key over with the connect,
+	 * because the peer runs the four way handshake itself: it never passes
+	 * the EAPOL frames to us.  The key has to be in its database before the
+	 * join, or the handshake it starts after associating goes nowhere.
+	 */
+	if (sme->crypto.psk) {
+		dev_info(w->dev, "connect: pairwise master key supplied\n");
+		ret = wlbt_mlme_set_pmk(w, sme->crypto.psk, WLAN_PMK_LEN);
+		if (ret)
+			return ret;
+	}
 
 	if (sme->channel && sme->channel->center_freq)
 		freq = sme->channel->center_freq;
@@ -4724,6 +4761,11 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	return 0;
 }
 
+/*
+ * A disconnect the supplicant asked for needs no report back - cfg80211 issued
+ * it and already knows.  All this has to do is forget the connection, or the
+ * next scan is refused as if the station were still associated.
+ */
 static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 			       u16 reason_code)
 {
@@ -4732,9 +4774,60 @@ static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	cancel_delayed_work_sync(&w->connect_work);
 	cancel_work_sync(&w->peer_work);
 	w->connecting = false;
-	cfg80211_disconnected(ndev, reason_code, NULL, 0, true, GFP_KERNEL);
+	w->connected = false;
+	netif_carrier_off(ndev);
+
 	return 0;
 }
+
+/*
+ * MLME_SET_PMK hands the peer the pairwise master key: it keeps a key database
+ * of its own, and the key travels as the payload after a sixteen byte body, the
+ * way the vendor's fapi_append_data() lays it out.  A zero length request is
+ * how the vendor asks for an entry to be dropped.
+ */
+static int wlbt_mlme_set_pmk(struct exynos_wlbt *w, const u8 *pmk, size_t len)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 16] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	if (len > 64)
+		return -EINVAL;
+
+	put_unaligned_le16(1, sig + sizeof(hdr));	/* vif */
+	hdr.id = cpu_to_le16(FAPI_MLME_SET_PMK_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), pmk, len);
+}
+
+static int wlbt_cfg_set_pmk(struct wiphy *wiphy, struct net_device *dev,
+			    const struct cfg80211_pmk_conf *conf)
+{
+	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+
+	if (!w->hip4_control)
+		return -EIO;
+
+	dev_info(w->dev, "set_pmk: aa %pM len %u\n", conf->aa, conf->pmk_len);
+
+	return wlbt_mlme_set_pmk(w, conf->pmk, conf->pmk_len);
+}
+
+static int wlbt_cfg_del_pmk(struct wiphy *wiphy, struct net_device *dev,
+			    const u8 *aa)
+{
+	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+
+	if (!w->hip4_control)
+		return -EIO;
+
+	dev_info(w->dev, "del_pmk: aa %pM\n", aa);
+
+	return wlbt_mlme_set_pmk(w, NULL, 0);
+}
+
 /*
  * MLME_SETKEYS is how the peer is told about the keys a host supplicant
  * negotiated - the firmware does not do the four way handshake itself, so this
@@ -4785,6 +4878,7 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 
 	if (!w->hip4_control)
 		return -EIO;
+
 	if (!mac_addr)
 		return -EINVAL;
 
@@ -4823,6 +4917,8 @@ static const struct cfg80211_ops wlbt_cfg80211_ops = {
 	.disconnect = wlbt_cfg_disconnect,
 	.add_key = wlbt_cfg_add_key,
 	.del_key = wlbt_cfg_del_key,
+	.set_pmk = wlbt_cfg_set_pmk,
+	.del_pmk = wlbt_cfg_del_pmk,
 };
 
 /*
@@ -4932,6 +5028,13 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	 * attribute is enough for now, the peer's data path is not there yet.
 	 */
 	wiphy->flags |= WIPHY_FLAG_CONTROL_PORT_PROTOCOL;
+	/*
+	 * The peer runs the four way handshake itself - it keeps the EAPOL
+	 * frames the access point sends and never passes them to the host - so
+	 * it needs the pairwise master key with the connect, which cfg80211
+	 * only hands over for a device advertising this.
+	 */
+	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
 
 	ret = wiphy_register(wiphy);
 	if (ret)
