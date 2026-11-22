@@ -3452,6 +3452,40 @@ static ssize_t wlbt_debugfs_peek(struct file *file, const char __user *buf,
 }
 
 /*
+ * Write "<hex offset> <hex value>" into the peer's DRAM.  Debug only, and the
+ * narrow complement of peek: when a field the peer owns is the only thing
+ * standing between a working and a broken data path, setting it by hand is how
+ * the field is identified at all, before there is any code to read.
+ */
+static ssize_t wlbt_debugfs_poke(struct file *file, const char __user *buf,
+				 size_t len, loff_t *ppos)
+{
+	struct exynos_wlbt *w = file->private_data;
+	unsigned int off, val;
+	char cmd[64];
+
+	if (!w->dram)
+		return -ENODEV;
+	if (len >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = '\0';
+
+	if (sscanf(cmd, "%x %x", &off, &val) != 2)
+		return -EINVAL;
+	off &= ~3u;
+	if (off + 4 > w->mem_size)
+		return -EINVAL;
+
+	writel(val, w->dram + off);
+	/* The peer may be polling the word right now, so finish the store. */
+	wmb();
+
+	return len;
+}
+
+/*
  * The peer is a dual-core RTOS with a saved context per thread, so the PC it
  * will resume at is a plain word in DRAM.  Sampling that word from here shows
  * where the peer stops running, at the moment it stops, without a debugger.
@@ -3699,6 +3733,9 @@ static const struct file_operations wlbt_bss_fops = {
 	.llseek = seq_lseek,
 	.release = single_release,
 };
+
+static const struct file_operations wlbt_poke_fops =
+	WLBT_DEBUGFS_OPS(wlbt_debugfs_poke);
 
 static const struct file_operations wlbt_peek_fops = {
 	.owner = THIS_MODULE,
@@ -3974,6 +4011,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("wlan", 0200, w->debugfs, w, &wlbt_wlan_fops);
 	debugfs_create_file("hip4", 0200, w->debugfs, w, &wlbt_hip4_fops);
 	debugfs_create_file("peek", 0600, w->debugfs, w, &wlbt_peek_fops);
+	debugfs_create_file("poke", 0200, w->debugfs, w, &wlbt_poke_fops);
 	debugfs_create_file("trace", 0600, w->debugfs, w, &wlbt_trace_fops);
 	debugfs_create_file("find", 0600, w->debugfs, w, &wlbt_find_fops);
 	debugfs_create_file("bss", 0400, w->debugfs, w, &wlbt_bss_fops);
