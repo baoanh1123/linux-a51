@@ -914,6 +914,22 @@ module_param(install_gtk, bool, 0644);
 MODULE_PARM_DESC(install_gtk, "Install the group key the supplicant hands over");
 
 /*
+ * The peer accepts a pairwise key with a success confirmation and then keeps
+ * no key the data path can find, while the same request for a group key is
+ * installed properly.  These two knobs change only the key type and the key
+ * index of the pairwise install, so that path can be compared with the one
+ * that works without going through the debugfs send path, which the peer does
+ * not treat the same way as a request from the driver.
+ */
+static uint ptk_type = FAPI_KEYTYPE_PAIRWISE;
+module_param(ptk_type, uint, 0644);
+MODULE_PARM_DESC(ptk_type, "Key type to use for the pairwise key (diagnostic)");
+
+static uint ptk_id;
+module_param(ptk_id, uint, 0644);
+MODULE_PARM_DESC(ptk_id, "Key index to use for the pairwise key, 0 keeps the supplicant's");
+
+/*
  * The peer inspects an EAPOL key frame itself and can issue MLME_SETKEYS from
  * its own copy of the link, so the PMK hand-off is separable too.
  */
@@ -5528,8 +5544,8 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 	if (params->cipher == WLAN_CIPHER_SUITE_WEP40 ||
 	    params->cipher == WLAN_CIPHER_SUITE_WEP104)
 		type = FAPI_KEYTYPE_WEP;
-	else if (pairwise)
-		type = FAPI_KEYTYPE_PAIRWISE;
+	if (pairwise)
+		type = ptk_type;
 	else if (params->cipher == WLAN_CIPHER_SUITE_AES_CMAC ||
 		 params->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_128 ||
 		 params->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_256)
@@ -5549,6 +5565,9 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 			return 0;
 		mac_addr = w->connect_bssid;
 	}
+
+	if (pairwise && ptk_id)
+		key_index = ptk_id;
 
 	dev_info(w->dev, "setkeys: id %u type %u cipher 0x%x len %d %pM\n",
 		 key_index, type, params->cipher, params->key_len, mac_addr);
