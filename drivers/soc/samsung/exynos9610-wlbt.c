@@ -734,6 +734,18 @@ struct exynos_wlbt {
 	struct work_struct peer_work;	/* answers the connect indications */
 	u8 connect_bssid[ETH_ALEN];
 	u16 scan_id;
+	/* The last pairwise key the supplicant handed over, kept so that it can be
+	 * sent again on demand.  The debugfs send path is not equivalent to this
+	 * one - the peer installs a request from the driver and merely stores one
+	 * injected there - so a faithful repeat install needs the driver to own
+	 * the key.
+	 */
+	u8 ptk_key[32];
+	u8 ptk_addr[ETH_ALEN];
+	u32 ptk_cipher;
+	u16 ptk_len;
+	u16 ptk_id;
+	bool ptk_valid;
 	bool connecting;
 	bool vif_created;		/* MLME_ADD_VIF was accepted */
 	bool connect_reported;		/* the peer answered the join */
@@ -4384,6 +4396,83 @@ static const struct file_operations wlbt_evlog_fops = {
 	.release = single_release,
 };
 
+/* The keystore is only used below; the peer answers CFMs for it. */
+static int wlbt_mlme_setkeys(struct exynos_wlbt *w, u16 key_id, u16 key_type,
+			     const u8 *address, u32 cipher, const u8 *key,
+			     size_t key_len, const u8 *seq, size_t seq_len);
+
+/*
+ * Writing here sends the stored pairwise key to the peer again, from the same
+ * code path the supplicant's key goes through.  Nothing else changes, so the
+ * difference between this and an injected request is only the transport - and
+ * that is what made the peer install one and merely store the other.
+ */
+static int wlbt_ptk_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+
+	seq_printf(s, "stored %d id %u cipher 0x%x len %u addr %pM\n",
+		   w->ptk_valid, w->ptk_id, w->ptk_cipher, w->ptk_len,
+		   w->ptk_addr);
+
+	return 0;
+}
+
+static ssize_t wlbt_ptk_write(struct file *file, const char __user *ubuf,
+			      size_t len, loff_t *off)
+{
+	struct seq_file *s = file->private_data;
+	struct exynos_wlbt *w = s->private;
+	char buf[68];
+	char hex[33];
+	unsigned int i, n;
+
+	if (!w->ptk_valid || !w->hip4_control)
+		return -EINVAL;
+
+	n = min(len, sizeof(buf) - 1);
+	if (n && copy_from_user(buf, ubuf, n))
+		return -EFAULT;
+	buf[n] = '\0';
+
+	/*
+	 * A hex string replaces the stored key first, so the peer cannot take the
+	 * "this exact key is already installed" shortcut and has to allocate.  An
+	 * empty write re-sends the key the supplicant handed over.
+	 */
+	for (i = 0; i < sizeof(hex) - 1 && i < n; i++) {
+		if (buf[i] == ' ' || buf[i] == '\n' || buf[i] == '\t')
+			break;
+		hex[i] = buf[i];
+	}
+	hex[i] = '\0';
+	if (i == 2 * w->ptk_len)
+		if (hex2bin(w->ptk_key, hex, w->ptk_len))
+			return -EINVAL;
+
+	dev_info(w->dev, "ptk: sending id %u type %u cipher 0x%x len %u %pM\n",
+		 w->ptk_id, ptk_type, w->ptk_cipher, w->ptk_len, w->ptk_addr);
+
+	wlbt_mlme_setkeys(w, w->ptk_id, ptk_type, w->ptk_addr, w->ptk_cipher,
+			  w->ptk_key, w->ptk_len, NULL, 0);
+
+	return len;
+}
+
+static int wlbt_ptk_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_ptk_show, inode->i_private);
+}
+
+static const struct file_operations wlbt_ptk_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_ptk_open,
+	.read = seq_read,
+	.write = wlbt_ptk_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int wlbt_ids_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, wlbt_ids_show, inode->i_private);
@@ -4460,6 +4549,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("faults", 0400, w->debugfs, w, &wlbt_faults_fops);
 	debugfs_create_file("ids", 0400, w->debugfs, w, &wlbt_ids_fops);
 	debugfs_create_file("evlog", 0600, w->debugfs, w, &wlbt_evlog_fops);
+	debugfs_create_file("ptk", 0600, w->debugfs, w, &wlbt_ptk_fops);
 }
 
 static struct regmap *wlbt_syscon(struct exynos_wlbt *w, const char *name)
@@ -5568,6 +5658,16 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 
 	if (pairwise && ptk_id)
 		key_index = ptk_id;
+
+	if (pairwise && params->key && params->key_len &&
+	    params->key_len <= sizeof(w->ptk_key)) {
+		memcpy(w->ptk_key, params->key, params->key_len);
+		memcpy(w->ptk_addr, mac_addr, ETH_ALEN);
+		w->ptk_cipher = params->cipher;
+		w->ptk_len = params->key_len;
+		w->ptk_id = key_index;
+		w->ptk_valid = true;
+	}
 
 	dev_info(w->dev, "setkeys: id %u type %u cipher 0x%x len %d %pM\n",
 		 key_index, type, params->cipher, params->key_len, mac_addr);
