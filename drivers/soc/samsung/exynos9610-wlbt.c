@@ -5088,6 +5088,15 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
 static int wlbt_mlme_add_vif(struct exynos_wlbt *w)
 {
 	static const u8 mac[6] = { 0x8c, 0x77, 0x12, 0xaa, 0xbb, 0xcc };
+	/*
+	 * The vendor passes the broadcast address as the vif's partner address for
+	 * a station (cfg80211_ops.c:1030-1362: device_address is initialised to
+	 * ff:ff:ff:ff:ff:ff and only rewritten for a P2P client), while this driver
+	 * used to put its own address there.  The peer keeps both addresses in the
+	 * vif record and the join path compares against them, so send the same
+	 * thing the vendor sends.
+	 */
+	static const u8 partner[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 	u8 sig[sizeof(struct wlbt_fapi_hdr) + 28];
 	struct wlbt_fapi_hdr hdr = { };
 
@@ -5098,7 +5107,7 @@ static int wlbt_mlme_add_vif(struct exynos_wlbt *w)
 	put_unaligned_le16(1, sig + sizeof(hdr) + 0);	/* vif */
 	memcpy(sig + sizeof(hdr) + 2, mac, sizeof(mac));
 	put_unaligned_le16(2, sig + sizeof(hdr) + 8);	/* FAPI_VIFTYPE_STATION */
-	memcpy(sig + sizeof(hdr) + 10, mac, sizeof(mac));
+	memcpy(sig + sizeof(hdr) + 10, partner, sizeof(partner));
 
 	hdr.id = cpu_to_le16(FAPI_MLME_ADD_VIF_REQ);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
@@ -5354,16 +5363,24 @@ static int wlbt_mlme_connect(struct exynos_wlbt *w,
 		if (sec_ie_only) {
 			const u8 *rsn = cfg80211_find_ie(WLAN_EID_RSN, ie, ie_len);
 
-			if (rsn) {
-				ie = rsn;
-				ie_len = rsn[1] + 2;
-			}
+			/*
+			 * The vendor appends only the security element to the connect
+			 * request, and nothing at all when the link has none - its
+			 * access point on an open network sees the SSID element and
+			 * no more.  sec_ie_only reproduces that shape, so the extra
+			 * elements a supplicant adds (extended capabilities, vendor
+			 * specific) do not reach a peer that may refuse them.
+			 */
+			ie = rsn;
+			ie_len = rsn ? rsn[1] + 2 : 0;
 		}
 
-		if (ie_len > sizeof(dat) - n)
-			return -EINVAL;
-		memcpy(dat + n, ie, ie_len);
-		n += ie_len;
+		if (ie_len) {
+			if (ie_len > sizeof(dat) - n)
+				return -EINVAL;
+			memcpy(dat + n, ie, ie_len);
+			n += ie_len;
+		}
 	}
 
 	hdr.id = cpu_to_le16(FAPI_MLME_CONNECT_REQ);
