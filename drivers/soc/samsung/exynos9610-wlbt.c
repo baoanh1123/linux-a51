@@ -266,6 +266,13 @@
  * frame ring being recycled.
  */
 #define WLBT_FAULT_RING			16
+/*
+ * A histogram of the fapi identifiers the peer sends, with the last body of
+ * each: counting them is the only way to see an indication that arrives once
+ * per frame without printing from the drain.
+ */
+#define WLBT_ID_SLOTS			48
+#define WLBT_ID_BODY			32
 #define WLBT_FAULT_DATA			28
 
 #define HIP4_Q_NUM			6
@@ -780,6 +787,13 @@ struct exynos_wlbt {
 	 */
 	struct wlbt_pw_reg pw_cfg[WLBT_PW_REGS];
 	bool pw_cfg_dirty;
+	struct {
+		u16 id;
+		u32 count;
+		u8 len;
+		u8 body[WLBT_ID_BODY];
+	} ids[WLBT_ID_SLOTS];
+	unsigned int n_ids;
 	char find_needle[32];
 	u32 find_len;
 	u32 find_hits[64];
@@ -814,6 +828,23 @@ MODULE_PARM_DESC(firmware_name, "Firmware image for the WLBT subsystem");
  * key context of its own - but keeping the two installs separable is what made
  * that visible.
  */
+/*
+ * The peer has an EAPOL key handler of its own that can install a key without
+ * the host, so the host's installs have to be separable from its handshake.
+ */
+/*
+ * The vendor answers MLME_CONNECT_IND when the four way handshake's M4 arrives,
+ * not when the peer announces the association, so the answer can be repeated at
+ * the moment the pairwise key lands.
+ */
+static bool connect_res_at_key;
+module_param(connect_res_at_key, bool, 0644);
+MODULE_PARM_DESC(connect_res_at_key, "Answer MLME_CONNECT_IND again when the pairwise key is installed");
+
+static bool host_keys = true;
+module_param(host_keys, bool, 0644);
+MODULE_PARM_DESC(host_keys, "Send the supplicant's keys to the peer");
+
 static bool install_gtk = true;
 module_param(install_gtk, bool, 0644);
 MODULE_PARM_DESC(install_gtk, "Install the group key the supplicant hands over");
@@ -2168,6 +2199,32 @@ static void wlbt_fault_record(struct exynos_wlbt *w, u16 id, const u8 *data,
 	w->fault_next++;
 }
 
+static void wlbt_id_record(struct exynos_wlbt *w, u16 id, const u8 *data,
+			   size_t len)
+{
+	unsigned int i, slot = w->n_ids;
+
+	for (i = 0; i < w->n_ids; i++)
+		if (w->ids[i].id == id) {
+			slot = i;
+			break;
+		}
+	if (slot == w->n_ids) {
+		if (w->n_ids >= WLBT_ID_SLOTS)
+			return;
+		w->n_ids++;
+		memset(&w->ids[slot], 0, sizeof(w->ids[slot]));
+		w->ids[slot].id = id;
+	}
+
+	if (len > WLBT_ID_BODY)
+		len = WLBT_ID_BODY;
+	w->ids[slot].len = len;
+	if (len)
+		memcpy(w->ids[slot].body, data, len);
+	w->ids[slot].count++;
+}
+
 static void wlbt_frame_record(struct exynos_wlbt *w, u32 ref, u8 flag, u16 id,
 			      const void *data, size_t len)
 {
@@ -2447,6 +2504,9 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			memcpy_fromio(body, m + HIP4_MBULK_SIZE +
 				      HIP4_SIG_RESERVED + sizeof(hdr),
 				      len > sizeof(hdr) ? len - sizeof(hdr) : 0);
+			wlbt_id_record(w, le16_to_cpu(hdr.id), body,
+				       len > sizeof(hdr) ? len - sizeof(hdr) : 0);
+
 			/*
 			 * The peer's own log frames would fill the ring on their
 			 * own, and it is the requests and indications that matter.
@@ -3822,6 +3882,7 @@ static ssize_t wlbt_debugfs_find(struct file *file, const char __user *buf,
 	struct seq_file *s = file->private_data;
 	struct exynos_wlbt *w = s->private;
 	char needle[96];
+	size_t count = len;
 
 	if (!len || len >= sizeof(needle))
 		return -EINVAL;
@@ -3855,7 +3916,8 @@ static ssize_t wlbt_debugfs_find(struct file *file, const char __user *buf,
 
 	wlbt_dram_find(w);
 
-	return len;
+	/* Report the whole write: the needle is shortened, the write is not. */
+	return count;
 }
 
 static const struct file_operations wlbt_find_fops = {
@@ -4118,6 +4180,35 @@ static const struct file_operations wlbt_frames_fops = {
 	.release = single_release,
 };
 
+static int wlbt_ids_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+	unsigned int i, k;
+
+	seq_printf(s, "%u identifier(s)\n", w->n_ids);
+	for (i = 0; i < w->n_ids; i++) {
+		seq_printf(s, "0x%04x %u:", w->ids[i].id, w->ids[i].count);
+		for (k = 0; k < w->ids[i].len; k++)
+			seq_printf(s, " %02x", w->ids[i].body[k]);
+		seq_putc(s, '\n');
+	}
+
+	return 0;
+}
+
+static int wlbt_ids_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_ids_show, inode->i_private);
+}
+
+static const struct file_operations wlbt_ids_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_ids_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int wlbt_faults_show(struct seq_file *s, void *unused)
 {
 	struct exynos_wlbt *w = s->private;
@@ -4179,6 +4270,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("bss", 0400, w->debugfs, w, &wlbt_bss_fops);
 	debugfs_create_file("frames", 0400, w->debugfs, w, &wlbt_frames_fops);
 	debugfs_create_file("faults", 0400, w->debugfs, w, &wlbt_faults_fops);
+	debugfs_create_file("ids", 0400, w->debugfs, w, &wlbt_ids_fops);
 }
 
 static struct regmap *wlbt_syscon(struct exynos_wlbt *w, const char *name)
@@ -5224,9 +5316,13 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 {
 	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
 	u16 type;
+	int ret;
 
 	if (!w->hip4_control)
 		return -EIO;
+
+	if (!host_keys)
+		return 0;
 
 	if (params->cipher == WLAN_CIPHER_SUITE_WEP40 ||
 	    params->cipher == WLAN_CIPHER_SUITE_WEP104)
@@ -5256,9 +5352,13 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 	dev_info(w->dev, "setkeys: id %u type %u cipher 0x%x len %d %pM\n",
 		 key_index, type, params->cipher, params->key_len, mac_addr);
 
-	return wlbt_mlme_setkeys(w, key_index, type, mac_addr, params->cipher,
-				 params->key, params->key_len, params->seq,
-				 params->seq_len);
+	ret = wlbt_mlme_setkeys(w, key_index, type, mac_addr, params->cipher,
+				params->key, params->key_len, params->seq,
+				params->seq_len);
+	if (!ret && pairwise && connect_res_at_key)
+		wlbt_mlme_connect_res(w);
+
+	return ret;
 }
 
 static int wlbt_cfg_del_key(struct wiphy *wiphy, struct net_device *ndev,
