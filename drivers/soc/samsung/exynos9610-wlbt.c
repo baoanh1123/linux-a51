@@ -268,13 +268,20 @@
  */
 #define WLBT_FAULT_RING			16
 /*
+ * The peer's own log records are far too numerous to keep, but the ones a
+ * protected frame provokes have to be told apart from the background.  They
+ * are counted by module, sub identifier and the first two words instead, so
+ * two runs can simply be subtracted.
+ */
+#define WLBT_LOG_SLOTS			192
+/*
  * A histogram of the fapi identifiers the peer sends, with the last body of
  * each: counting them is the only way to see an indication that arrives once
  * per frame without printing from the drain.
  */
 #define WLBT_ID_SLOTS			48
 #define WLBT_ID_BODY			32
-#define WLBT_FAULT_DATA			28
+#define WLBT_FAULT_DATA			40
 
 #define HIP4_Q_NUM			6
 #define HIP4_Q_LEN			256
@@ -707,6 +714,14 @@ struct exynos_wlbt {
 		u8 data[WLBT_FAULT_DATA];
 	} faults[WLBT_FAULT_RING];
 	unsigned int fault_next;
+	struct {
+		u16 module;
+		u16 sub;
+		u16 word0;
+		u16 word1;
+		u32 count;
+	} log_slots[WLBT_LOG_SLOTS];
+	unsigned int log_used;
 	bool hip4_started;		/* peer took the service start request */
 	struct wlbt_hip4_pool hip4_pool[2];
 	unsigned int n_hip4_tx;
@@ -927,6 +942,15 @@ MODULE_PARM_DESC(hip4_return, "Hand received HIP4 segments back to the peer");
 static bool hip4_log;
 module_param(hip4_log, bool, 0644);
 MODULE_PARM_DESC(hip4_log, "Record every received HIP4 frame for debugfs frames");
+
+/*
+ * The peer's log records are far too many to keep, but the ones that a burst
+ * of traffic provokes come from one module.  Naming it keeps the ring for
+ * those records alone, with all twelve words intact.
+ */
+static uint log_module;
+module_param(log_module, uint, 0644);
+MODULE_PARM_DESC(log_module, "Keep the peer's log records from this module in the fault ring");
 
 static bool load_mib = true;
 module_param(load_mib, bool, 0644);
@@ -2235,6 +2259,48 @@ static void wlbt_hip4_release(struct exynos_wlbt *w)
 	}
 }
 
+/*
+ * One DEBUG_WORD12IND carries vif, module, sub module, a timestamp and twelve
+ * words.  Counting the first two of those words by module is enough to say
+ * which records a burst of traffic added.
+ */
+static void wlbt_log_count(struct exynos_wlbt *w, const u8 *data, size_t len)
+{
+	u16 module, sub, w0, w1;
+	unsigned int i, slot;
+
+	if (len < 14)
+		return;
+	module = get_unaligned_le16(data + 2);
+	sub = get_unaligned_le16(data + 4);
+	w0 = get_unaligned_le16(data + 10);
+	w1 = get_unaligned_le16(data + 12);
+	slot = (module * 31 + sub * 17 + w0 * 7 + w1) % WLBT_LOG_SLOTS;
+
+	for (i = 0; i < 16; i++) {
+		unsigned int s = (slot + i) % WLBT_LOG_SLOTS;
+
+		if (!w->log_slots[s].count) {
+			if (w->log_used >= WLBT_LOG_SLOTS)
+				return;
+			w->log_slots[s].module = module;
+			w->log_slots[s].sub = sub;
+			w->log_slots[s].word0 = w0;
+			w->log_slots[s].word1 = w1;
+			w->log_slots[s].count = 1;
+			w->log_used++;
+			return;
+		}
+		if (w->log_slots[s].module == module &&
+		    w->log_slots[s].sub == sub &&
+		    w->log_slots[s].word0 == w0 &&
+		    w->log_slots[s].word1 == w1) {
+			w->log_slots[s].count++;
+			return;
+		}
+	}
+}
+
 static void wlbt_fault_record(struct exynos_wlbt *w, u16 id, const u8 *data,
 			      size_t len)
 {
@@ -2560,6 +2626,19 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			 * The peer's own log frames would fill the ring on their
 			 * own, and it is the requests and indications that matter.
 			 */
+			if (le16_to_cpu(hdr.id) == 0x8301) {
+				wlbt_log_count(w, body,
+					       len > sizeof(hdr) ?
+					       len - sizeof(hdr) : 0);
+				if (log_module && len >= sizeof(hdr) + 4 &&
+				    get_unaligned_le16(body + 2) == log_module)
+					wlbt_fault_record(w, le16_to_cpu(hdr.id),
+							  body,
+							  min_t(size_t,
+								len - sizeof(hdr),
+								WLBT_FAULT_DATA));
+			}
+
 			if (le16_to_cpu(hdr.id) == 0x8301 ||
 			    le16_to_cpu(hdr.id) == 0x8302)
 				wlbt_fault_record(w, le16_to_cpu(hdr.id), body,
@@ -4245,6 +4324,50 @@ static int wlbt_ids_show(struct seq_file *s, void *unused)
 	return 0;
 }
 
+static int wlbt_evlog_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+	unsigned int i;
+
+	seq_printf(s, "%u record kind(s)\n", w->log_used);
+	for (i = 0; i < WLBT_LOG_SLOTS; i++) {
+		if (!w->log_slots[i].count)
+			continue;
+		seq_printf(s, "m %u s %u w0 %04x w1 %04x n %u\n",
+			   w->log_slots[i].module, w->log_slots[i].sub,
+			   w->log_slots[i].word0, w->log_slots[i].word1,
+			   w->log_slots[i].count);
+	}
+
+	return 0;
+}
+
+static ssize_t wlbt_evlog_write(struct file *file, const char __user *ubuf,
+				size_t len, loff_t *off)
+{
+	struct seq_file *s = file->private_data;
+	struct exynos_wlbt *w = s->private;
+
+	memset(w->log_slots, 0, sizeof(w->log_slots));
+	w->log_used = 0;
+
+	return len;
+}
+
+static int wlbt_evlog_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_evlog_show, inode->i_private);
+}
+
+static const struct file_operations wlbt_evlog_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_evlog_open,
+	.read = seq_read,
+	.write = wlbt_evlog_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int wlbt_ids_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, wlbt_ids_show, inode->i_private);
@@ -4320,6 +4443,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("frames", 0400, w->debugfs, w, &wlbt_frames_fops);
 	debugfs_create_file("faults", 0400, w->debugfs, w, &wlbt_faults_fops);
 	debugfs_create_file("ids", 0400, w->debugfs, w, &wlbt_ids_fops);
+	debugfs_create_file("evlog", 0600, w->debugfs, w, &wlbt_evlog_fops);
 }
 
 static struct regmap *wlbt_syscon(struct exynos_wlbt *w, const char *name)
