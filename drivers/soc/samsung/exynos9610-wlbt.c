@@ -715,6 +715,14 @@ struct exynos_wlbt {
 	 * lock and cfg80211 cannot be called from the interrupt.
 	 */
 	bool connected;			/* cfg80211 was told the link is up */
+	/*
+	 * Room the peer needs in front of and behind the frame in a unitdata
+	 * request, which it publishes in the HIP4 configuration once it has
+	 * started: that is where it writes the 802.11 header it builds for an
+	 * associated station.
+	 */
+	u16 tx_headroom;
+	u16 tx_tailroom;
 	u16 host_tag;			/* names each transmitted frame */
 	bool peer_connect_cfm;		/* the peer took the join request */
 	bool connect_res_sent;
@@ -1856,11 +1864,38 @@ static u32 wlbt_hip4_scratch(struct exynos_wlbt *w, const void *data,
 	return ref;
 }
 
+/*
+ * The peer owns two words of the configuration it is given: how much room it
+ * wants reserved in front of and behind the frame of a unitdata request.  It
+ * builds the 802.11 header there, so the reservation only matters for frames
+ * that reach the air - a scan or a join carries information elements and works
+ * without it, which is why this went unnoticed until a station transmitted.
+ */
+static void wlbt_hip4_read_limits(struct exynos_wlbt *w)
+{
+	struct wlbt_hip4_control *c;
+
+	if (!w->hip4_control)
+		return;
+
+	c = (struct wlbt_hip4_control *)(w->dram + w->hip4_control);
+	if (le32_to_cpu(c->init.conf_ver) == 5) {
+		w->tx_headroom = c->v5.unidat_req_headroom;
+		w->tx_tailroom = c->v5.unidat_req_tailroom;
+	} else {
+		w->tx_headroom = c->v4.unidat_req_headroom;
+		w->tx_tailroom = c->v4.unidat_req_tailroom;
+	}
+
+	dev_info(w->dev, "HIP4 unitdata limits: %u byte headroom, %u byte tailroom\n",
+		 w->tx_headroom, w->tx_tailroom);
+}
+
 static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 			  size_t sig_len, const void *data, size_t data_len)
 {
 	struct wlbt_mbulk mb = { };
-	u32 sig_bufsz, ref;
+	u32 sig_bufsz, dat_bufsz, head, ref;
 	unsigned long flags;
 	void *m;
 	int ret;
@@ -1879,6 +1914,24 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	}
 
 	sig_bufsz = ALIGN(sig_len + HIP4_SIG_RESERVED, 4);
+	/*
+	 * A frame the peer will put on the air needs room for the header it
+	 * builds in front of the payload, and for whatever it appends behind it.
+	 * The reservation is expressed the way the peer's own allocator does:
+	 * the data buffer covers headroom, payload and tailroom, and the head
+	 * tells it where the payload starts.
+	 */
+	head = sig_bufsz;
+	dat_bufsz = data_len;
+	if (!ctrl && data_len) {
+		head = sig_bufsz + w->tx_headroom;
+		dat_bufsz = w->tx_headroom + data_len + w->tx_tailroom;
+	}
+	if (HIP4_MBULK_SIZE + head + data_len > HIP4_SLOT_SIZE) {
+		spin_unlock_irqrestore(&w->hip4_lock, flags);
+		return -ENOSPC;
+	}
+
 	mb.flag = MBULK_F_SIG | MBULK_F_OBOUND;
 	mb.clas = ctrl ? MBULK_CLASS_FROM_HOST_CTL : MBULK_CLASS_FROM_HOST_DAT;
 	mb.pid = ctrl ? MBULK_POOL_ID_CTRL : MBULK_POOL_ID_DATA;
@@ -1889,17 +1942,17 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	 * anything else is written as given.
 	 */
 	mb.refcnt = sig_refcnt < 0 ? (data_len ? 1 : 0) : sig_refcnt;
-	mb.dat_bufsz = cpu_to_le16(data_len);
+	mb.dat_bufsz = cpu_to_le16(dat_bufsz);
 	mb.sig_bufsz = cpu_to_le16(sig_bufsz);
 	mb.len = cpu_to_le16(data_len);
-	mb.head = cpu_to_le16(sig_bufsz);
+	mb.head = cpu_to_le16(head);
 
 	m = w->dram + ref;
 	memcpy_toio(m, &mb, sizeof(mb));
 	memset_io(m + HIP4_MBULK_SIZE, 0, HIP4_SIG_RESERVED);
 	memcpy_toio(m + HIP4_MBULK_SIZE + HIP4_SIG_RESERVED, sig, sig_len);
 	if (data_len)
-		memcpy_toio(m + HIP4_MBULK_SIZE + sig_bufsz, data, data_len);
+		memcpy_toio(m + HIP4_MBULK_SIZE + head, data, data_len);
 	if (sig_self_ref) {
 		/*
 		 * The peer validates this word against the transmit and receive
@@ -2980,8 +3033,10 @@ static ssize_t wlbt_debugfs_wlan(struct file *file, const char __user *buf,
 	ret = wlbt_stream_write(w, &w->mgmt_out, frame, sizeof(frame));
 	dev_info(w->dev, "WLAN start request (%s), control block 0x%x\n",
 		 ret ? "written" : "failed", w->hip4_control);
-	if (ret)
+	if (ret) {
 		w->hip4_started = true;
+		wlbt_hip4_read_limits(w);
+	}
 
 	/* A start confirmation comes back on the same channel; give the peer a
 	 * moment and show whatever arrives.
