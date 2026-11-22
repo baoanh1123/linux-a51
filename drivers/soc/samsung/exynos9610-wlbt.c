@@ -746,6 +746,13 @@ struct exynos_wlbt {
 	u32 connect_pmk_len;
 	u8 peer_rxind[18];
 	u32 peer_rxind_len;
+	/*
+	 * The answer to MLME_GET: the peer's own counters are the only way to see
+	 * why it discards a frame, since a discard is silent.
+	 */
+	u8 mibresp[64];
+	u32 mibresp_len;
+	u32 mibresp_psid;
 	u32 peer_rxind_geom[4];		/* sig_bufsz, dat_bufsz, len, head */
 	u32 n_rxind;
 	struct wlbt_stream log;
@@ -799,6 +806,25 @@ static bool wlbt_trace_start(struct exynos_wlbt *w);
 static char *firmware_name = "mx140/mx140.bin";
 module_param(firmware_name, charp, 0444);
 MODULE_PARM_DESC(firmware_name, "Firmware image for the WLBT subsystem");
+
+/*
+ * A station's group key is addressed to the access point, exactly like the
+ * pairwise key, so a peer that indexed its key database by address alone would
+ * keep only the last one written.  It does not - the pairwise key lands in a
+ * key context of its own - but keeping the two installs separable is what made
+ * that visible.
+ */
+static bool install_gtk = true;
+module_param(install_gtk, bool, 0644);
+MODULE_PARM_DESC(install_gtk, "Install the group key the supplicant hands over");
+
+/*
+ * The peer inspects an EAPOL key frame itself and can issue MLME_SETKEYS from
+ * its own copy of the link, so the PMK hand-off is separable too.
+ */
+static bool send_pmk = true;
+module_param(send_pmk, bool, 0644);
+MODULE_PARM_DESC(send_pmk, "Hand the PMK to the peer for its own 4-way handshake");
 
 static bool load_firmware;
 module_param(load_firmware, bool, 0644);
@@ -2214,6 +2240,39 @@ static void wlbt_rx_chain(struct exynos_wlbt *w, u32 ref)
 	}
 }
 
+/*
+ * The answer to MLME_GET travels the way a received frame does: nothing in the
+ * segment that carries the confirmation, the values in the data area.  Keep them
+ * so a MIB counter can actually be read.
+ */
+static void wlbt_mib_capture(struct exynos_wlbt *w, u32 ref)
+{
+	unsigned int n;
+	u32 len = 0;
+
+	for (n = 0; n < MBULK_MAX_CHAIN && len < sizeof(w->mibresp); n++) {
+		struct wlbt_mbulk mb;
+		u16 l, head;
+
+		memcpy_fromio(&mb, w->dram + ref, sizeof(mb));
+		l = le16_to_cpu(mb.len);
+		head = le16_to_cpu(mb.head);
+		if (l && l <= HIP4_SLOT_SIZE - HIP4_MBULK_SIZE - head) {
+			if (l > sizeof(w->mibresp) - len)
+				l = sizeof(w->mibresp) - len;
+			memcpy_fromio(w->mibresp + len,
+				      (const u8 __iomem *)w->dram + ref +
+				      HIP4_MBULK_SIZE + head, l);
+			len += l;
+		}
+		if (!(mb.flag & MBULK_F_CHAIN))
+			break;
+		ref = le32_to_cpu(mb.chain_next_offset);
+	}
+
+	w->mibresp_len = len;
+}
+
 static void wlbt_rx_frame(struct exynos_wlbt *w, const void *data, size_t len)
 {
 	struct sk_buff *skb;
@@ -2346,6 +2405,9 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 				w->peer_connect_cfm = true;
 				schedule_work(&w->peer_work);
 			}
+
+			if (le16_to_cpu(hdr.id) == 0x2101)
+				wlbt_mib_capture(w, ref);
 
 			/* MLME_CONNECT_IND is {le16 vif, le16 result} and is the
 			 * only place the outcome of a join shows up.
@@ -3455,6 +3517,84 @@ static ssize_t wlbt_debugfs_peek(struct file *file, const char __user *buf,
 }
 
 /*
+ * MLME_GET asks the peer for MIB values: the request body is the interface and
+ * the payload is a list of {le16 psid, u8 index count, u8 pad} entries, four
+ * bytes when no index is wanted.  The answer comes back as MLME_GET_CFM with the
+ * values appended, and it is worth having because the peer discards frames
+ * silently - its own counters are the only place a discard shows up at all.
+ */
+static int wlbt_mib_get_send(struct exynos_wlbt *w, u16 psid)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14] = { };
+	struct wlbt_fapi_hdr hdr = { };
+	u8 mib[4] = { };
+
+	hdr.id = cpu_to_le16(0x2001);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+	put_unaligned_le16(1, sig + sizeof(hdr));	/* vif 1 */
+	put_unaligned_le16(psid, mib);			/* no indexes */
+
+	w->mibresp_len = 0;
+	w->mibresp_psid = psid;
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), mib, sizeof(mib));
+}
+
+static int wlbt_mib_show(struct seq_file *s, void *unused)
+{
+	struct exynos_wlbt *w = s->private;
+	u32 i;
+
+	seq_printf(s, "psid %04x len %u:", w->mibresp_psid, w->mibresp_len);
+	for (i = 0; i < w->mibresp_len && i < sizeof(w->mibresp); i++)
+		seq_printf(s, " %02x", w->mibresp[i]);
+	seq_putc(s, '\n');
+
+	return 0;
+}
+
+static int wlbt_mib_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wlbt_mib_show, inode->i_private);
+}
+
+static ssize_t wlbt_mib_write(struct file *file, const char __user *buf,
+			      size_t len, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct exynos_wlbt *w = s->private;
+	unsigned int psid;
+	char cmd[32];
+	int ret;
+
+	if (!w->hip4_control)
+		return -EIO;
+	if (len >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = '\0';
+
+	ret = kstrtouint(cmd, 16, &psid);
+	if (ret)
+		return ret;
+	if (wlbt_mib_get_send(w, psid))
+		return -EIO;
+
+	return len;
+}
+
+static const struct file_operations wlbt_mib_fops = {
+	.owner = THIS_MODULE,
+	.open = wlbt_mib_open,
+	.read = seq_read,
+	.write = wlbt_mib_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+/*
  * Write "<hex offset> <hex value>" into the peer's DRAM.  Debug only, and the
  * narrow complement of peek: when a field the peer owns is the only thing
  * standing between a working and a broken data path, setting it by hand is how
@@ -3663,8 +3803,8 @@ static int wlbt_debugfs_find_show(struct seq_file *s, void *unused)
 	struct exynos_wlbt *w = s->private;
 	unsigned int i;
 
-	seq_printf(s, "\"%s\": %u match(es) in %u bytes\n", w->find_needle,
-		   w->n_find, w->fw_runtime_length);
+	seq_printf(s, "n_find %u over %llu bytes\n", w->n_find,
+		   (unsigned long long)w->mem_size);
 	for (i = 0; i < w->n_find; i++)
 		seq_printf(s, "  %06x\n", w->find_hits[i]);
 
@@ -3681,7 +3821,7 @@ static ssize_t wlbt_debugfs_find(struct file *file, const char __user *buf,
 {
 	struct seq_file *s = file->private_data;
 	struct exynos_wlbt *w = s->private;
-	char needle[32];
+	char needle[96];
 
 	if (!len || len >= sizeof(needle))
 		return -EINVAL;
@@ -3689,12 +3829,30 @@ static ssize_t wlbt_debugfs_find(struct file *file, const char __user *buf,
 		return -EFAULT;
 	if (needle[len - 1] == '\n')
 		len--;
-	if (!len || len >= sizeof(w->find_needle))
+	if (!len || len >= sizeof(needle))
 		return -EINVAL;
 
-	memcpy(w->find_needle, needle, len);
-	w->find_needle[len] = '\0';
-	w->find_len = len;
+	/* "0x..." searches for bytes rather than text: a key is not a string. */
+	if (len > 4 && needle[0] == '0' && needle[1] == 'x') {
+		unsigned int i, n = 0;
+
+		for (i = 2; i < len && n < sizeof(w->find_needle); i += 2) {
+			int hi = hex_to_bin(needle[i]);
+			int lo = (i + 1 < len) ? hex_to_bin(needle[i + 1]) : 0;
+
+			if (hi < 0 || lo < 0)
+				return -EINVAL;
+			w->find_needle[n++] = (hi << 4) | lo;
+		}
+		w->find_len = n;
+	} else {
+		if (len >= sizeof(w->find_needle))
+			return -EINVAL;
+		memcpy(w->find_needle, needle, len);
+		w->find_needle[len] = '\0';
+		w->find_len = len;
+	}
+
 	wlbt_dram_find(w);
 
 	return len;
@@ -4015,6 +4173,7 @@ static void wlbt_debugfs_init(struct exynos_wlbt *w)
 	debugfs_create_file("hip4", 0200, w->debugfs, w, &wlbt_hip4_fops);
 	debugfs_create_file("peek", 0600, w->debugfs, w, &wlbt_peek_fops);
 	debugfs_create_file("poke", 0200, w->debugfs, w, &wlbt_poke_fops);
+	debugfs_create_file("mib", 0600, w->debugfs, w, &wlbt_mib_fops);
 	debugfs_create_file("trace", 0600, w->debugfs, w, &wlbt_trace_fops);
 	debugfs_create_file("find", 0600, w->debugfs, w, &wlbt_find_fops);
 	debugfs_create_file("bss", 0400, w->debugfs, w, &wlbt_bss_fops);
@@ -4977,6 +5136,8 @@ static int wlbt_mlme_set_pmk(struct exynos_wlbt *w, const u8 *pmk, size_t len)
 
 	if (len > 64)
 		return -EINVAL;
+	if (!send_pmk)
+		return -EOPNOTSUPP;
 
 	put_unaligned_le16(1, sig + sizeof(hdr));	/* vif */
 	hdr.id = cpu_to_le16(FAPI_MLME_SET_PMK_REQ);
@@ -5087,6 +5248,8 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 	if (!mac_addr) {
 		if (type != FAPI_KEYTYPE_GROUP || !is_valid_ether_addr(w->connect_bssid))
 			return -EINVAL;
+		if (!install_gtk)
+			return 0;
 		mac_addr = w->connect_bssid;
 	}
 
