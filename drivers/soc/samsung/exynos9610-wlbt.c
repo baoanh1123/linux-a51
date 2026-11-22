@@ -732,6 +732,19 @@ struct exynos_wlbt {
 	bool peer_disconnected_ind;
 	u16 peer_aid;
 	u16 peer_disconnect_reason;
+	/*
+	 * The peer announces a received frame with MLME_RECEIVED_FRAME_IND and,
+	 * at least for the EAPOL frames a secured join depends on, sends the
+	 * indication without the frame: the body is a descriptor, a frequency
+	 * and what looks like an address.  The last one is kept so it can be
+	 * read back without the log.
+	 */
+	u8 connect_pmk[32];		/* kept until the peer asks for the join */
+	u32 connect_pmk_len;
+	u8 peer_rxind[18];
+	u32 peer_rxind_len;
+	u32 peer_rxind_geom[4];		/* sig_bufsz, dat_bufsz, len, head */
+	u32 n_rxind;
 	struct wlbt_stream log;
 	struct wlbt_stream mgmt_in;
 	struct wlbt_stream mgmt_out;
@@ -2166,6 +2179,38 @@ static void wlbt_hip4_show_segment(struct exynos_wlbt *w, u32 ref,
  * ethernet frame.  It is copied into an skb and handed to the stack; nothing
  * else is needed because the peer did the 802.11 part.
  */
+static void wlbt_rx_frame(struct exynos_wlbt *w, const void *data, size_t len);
+
+/*
+ * A received frame does not always sit in the indication that announces it: the
+ * peer sends MLME_RECEIVED_FRAME_IND with an empty segment and puts the frame -
+ * already ethernet, the 802.11 part is its business - in the segment chained
+ * behind it.  That segment carries no FAPI header of its own, only a bulk
+ * descriptor and the payload, so it has to be walked to be seen at all.
+ */
+static void wlbt_rx_chain(struct exynos_wlbt *w, u32 ref)
+{
+	unsigned int n;
+
+	for (n = 0; n < MBULK_MAX_CHAIN; n++) {
+		struct wlbt_mbulk mb;
+		u16 len, head;
+
+		memcpy_fromio(&mb, w->dram + ref, sizeof(mb));
+		len = le16_to_cpu(mb.len);
+		head = le16_to_cpu(mb.head);
+		if (len && len <= HIP4_SLOT_SIZE - HIP4_MBULK_SIZE - head)
+			wlbt_rx_frame(w, (const u8 __iomem *)w->dram + ref +
+				      HIP4_MBULK_SIZE + head, len);
+
+		if (!(mb.flag & MBULK_F_CHAIN))
+			break;
+		ref = le32_to_cpu(mb.chain_next_offset);
+		if (!wlbt_hip4_ref_valid(w, ref))
+			break;
+	}
+}
+
 static void wlbt_rx_frame(struct exynos_wlbt *w, const void *data, size_t len)
 {
 	struct sk_buff *skb;
@@ -2243,6 +2288,34 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 				if (dlen && dlen <= HIP4_SLOT_SIZE - HIP4_MBULK_SIZE - off)
 					wlbt_rx_frame(w, m + HIP4_MBULK_SIZE + off,
 						      dlen);
+			}
+
+			/*
+			 * The received-frame indication is taken apart for its
+			 * trailing word: if the peer keeps the frame rather than
+			 * sending it, that word is the only pointer to it.
+			 */
+			/*
+			 * MLME_RECEIVED_FRAME_IND is how the peer hands over a
+			 * frame it received but did not fill into the
+			 * indication itself.
+			 */
+			if (le16_to_cpu(hdr.id) == 0x230d &&
+			    (mb.flag & MBULK_F_CHAIN))
+				wlbt_rx_chain(w, ref);
+
+			if (le16_to_cpu(hdr.id) == 0x230d) {
+				size_t blen = len > sizeof(hdr) ?
+					      len - sizeof(hdr) : 0;
+
+				blen = min_t(size_t, blen, sizeof(w->peer_rxind));
+				memcpy(w->peer_rxind, body, blen);
+				w->peer_rxind_len = blen;
+				w->peer_rxind_geom[0] = le16_to_cpu(mb.sig_bufsz);
+				w->peer_rxind_geom[1] = le16_to_cpu(mb.dat_bufsz);
+				w->peer_rxind_geom[2] = le16_to_cpu(mb.len);
+				w->peer_rxind_geom[3] = le16_to_cpu(mb.head);
+				w->n_rxind++;
 			}
 
 			/*
@@ -3717,6 +3790,11 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 		   firmware_name, w->fw_entry, w->fw_runtime_length,
 		   w->fw_loaded ? "loaded" : "not loaded");
 	seq_printf(s, "mailbox last status 0x%04x\n", w->last_mbox_status);
+	if (w->n_rxind)
+		seq_printf(s, "rxind %u, sig %u dat %u len %u head %u, body %*phN\n",
+			   w->n_rxind, w->peer_rxind_geom[0], w->peer_rxind_geom[1],
+			   w->peer_rxind_geom[2], w->peer_rxind_geom[3],
+			   (int)min_t(u32, w->peer_rxind_len, 18), w->peer_rxind);
 	if (w->connect_reported)
 		seq_printf(s, "connect result 0x%04x\n", w->connect_status);
 	seq_printf(s, "link %s, tx %lu called %u dropped %u, hip4 tx %u rx %u\n",
@@ -4576,6 +4654,9 @@ static int wlbt_mlme_connect(struct exynos_wlbt *w,
  * cfg80211 about the outcome.  This cannot run in the drain: the replies are
  * sends that take the queue lock, and cfg80211 may sleep.
  */
+static int wlbt_mlme_set_pmk(struct exynos_wlbt *w, const u8 *pmk,
+			     size_t len);
+
 static void wlbt_peer_work(struct work_struct *work)
 {
 	struct exynos_wlbt *w = container_of(work, struct exynos_wlbt, peer_work);
@@ -4604,6 +4685,14 @@ static void wlbt_peer_work(struct work_struct *work)
 	 * answering that is both too early and unnecessary.
 	 */
 	if (cind && !w->connect_res_sent) {
+		/*
+		 * Before the join the peer has no record to attach a key to, so
+		 * the one sent with the connect may have gone nowhere; this is
+		 * the first moment it can act on it.
+		 */
+		if (w->connect_pmk_len)
+			wlbt_mlme_set_pmk(w, w->connect_pmk, w->connect_pmk_len);
+
 		wlbt_mlme_connect_res(w);
 		w->connect_res_sent = true;
 	}
@@ -4683,8 +4772,6 @@ static void wlbt_connect_work(struct work_struct *work)
 				WLAN_STATUS_UNSPECIFIED_FAILURE, GFP_KERNEL);
 }
 
-static int wlbt_mlme_set_pmk(struct exynos_wlbt *w, const u8 *pmk,
-			     size_t len);
 
 static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 			    struct cfg80211_connect_params *sme)
@@ -4712,9 +4799,13 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	 */
 	if (sme->crypto.psk) {
 		dev_info(w->dev, "connect: pairwise master key supplied\n");
+		memcpy(w->connect_pmk, sme->crypto.psk, WLAN_PMK_LEN);
+		w->connect_pmk_len = WLAN_PMK_LEN;
 		ret = wlbt_mlme_set_pmk(w, sme->crypto.psk, WLAN_PMK_LEN);
 		if (ret)
 			return ret;
+	} else {
+		w->connect_pmk_len = 0;
 	}
 
 	if (sme->channel && sme->channel->center_freq)
@@ -4831,16 +4922,16 @@ static int wlbt_cfg_del_pmk(struct wiphy *wiphy, struct net_device *dev,
 /*
  * MLME_SETKEYS is how the peer is told about the keys a host supplicant
  * negotiated - the firmware does not do the four way handshake itself, so this
- * is the only way a WPA2 connection can carry traffic.  The key material is
- * appended to the signal right after the fixed body, which is what the
- * vendor's fapi_append_data() produces; the length field is in bits, and the
- * packet sequence numbers are packed as little endian half words.
+ * is the only way a WPA2 connection can carry traffic.  The length field is in
+ * bits, the packet sequence numbers are packed as little endian half words, and
+ * the key itself is the payload, the way the vendor's fapi_append_data() leaves
+ * it.
  */
 static int wlbt_mlme_setkeys(struct exynos_wlbt *w, u16 key_id, u16 key_type,
 			     const u8 *address, u32 cipher, const u8 *key,
 			     size_t key_len, const u8 *seq, size_t seq_len)
 {
-	u8 sig[sizeof(struct wlbt_fapi_hdr) + 46 + 32];
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 46];
 	struct wlbt_fapi_hdr hdr = { };
 	size_t n = sizeof(hdr);
 	unsigned int i;
@@ -4860,13 +4951,17 @@ static int wlbt_mlme_setkeys(struct exynos_wlbt *w, u16 key_id, u16 key_type,
 				   sig + n + 14 + i);
 
 	put_unaligned_le32(cipher, sig + n + 30);
-	memcpy(sig + n + 46, key, key_len);
 
 	hdr.id = cpu_to_le16(FAPI_MLME_SETKEYS_REQ);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
 	memcpy(sig, &hdr, sizeof(hdr));
 
-	return wlbt_hip4_send(w, true, sig, n + 46 + key_len, NULL, 0);
+	/*
+	 * The key material travels behind the signal, not inside it: the peer
+	 * reads it from the payload at the offset the signal length implies, so
+	 * a key appended to the signal is read back as whatever follows it.
+	 */
+	return wlbt_hip4_send(w, true, sig, n + 46, key, key_len);
 }
 
 static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
@@ -4879,9 +4974,6 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 	if (!w->hip4_control)
 		return -EIO;
 
-	if (!mac_addr)
-		return -EINVAL;
-
 	if (params->cipher == WLAN_CIPHER_SUITE_WEP40 ||
 	    params->cipher == WLAN_CIPHER_SUITE_WEP104)
 		type = FAPI_KEYTYPE_WEP;
@@ -4893,6 +4985,17 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 		type = FAPI_KEYTYPE_IGTK;
 	else
 		type = FAPI_KEYTYPE_GROUP;
+
+	/*
+	 * A group key is not addressed to a peer: cfg80211 says so by leaving the
+	 * address out, and the peer still wants the access point named, the same
+	 * way the vendor takes the station peer record for a group key.
+	 */
+	if (!mac_addr) {
+		if (type != FAPI_KEYTYPE_GROUP || !is_valid_ether_addr(w->connect_bssid))
+			return -EINVAL;
+		mac_addr = w->connect_bssid;
+	}
 
 	dev_info(w->dev, "setkeys: id %u type %u cipher 0x%x len %d %pM\n",
 		 key_index, type, params->cipher, params->key_len, mac_addr);
@@ -5028,13 +5131,6 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	 * attribute is enough for now, the peer's data path is not there yet.
 	 */
 	wiphy->flags |= WIPHY_FLAG_CONTROL_PORT_PROTOCOL;
-	/*
-	 * The peer runs the four way handshake itself - it keeps the EAPOL
-	 * frames the access point sends and never passes them to the host - so
-	 * it needs the pairwise master key with the connect, which cfg80211
-	 * only hands over for a device advertising this.
-	 */
-	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
 
 	ret = wiphy_register(wiphy);
 	if (ret)
