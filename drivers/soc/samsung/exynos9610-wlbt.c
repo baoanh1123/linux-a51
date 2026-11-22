@@ -837,9 +837,38 @@ MODULE_PARM_DESC(firmware_name, "Firmware image for the WLBT subsystem");
  * not when the peer announces the association, so the answer can be repeated at
  * the moment the pairwise key lands.
  */
+/*
+ * The vendor answers the connect from the M4 path, i.e. after the four way
+ * handshake, not when the association is announced.  If the peer settles the
+ * link's security when it is answered, answering first and installing keys
+ * afterwards is the wrong order.
+ */
+/*
+ * The vendor's MLME_ADD_INFO_ELEMENTS carries only the IEs it cannot express
+ * itself - interworking, extension and vendor ones - and skips the request
+ * entirely when there are none.  The RSN IE travels in the connect request
+ * instead, which is the copy that also reaches the air.
+ */
+static bool info_elements = true;
+module_param(info_elements, bool, 0644);
+MODULE_PARM_DESC(info_elements, "Send the association IEs with MLME_ADD_INFO_ELEMENTS");
+
+static bool connect_res_late;
+module_param(connect_res_late, bool, 0644);
+MODULE_PARM_DESC(connect_res_late, "Answer MLME_CONNECT_IND only once the pairwise key is installed");
+
 static bool connect_res_at_key;
 module_param(connect_res_at_key, bool, 0644);
 MODULE_PARM_DESC(connect_res_at_key, "Answer MLME_CONNECT_IND again when the pairwise key is installed");
+
+/*
+ * A key installed before the join, with a placeholder body, tells whether the
+ * peer decides the link's security when it joins (in which case a key database
+ * filled afterwards never reaches the data path) or when the key arrives.
+ */
+static bool prekey;
+module_param(prekey, bool, 0644);
+MODULE_PARM_DESC(prekey, "Install a placeholder pairwise key before the connect");
 
 static bool host_keys = true;
 module_param(host_keys, bool, 0644);
@@ -4977,6 +5006,9 @@ static int wlbt_mlme_connect(struct exynos_wlbt *w,
  */
 static int wlbt_mlme_set_pmk(struct exynos_wlbt *w, const u8 *pmk,
 			     size_t len);
+static int wlbt_mlme_setkeys(struct exynos_wlbt *w, u16 key_id, u16 key_type,
+			     const u8 *address, u32 cipher, const u8 *key,
+			     size_t key_len, const u8 *seq, size_t seq_len);
 
 static void wlbt_peer_work(struct work_struct *work)
 {
@@ -5014,8 +5046,10 @@ static void wlbt_peer_work(struct work_struct *work)
 		if (w->connect_pmk_len)
 			wlbt_mlme_set_pmk(w, w->connect_pmk, w->connect_pmk_len);
 
-		wlbt_mlme_connect_res(w);
-		w->connect_res_sent = true;
+		if (!connect_res_late) {
+			wlbt_mlme_connect_res(w);
+			w->connect_res_sent = true;
+		}
 	}
 
 	if (cind) {
@@ -5183,9 +5217,20 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	w->connect_res_sent = false;
 	w->peer_connect_cfm = false;
 
-	ret = wlbt_mlme_add_info_elements(w, sme->ie, sme->ie_len);
-	if (ret)
-		return ret;
+	if (info_elements) {
+		ret = wlbt_mlme_add_info_elements(w, sme->ie, sme->ie_len);
+		if (ret)
+			return ret;
+	}
+
+	if (prekey) {
+		static const u8 placeholder[16] = { 1, 2, 3, 4, 5, 6, 7, 8,
+						    9, 10, 11, 12, 13, 14, 15, 16 };
+
+		wlbt_mlme_setkeys(w, 0, FAPI_KEYTYPE_PAIRWISE, bssid,
+				  WLAN_CIPHER_SUITE_CCMP, placeholder,
+				  sizeof(placeholder), NULL, 0);
+	}
 
 	ret = wlbt_mlme_connect(w, sme, bssid, freq);
 	if (ret)
@@ -5355,8 +5400,10 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 	ret = wlbt_mlme_setkeys(w, key_index, type, mac_addr, params->cipher,
 				params->key, params->key_len, params->seq,
 				params->seq_len);
-	if (!ret && pairwise && connect_res_at_key)
+	if (!ret && pairwise && (connect_res_at_key || connect_res_late)) {
 		wlbt_mlme_connect_res(w);
+		w->connect_res_sent = true;
+	}
 
 	return ret;
 }
