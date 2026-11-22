@@ -4807,14 +4807,32 @@ static void wlbt_peer_work(struct work_struct *work)
 		netif_carrier_on(w->netdev);
 	}
 
-	if (disc && w->connected) {
+	if (disc) {
+		bool was_connected = w->connected;
+		bool was_connecting = w->connecting;
+
+		/*
+		 * The peer drops the link for two different reasons and both have
+		 * to release the state: an established link that went away, and a
+		 * join whose four way handshake timed out.  The second one used to
+		 * leave "connecting" set, and then every retry the supplicant
+		 * made was refused as busy - which its log reports as the driver
+		 * failing to associate, not as a handshake that timed out.
+		 */
 		w->connected = false;
-		netif_carrier_off(w->netdev);
-		dev_info(w->dev, "connect: peer lost the link, reason %u\n",
-			 reason);
 		w->connecting = false;
-		cfg80211_disconnected(w->netdev, reason, NULL, 0,
-				      !w->connect_reported, GFP_KERNEL);
+		netif_carrier_off(w->netdev);
+		dev_info(w->dev, "connect: peer lost the link, reason %u (was %s)\n",
+			 reason, was_connected ? "connected" : "connecting");
+
+		if (was_connected)
+			cfg80211_disconnected(w->netdev, reason, NULL, 0,
+					      !w->connect_reported, GFP_KERNEL);
+		else if (was_connecting)
+			cfg80211_connect_result(w->netdev, w->connect_bssid,
+						NULL, 0, NULL, 0,
+						WLAN_STATUS_UNSPECIFIED_FAILURE,
+						GFP_KERNEL);
 	}
 }
 
