@@ -415,6 +415,9 @@ struct wlbt_hip4_q {
 #define FAPI_MLME_CONNECTED_RES		0x2201
 #define FAPI_MLME_SET_ACL_REQ		0x2016
 #define FAPI_MA_UNITDATA_REQ		0x1000
+#define FAPI_MLME_SEND_FRAME_REQ	0x2010
+#define FAPI_MSG_TYPE_EAPOL_KEY_M123	0x0002
+#define FAPI_MSG_TYPE_EAPOL_KEY_M4	0x0003
 #define FAPI_MA_UNITDATA_IND		0x1300
 #define FAPI_PRIORITY_CONTENTION	0x8000
 /* The data the peer carries for a station is ethernet, not 802.11. */
@@ -5097,17 +5100,75 @@ static int wlbt_net_stop(struct net_device *ndev)
  * front of it.  The body names the interface, a tag the confirm echoes, the
  * contention priority and the peer, and says the payload is an 802.3 frame.
  */
+/*
+ * EAPOL is not data.  The vendor driver sends it through MLME_SEND_FRAME with a
+ * message type naming the handshake message (tx.c:143), and the peer counts the
+ * four-way handshake from those requests - the transmission of the M4 is what
+ * ends it (rx.c:3566).  Sent down the data path instead the handshake still
+ * completes on air, the keys still install and confirm, and the peer never
+ * decides that the link is protected, because it never saw an M4.  Hence the
+ * split: EAPOL on the control path with its type, everything else as data.
+ */
+static u16 wlbt_eapol_msg_type(const struct sk_buff *skb)
+{
+	const u8 *eapol = skb->data + ETH_HLEN;
+	unsigned int len = skb->len - ETH_HLEN;
+
+	if (len < 99 || eapol[1] != 3)	/* not an EAPOL-Key frame */
+		return 0;
+
+	/*
+	 * M4 is the one with no ACK and the pairwise bit set, and either the
+	 * secure bit (RSN) or a MIC with no key data at all (WPA).
+	 */
+	if (!(eapol[6] & BIT(7)) && (eapol[6] & BIT(3)) &&
+	    ((eapol[4] == 2 && (eapol[5] & BIT(1))) ||
+	     (eapol[4] == 1 && (eapol[5] & BIT(0)) && !eapol[97] && !eapol[98])))
+		return FAPI_MSG_TYPE_EAPOL_KEY_M4;
+
+	return FAPI_MSG_TYPE_EAPOL_KEY_M123;
+}
+
+static int wlbt_net_xmit_eapol(struct exynos_wlbt *w, struct sk_buff *skb, u16 type)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 30] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SEND_FRAME_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
+	put_unaligned_le16(w->host_tag++, sig + sizeof(hdr) + 2);
+	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3, sig + sizeof(hdr) + 4);
+	put_unaligned_le16(type, sig + sizeof(hdr) + 6);
+	/*
+	 * Channel frequency, dwell time and period stay zero: the peer is on the
+	 * channel already and a key frame has no reason to dwell.
+	 */
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), skb->data, skb->len);
+}
+
 static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct exynos_wlbt *w = wlbt_from_netdev(ndev);
 	u8 sig[sizeof(struct wlbt_fapi_hdr) + 24] = { };
 	struct wlbt_fapi_hdr hdr = { };
+	u16 eapol;
 	int ret;
 
 	if (!w->hip4_control || !w->connected || skb->len < ETH_HLEN) {
 		dev_kfree_skb(skb);
 		w->n_tx_dropped++;
 		return NETDEV_TX_OK;
+	}
+
+	w->n_tx_calls++;
+
+	eapol = skb->protocol == htons(ETH_P_PAE) ? wlbt_eapol_msg_type(skb) : 0;
+	if (eapol) {
+		ret = wlbt_net_xmit_eapol(w, skb, eapol);
+		goto sent;
 	}
 
 	hdr.id = cpu_to_le16(FAPI_MA_UNITDATA_REQ);
@@ -5124,8 +5185,8 @@ static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 	put_unaligned_le16(1, sig + sizeof(hdr) + 6);		/* peer index */
 	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3, sig + sizeof(hdr) + 8);
 
-	w->n_tx_calls++;
 	ret = wlbt_hip4_send(w, false, sig, sizeof(sig), skb->data, skb->len);
+sent:
 	if (ret) {
 		w->n_tx_dropped++;
 		dev_info_ratelimited(w->dev, "tx: send failed: %d\n", ret);
