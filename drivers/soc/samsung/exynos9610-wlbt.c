@@ -801,34 +801,6 @@ MODULE_PARM_DESC(hip4_return, "Hand received HIP4 segments back to the peer");
  * header says; the control queue is an experiment because the peer does not
  * consume the data queue yet.
  */
-static bool post_res = true;
-module_param(post_res, bool, 0644);
-MODULE_PARM_DESC(post_res, "Answer the join indication with MLME_CONNECT_RES");
-
-static bool post_connected = true;
-module_param(post_connected, bool, 0644);
-MODULE_PARM_DESC(post_connected, "Also answer with MLME_CONNECTED_RES and aid 1");
-
-static bool post_acl = true;
-module_param(post_acl, bool, 0644);
-MODULE_PARM_DESC(post_acl, "Send the access list after a connection");
-
-static bool post_channels = true;
-module_param(post_channels, bool, 0644);
-MODULE_PARM_DESC(post_channels, "Send the channel list after a connection");
-
-/*
- * The vendor answers the connect only once the indication arrives; the confirm
- * means the peer accepted the request, not that it has news for the host.
- */
-static bool res_on_cfm;
-module_param(res_on_cfm, bool, 0644);
-MODULE_PARM_DESC(res_on_cfm, "Answer the connect on the confirm instead of the indication");
-
-static bool tx_ctl;
-module_param(tx_ctl, bool, 0644);
-MODULE_PARM_DESC(tx_ctl, "Send transmitted frames on the control queue");
-
 static bool hip4_log;
 module_param(hip4_log, bool, 0644);
 MODULE_PARM_DESC(hip4_log, "Record every received HIP4 frame for debugfs frames");
@@ -4587,11 +4559,10 @@ static void wlbt_peer_work(struct work_struct *work)
 {
 	struct exynos_wlbt *w = container_of(work, struct exynos_wlbt, peer_work);
 	unsigned long flags;
-	bool cfm, cind, cted, disc;
+	bool cind, cted, disc;
 	u16 status, aid, reason;
 
 	spin_lock_irqsave(&w->hip4_lock, flags);
-	cfm = w->peer_connect_cfm;
 	cind = w->peer_connect_ind;
 	cted = w->peer_connected_ind;
 	disc = w->peer_disconnected_ind;
@@ -4604,17 +4575,17 @@ static void wlbt_peer_work(struct work_struct *work)
 	w->peer_disconnected_ind = false;
 	spin_unlock_irqrestore(&w->hip4_lock, flags);
 
-	if ((cind || (cfm && res_on_cfm)) && !w->connect_res_sent && post_res) {
+	/*
+	 * The peer asks once the connection is there, and its data path stays
+	 * shut until it is answered: without this the frames are taken off the
+	 * data queue and none of them ever reaches the air.  The confirm that
+	 * precedes the indication only says the request was accepted, so
+	 * answering that is both too early and unnecessary.
+	 */
+	if (cind && !w->connect_res_sent) {
 		wlbt_mlme_connect_res(w);
 		w->connect_res_sent = true;
 	}
-
-	/* The peer never sends MLME_CONNECTED_IND, so the completion it would
-	 * carry is sent unsolicited to see whether that is what its request
-	 * processing is waiting for.
-	 */
-	if (cind && !status && post_connected)
-		wlbt_mlme_connected_res(w, 1);
 
 	if (cind) {
 		if (status) {
@@ -4633,15 +4604,11 @@ static void wlbt_peer_work(struct work_struct *work)
 		 * later, if at all, so waiting for it means the supplicant has
 		 * already given up.
 		 */
-		if (post_acl) {
-			wlbt_mlme_set_packet_filter(w);
-			msleep(20);
-			wlbt_mlme_set_acl(w);
-		}
-		if (post_channels) {
-			msleep(20);
-			wlbt_mlme_set_cached_channels(w);
-		}
+		wlbt_mlme_set_packet_filter(w);
+		msleep(20);
+		wlbt_mlme_set_acl(w);
+		msleep(20);
+		wlbt_mlme_set_cached_channels(w);
 
 		w->connected = true;
 		if (w->connecting) {
@@ -4921,7 +4888,7 @@ static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3, sig + sizeof(hdr) + 8);
 
 	w->n_tx_calls++;
-	ret = wlbt_hip4_send(w, tx_ctl, sig, sizeof(sig), skb->data, skb->len);
+	ret = wlbt_hip4_send(w, false, sig, sizeof(sig), skb->data, skb->len);
 	if (ret) {
 		w->n_tx_dropped++;
 		dev_info_ratelimited(w->dev, "tx: send failed: %d\n", ret);
