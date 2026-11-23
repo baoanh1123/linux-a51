@@ -37,6 +37,7 @@
 #include <linux/unaligned.h>
 #include <linux/completion.h>
 #include <linux/debugfs.h>
+#include <linux/rtnetlink.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
@@ -757,6 +758,13 @@ struct exynos_wlbt {
 	struct delayed_work scan_work;
 	struct delayed_work connect_work;
 	struct work_struct peer_work;	/* answers the connect indications */
+	unsigned long scan_done;	/* when the last scan finished */
+	bool port_authorized;	/* the peer has a pairwise key, so data may flow */
+	unsigned int n_tx_unauthed;	/* frames dropped before the 4-way finished */
+	u8 default_key_idx;	/* the index userspace marked as default */
+	struct work_struct peer_gone_work;	/* takes the link down after a panic */
+	int wdog_irq;
+	bool peer_dead;
 	u8 connect_bssid[ETH_ALEN];
 	u16 scan_id;
 	/* The last pairwise key the supplicant handed over, kept so that it can be
@@ -977,6 +985,10 @@ MODULE_PARM_DESC(send_pmk, "Hand the PMK to the peer for its own 4-way handshake
 static bool load_firmware;
 module_param(load_firmware, bool, 0644);
 MODULE_PARM_DESC(load_firmware, "Copy the firmware image into MIF DRAM and let the peer run it");
+
+static bool wlan_start_on_boot = true;
+module_param(wlan_start_on_boot, bool, 0644);
+MODULE_PARM_DESC(wlan_start_on_boot, "Start the peer's WLAN service once the firmware runs (default: on)");
 
 /*
  * EAPOL does not travel on the data queue.  The vendor driver hands key
@@ -1394,15 +1406,20 @@ static irqreturn_t wlbt_wdog_isr(int irq, void *data)
 	/* The peer holds the line until something resets it, so a level
 	 * interrupt here storms the AP - which is exactly what the vendor
 	 * guards against by disabling the line when no reset handler is
-	 * registered.  One request is enough to know the peer is gone.
+	 * registered.
 	 */
 	disable_irq_nosync(irq);
-	dev_err(w->dev, "peer watchdog reset request, line disabled\n");
+	dev_err(w->dev, "peer watchdog: the firmware requested a reset\n");
 
 	ret = regmap_update_bits(w->pmu, WLBT_CTRL_NS, WLBT_RESET_REQ_CLR,
 				 WLBT_RESET_REQ_CLR);
 	if (ret)
 		dev_err(w->dev, "cannot clear the reset request: %d\n", ret);
+
+	/* The vendor treats this as a firmware panic (panicmon.c).  Its recovery
+	 * cannot be reproduced here, so the work item only takes the link down.
+	 */
+	schedule_work(&w->peer_gone_work);
 
 	return IRQ_HANDLED;
 }
@@ -3367,6 +3384,52 @@ static int wlbt_power_down(struct exynos_wlbt *w)
 	return -ETIME;
 }
 
+static int wlbt_wlan_start(struct exynos_wlbt *w);
+static void wlbt_boot(struct exynos_wlbt *w);
+
+/*
+ * The peer's firmware stopped.  A panicking peer asserts its own reset and the
+ * block will not come up again until the SoC reboots: wlbt_power_down() followed
+ * by the boot sequence never produces another CFG_REQ, and neither does the boot
+ * sequence on its own from the state the peer leaves behind (both measured, see
+ * notes/scsc.md).  So the job here is to make the failure visible and safe: drop
+ * the link, tell cfg80211, and refuse further work instead of handing frames to a
+ * peer that will never answer.
+ */
+static void wlbt_peer_gone_work(struct work_struct *work)
+{
+	struct exynos_wlbt *w = container_of(work, struct exynos_wlbt, peer_gone_work);
+	bool was_connected;
+
+	rtnl_lock();
+	cancel_delayed_work_sync(&w->scan_work);
+	cancel_delayed_work_sync(&w->connect_work);
+	cancel_work_sync(&w->peer_work);
+
+	if (w->scan_req) {
+		struct cfg80211_scan_info info = { .aborted = true };
+
+		cfg80211_scan_done(w->scan_req, &info);
+		w->scan_req = NULL;
+	}
+
+	was_connected = w->connected;
+	w->connected = false;
+	w->connecting = false;
+	w->connect_res_sent = false;
+	w->vif_created = false;
+	w->port_authorized = false;
+	w->peer_dead = true;
+	if (w->netdev)
+		netif_carrier_off(w->netdev);
+	if (was_connected && w->netdev)
+		cfg80211_disconnected(w->netdev, 4, NULL, 0, true, GFP_KERNEL);
+	rtnl_unlock();
+
+	dev_err(w->dev, "peer stopped; wifi is off until this device is rebooted\n");
+}
+
+
 static void wlbt_boot(struct exynos_wlbt *w)
 {
 	int ret;
@@ -3418,6 +3481,15 @@ static void wlbt_boot(struct exynos_wlbt *w)
 		dev_info(w->dev, "after boot: %u log messages, %u undecodable, INTSR0 0x%08x\n",
 			 w->n_fwlog, w->n_fwlog_bad,
 			 readl(w->mbox + MBOX_INTSR0));
+
+		/*
+		 * Ask for the WLAN service as part of booting, so that loading the
+		 * module is all it takes: nothing else on the system knows about
+		 * the debugfs knob, and an interface without the service behind it
+		 * just looks like a card that scans nothing.
+		 */
+		if (wlan_start_on_boot && !wlbt_wlan_start(w))
+			dev_warn(w->dev, "WLAN start not accepted\n");
 	}
 	mutex_unlock(&w->lock);
 }
@@ -3538,21 +3610,21 @@ static ssize_t wlbt_debugfs_reset(struct file *file, const char __user *buf,
  * the HIP4 region has to exist before the request goes out - a zero reference
  * makes the peer read the firmware header as a control block and stop.
  */
-static ssize_t wlbt_debugfs_wlan(struct file *file, const char __user *buf,
-				 size_t len, loff_t *ppos)
+/*
+ * Send the WLAN service start and collect whatever the peer says in reply.
+ * w->lock must be held.  Returns the write result: true when the request was
+ * queued.
+ */
+static int wlbt_wlan_start(struct exynos_wlbt *w)
 {
-	struct exynos_wlbt *w = file->private_data;
 	unsigned int before = w->n_mgmt;
 	u8 frame[7];
 	__le32 ref;
 	int ret, i;
 
-	mutex_lock(&w->lock);
 	ret = wlbt_hip4_build(w);
-	if (ret) {
-		mutex_unlock(&w->lock);
+	if (ret)
 		return ret;
-	}
 
 	/* The vendor fills the peer's MIB database between opening the service
 	 * and starting it (mgt.c:800-870), so the entries are in place before
@@ -3586,6 +3658,18 @@ static ssize_t wlbt_debugfs_wlan(struct file *file, const char __user *buf,
 	}
 	dev_info(w->dev, "%u management message(s) after WLAN start\n",
 		 w->n_mgmt - before);
+
+	return ret;
+}
+
+static ssize_t wlbt_debugfs_wlan(struct file *file, const char __user *buf,
+				 size_t len, loff_t *ppos)
+{
+	struct exynos_wlbt *w = file->private_data;
+	int ret;
+
+	mutex_lock(&w->lock);
+	ret = wlbt_wlan_start(w);
 	mutex_unlock(&w->lock);
 
 	return ret ? len : -EIO;
@@ -4325,6 +4409,7 @@ static const struct file_operations wlbt_boot_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_boot);
 static const struct file_operations wlbt_reset_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_reset);
+
 static const struct file_operations wlbt_halt_fops =
 	WLBT_DEBUGFS_OPS(wlbt_debugfs_halt);
 static const struct file_operations wlbt_send_fops =
@@ -4398,10 +4483,25 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 	seq_printf(s, "state %s  MIF DRAM %pa  irq cfg-req %u bad %u wdog %u mbox %u\n",
 		   wlbt_state_name(w->state), &w->mem_base, w->n_cfg_req,
 		   w->n_cfg_bad, w->n_wdog, w->n_mbox);
+	seq_printf(s, "peer state: %s\n", w->peer_dead ? "stopped" : "running");
 	seq_printf(s, "firmware %s, entry 0x%x, runtime %u, dram %s\n",
 		   firmware_name, w->fw_entry, w->fw_runtime_length,
 		   w->fw_loaded ? "loaded" : "not loaded");
 	seq_printf(s, "mailbox last status 0x%04x\n", w->last_mbox_status);
+	/* The WLBT power-gate configuration: what was saved at probe and what the
+	 * PMU holds now, so a restore can be checked against it.
+	 */
+	for (i = 0; i < WLBT_PW_REGS; i++) {
+		u32 now = 0;
+
+		regmap_read(w->pmu, w->pw_cfg[i].reg, &now);
+		seq_printf(s, "pmu 0x%04x saved 0x%08x now 0x%08x\n",
+			   w->pw_cfg[i].reg, w->pw_cfg[i].val, now);
+	}
+	seq_printf(s, "central seq: cfg 0x%08x status 0x%08x ctrl_ns 0x%08x\n",
+		   ({ u32 v = 0; regmap_read(w->pmu, CENTRAL_SEQ_WLBT_CONFIGURATION, &v); v; }),
+		   ({ u32 v = 0; regmap_read(w->pmu, CENTRAL_SEQ_WLBT_STATUS, &v); v; }),
+		   ({ u32 v = 0; regmap_read(w->pmu, WLBT_CTRL_NS, &v); v; }));
 	if (w->n_rxind)
 		seq_printf(s, "rxind %u, sig %u dat %u len %u head %u, body %*phN\n",
 			   w->n_rxind, w->peer_rxind_geom[0], w->peer_rxind_geom[1],
@@ -4409,10 +4509,11 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 			   (int)min_t(u32, w->peer_rxind_len, 18), w->peer_rxind);
 	if (w->connect_reported)
 		seq_printf(s, "connect result 0x%04x\n", w->connect_status);
-	seq_printf(s, "link %s, tx %lu called %u dropped %u, hip4 tx %u rx %u\n",
+	seq_printf(s, "link %s, tx %lu called %u dropped %u (unauthenticated %u), hip4 tx %u rx %u\n",
 		   w->connected ? "up" : "down",
 		   w->netdev ? w->netdev->stats.tx_packets : 0UL,
-		   w->n_tx_calls, w->n_tx_dropped, w->n_hip4_tx, w->n_hip4_rx);
+		   w->n_tx_calls, w->n_tx_dropped, w->n_tx_unauthed,
+		   w->n_hip4_tx, w->n_hip4_rx);
 	if (w->hip4_ref)
 		seq_printf(s, "hip4 0x%x control 0x%x mib 0x%x (%u bytes)\n",
 			   w->hip4_ref, w->hip4_control,
@@ -5193,6 +5294,7 @@ static void wlbt_scan_work(struct work_struct *work)
 	wlbt_scan_collect(w);
 	mutex_unlock(&w->lock);
 
+	w->scan_done = jiffies;
 	cfg80211_scan_done(req, &info);
 }
 
@@ -5201,6 +5303,12 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
 {
 	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
 	int ret;
+
+	/* After the peer stopped there is nothing to ask: say so at once rather
+	 * than waiting for a scan result that cannot arrive.
+	 */
+	if (w->peer_dead)
+		return -EIO;
 
 	if (!w->hip4_control)
 		return -EIO;
@@ -5716,6 +5824,9 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 			    struct cfg80211_connect_params *sme)
 {
 	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+
+	if (w->peer_dead)
+		return -EIO;
 	struct cfg80211_bss *bss;
 	u8 bssid[ETH_ALEN];
 	u16 freq = 2437;
@@ -5790,6 +5901,18 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 		 sme->ie_len);
 
 	memcpy(w->connect_bssid, bssid, ETH_ALEN);
+	/*
+	 * Nothing may leave the interface before the handshake is done.  The
+	 * peer holds the link keys, and a data frame that reaches it while it has
+	 * no pairwise key stops the firmware outright: at boot NetworkManager
+	 * starts DHCP the moment the carrier comes up, which is well before the
+	 * supplicant has finished the 4-way, and that is when the reset request
+	 * was seen.  Keep the carrier down and the queue stopped until the key
+	 * arrives; an open network is authorized from the start.
+	 */
+	w->port_authorized = !sme->privacy;
+	dev_info(w->dev, "connect: privacy %d, data %s until a key is installed\n",
+		 sme->privacy, w->port_authorized ? "allowed" : "held back");
 	w->connect_reported = false;
 	w->connect_status = 0;
 	w->connect_res_sent = false;
@@ -5900,6 +6023,7 @@ static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 
 	w->connecting = false;
 	w->connected = false;
+	w->port_authorized = false;
 	netif_carrier_off(ndev);
 
 	if (was_connected)
@@ -6086,6 +6210,18 @@ static int wlbt_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 		w->connect_res_sent = true;
 	}
 
+	/*
+	 * The 4-way is far enough along for the peer to take data frames: it has
+	 * the pairwise key, so open the port the same way mac80211 does, and let
+	 * the stack (DHCP first) at the link.
+	 */
+	if (!ret && pairwise && w->netdev && !w->port_authorized) {
+		w->port_authorized = true;
+		cfg80211_port_authorized(w->netdev, w->connect_bssid, NULL, 0,
+					 GFP_KERNEL);
+		dev_info(w->dev, "key: port authorized\n");
+	}
+
 	return ret;
 }
 
@@ -6098,11 +6234,29 @@ static int wlbt_cfg_del_key(struct wiphy *wiphy, struct net_device *ndev,
 	 */
 	return 0;
 }
+/*
+ * cfg80211 asks for this whenever userspace marks a key as the default one.  The
+ * peer takes the transmit key from the index in the key install request, so
+ * there is nothing to send here, but the op has to exist: add_key without it is
+ * an api violation that cfg80211 warns about at registration time.
+ */
+static int wlbt_cfg_set_default_key(struct wiphy *wiphy, struct net_device *ndev,
+				    int link_id, u8 key_idx, bool unicast,
+				    bool multicast)
+{
+	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+
+	w->default_key_idx = key_idx;
+
+	return 0;
+}
+
 static const struct cfg80211_ops wlbt_cfg80211_ops = {
 	.scan = wlbt_cfg_scan,
 	.connect = wlbt_cfg_connect,
 	.disconnect = wlbt_cfg_disconnect,
 	.add_key = wlbt_cfg_add_key,
+	.set_default_key = wlbt_cfg_set_default_key,
 	.del_key = wlbt_cfg_del_key,
 	.set_pmk = wlbt_cfg_set_pmk,
 	.del_pmk = wlbt_cfg_del_pmk,
@@ -6116,6 +6270,11 @@ static const struct cfg80211_ops wlbt_cfg80211_ops = {
 static int wlbt_net_open(struct net_device *ndev)
 {
 	struct exynos_wlbt *w = wlbt_from_netdev(ndev);
+
+	if (w->peer_dead) {
+		netif_carrier_off(ndev);
+		return -EIO;
+	}
 
 	/*
 	 * The interface is usually brought up before the join, but it can also be
@@ -6203,6 +6362,19 @@ static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 	}
 
 	w->n_tx_calls++;
+
+	/*
+	 * EAPOL has to get out through this function - it is how the handshake is
+	 * completed - but nothing else may reach the peer before it holds the
+	 * pairwise key.  Dropping here rather than stopping the queue keeps the
+	 * supplicant's own frames flowing.
+	 */
+	if (!w->port_authorized && skb->protocol != htons(ETH_P_PAE)) {
+		dev_kfree_skb(skb);
+		w->n_tx_unauthed++;
+		return NETDEV_TX_OK;
+	}
+
 	if (eapol_mlme && skb->protocol == htons(ETH_P_PAE)) {
 		ret = wlbt_mlme_send_eapol(w, skb->data, skb->len);
 		if (ret) {
@@ -6294,7 +6466,16 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	SET_NETDEV_DEV(ndev, w->dev);
 	eth_hw_addr_set(ndev, wlbt_mac);
 
+	/* Registering an interface from a driver's own probe means taking the
+	 * two locks cfg80211 expects its callers to hold; without them the netdev
+	 * is created outside RTNL and the add never reaches userspace in a shape
+	 * NetworkManager accepts.
+	 */
+	rtnl_lock();
+	wiphy_lock(wiphy);
 	ret = cfg80211_register_netdevice(ndev);
+	wiphy_unlock(wiphy);
+	rtnl_unlock();
 	if (ret) {
 		free_netdev(ndev);
 		goto err_unregister;
@@ -6305,6 +6486,7 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	INIT_DELAYED_WORK(&w->scan_work, wlbt_scan_work);
 	INIT_DELAYED_WORK(&w->connect_work, wlbt_connect_work);
 	INIT_WORK(&w->peer_work, wlbt_peer_work);
+	INIT_WORK(&w->peer_gone_work, wlbt_peer_gone_work);
 	dev_info(w->dev, "registered %s\n", netdev_name(ndev));
 	return 0;
 
@@ -6321,6 +6503,7 @@ static void wlbt_unregister_wiphy(struct exynos_wlbt *w)
 		return;
 
 	cancel_delayed_work_sync(&w->scan_work);
+	cancel_work_sync(&w->peer_gone_work);
 	cancel_delayed_work_sync(&w->connect_work);
 	if (w->scan_req) {
 		struct cfg80211_scan_info info = { .aborted = true };
@@ -6329,7 +6512,11 @@ static void wlbt_unregister_wiphy(struct exynos_wlbt *w)
 		w->scan_req = NULL;
 	}
 	if (w->netdev) {
+		rtnl_lock();
+		wiphy_lock(w->wiphy);
 		cfg80211_unregister_netdevice(w->netdev);
+		wiphy_unlock(w->wiphy);
+		rtnl_unlock();
 		free_netdev(w->netdev);
 		w->netdev = NULL;
 	}
@@ -6432,6 +6619,7 @@ static int wlbt_probe(struct platform_device *pdev)
 	/* WLBT watchdog and doorbell will only matter once the transport is
 	 * there, but taking them keeps a level interrupt from storming.
 	 */
+	w->wdog_irq = irq_wdog;
 	ret = devm_request_irq(w->dev, irq_wdog, wlbt_wdog_isr, IRQF_TRIGGER_HIGH,
 			       "wlbt-wdog", w);
 	if (ret)
@@ -6473,7 +6661,10 @@ static void wlbt_remove(struct platform_device *pdev)
 
 	mutex_lock(&w->lock);
 	w->vif_created = false;
-	wlbt_power_down(w);
+	if (w->peer_dead)
+		dev_info(w->dev, "peer already stopped, leaving it in reset\n");
+	else
+		wlbt_power_down(w);
 	mutex_unlock(&w->lock);
 
 	debugfs_remove(w->debugfs);
