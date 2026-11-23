@@ -5573,8 +5573,13 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 
 	if (!w->hip4_control)
 		return -EIO;
-	if (w->connecting)
+	if (w->connecting) {
+		/* Refused without a word this looks like an association failure in
+		 * the supplicant's log, so name the state that caused it.
+		 */
+		dev_info(w->dev, "connect: refused, one is already under way\n");
 		return -EBUSY;
+	}
 
 	ret = wlbt_vif_up(w);
 	if (ret)
