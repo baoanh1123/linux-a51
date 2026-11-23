@@ -1015,6 +1015,20 @@ static bool hip4_log;
 module_param(hip4_log, bool, 0644);
 MODULE_PARM_DESC(hip4_log, "Record every received HIP4 frame for debugfs frames");
 
+/*
+ * The peer logs through the same transport as everything else, and a busy link
+ * produces thousands of records a second.  Printing them from the drain stops
+ * the machine for as long as the console takes, so they are counted always and
+ * printed only when asked.
+ */
+static bool fw_log;
+module_param(fw_log, bool, 0644);
+MODULE_PARM_DESC(fw_log, "Print the peer's own log records");
+
+static bool scan_log;
+module_param(scan_log, bool, 0644);
+MODULE_PARM_DESC(scan_log, "Print one line per access point a scan reports");
+
 /* One line per control frame sent; cheap enough to leave on by default. */
 static bool tx_log = true;
 module_param(tx_log, bool, 0644);
@@ -2601,12 +2615,20 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 
 			memcpy_fromio(&hdr, m + HIP4_MBULK_SIZE +
 				      HIP4_SIG_RESERVED, sizeof(hdr));
-			dev_info(w->dev,
-				 "  fapi id 0x%04x receiver 0x%04x sender 0x%04x ref 0x%x\n",
-				 le16_to_cpu(hdr.id),
-				 le16_to_cpu(hdr.receiver_pid),
-				 le16_to_cpu(hdr.sender_pid),
-				 le32_to_cpu(hdr.fw_reference));
+			/*
+			 * One line per frame is enough to stall the machine when
+			 * the console is a serial port and this runs in the
+			 * drain with interrupts off: hundreds of frames a second
+			 * each wait for the UART, and everything behind them
+			 * waits too.  Only print when it is asked for.
+			 */
+			if (hip4_log)
+				dev_info(w->dev,
+					 "  fapi id 0x%04x receiver 0x%04x sender 0x%04x ref 0x%x\n",
+					 le16_to_cpu(hdr.id),
+					 le16_to_cpu(hdr.receiver_pid),
+					 le16_to_cpu(hdr.sender_pid),
+					 le32_to_cpu(hdr.fw_reference));
 
 			/*
 			 * The signal body has to be in memory before any id specific
@@ -3009,8 +3031,9 @@ static void wlbt_log_drain(struct exynos_wlbt *w)
 
 		if (sync == MXLOG_SYNC_PHASE_4) {
 			w->n_fwlog++;
-			dev_printk(wlbt_fw_level(level), w->dev, "firmware: %s\n",
-				   text);
+			if (fw_log)
+				dev_printk(wlbt_fw_level(level), w->dev,
+					   "firmware: %s\n", text);
 		} else {
 			w->n_fwlog_bad++;
 			/* Phase 5 compresses repeated strings against a table
@@ -4908,7 +4931,8 @@ static void wlbt_scan_report_one(struct exynos_wlbt *w, const u8 *frame,
 	bss = cfg80211_inform_bss_frame_data(w->wiphy, &data,
 					     (struct ieee80211_mgmt *)frame,
 					     len, GFP_KERNEL);
-	dev_info(w->dev, "bss %pM freq %u len %zu chan %s -> %s\n",
+	if (scan_log)
+		dev_info(w->dev, "bss %pM freq %u len %zu chan %s -> %s\n",
 		 frame + 16, freq, len, data.chan ? "known" : "UNKNOWN",
 		 IS_ERR(bss) ? "rejected" : "ok");
 	if (!IS_ERR_OR_NULL(bss))
