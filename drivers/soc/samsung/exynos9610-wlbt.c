@@ -683,6 +683,9 @@ struct wlbt_trace_rec {
 	u32 val;
 };
 
+/* An SAE authentication frame is a header plus a curve point and a token. */
+#define WLBT_SAE_FRAME			512
+
 struct exynos_wlbt {
 	struct device *dev;
 	void __iomem *mbox;
@@ -780,6 +783,24 @@ struct exynos_wlbt {
 	u16 ptk_id;
 	bool ptk_valid;
 	bool connecting;
+	u8 connect_ssid[IEEE80211_MAX_SSID_LEN];
+	size_t connect_ssid_len;
+	u16 connect_freq;		/* channel of the join in progress */
+	u64 mgmt_cookie;		/* names management frames sent to the peer */
+	/* An authentication frame the peer handed up for SAE, copied out of the
+	 * drain (which runs with interrupts off) for the work item that can sleep.
+	 */
+	struct work_struct sae_work;
+	u8 sae_frame[WLBT_SAE_FRAME];
+	size_t sae_frame_len;
+	int sae_signal;
+	/* Where the peer's SAE indication kept its frame, kept as data: the
+	 * drain cannot print, and guessing wrong looks like a peer that never
+	 * answered.
+	 */
+	u32 sae_dbg[8];
+	unsigned int n_sae_ind;
+	unsigned int sae_chain;
 	bool vif_created;		/* MLME_ADD_VIF was accepted */
 	bool connect_reported;		/* the peer answered the join */
 	u16 connect_status;		/* FAPI_RESULTCODE from MLME_CONNECT_IND */
@@ -1002,7 +1023,32 @@ MODULE_PARM_DESC(wlan_start_on_boot, "Start the peer's WLAN service once the fir
 #define FAPI_MLME_SEND_FRAME_REQ	0x2010
 #define FAPI_MESSAGETYPE_EAPOL_KEY_M123	0x0002
 #define FAPI_MESSAGETYPE_EAPOL_KEY_M4	0x0003
+#define FAPI_MESSAGETYPE_IEEE80211_MGMT	0x0011
 #define FAPI_DATAUNIT_IEEE802_3_FRAME	0x0001
+#define FAPI_DATAUNIT_IEEE802_11_FRAME	0x0000
+
+/*
+ * WPA3 is not the peer's to finish on its own.  The join goes out with
+ * FAPI_AUTHENTICATIONTYPE_SAE, and the peer then runs the exchange with its own
+ * MLME but hands every authentication frame it receives up in an
+ * MLME_SYNCHRONISED_IND: the supplicant owns the derivation, so it must see the
+ * frame (cfg80211_rx_mgmt) and be told to start (cfg80211_external_auth_request).
+ * Its answer comes back through NL80211_CMD_EXTERNAL_AUTH and is passed on as
+ * MLME_SYNCHRONISED_RES, after which the peer associates and the 4-way runs as
+ * it does for WPA2.
+ *
+ * The vendor driver is built the same way (CONFIG_SCSC_WLAN_SAE_CONFIG):
+ * cfg80211_ops.c sets NL80211_FEATURE_SAE, rx.c turns MLME_SYNCHRONISED_IND into
+ * an external auth request, and mlme.c answers it with MLME_SYNCHRONISED_RES.
+ */
+#define FAPI_MLME_SYNCHRONISED_RES	0x2205
+#define FAPI_MLME_SYNCHRONISED_IND	0x231b
+#define FAPI_AUTHENTICATIONTYPE_SAE	0x0003
+#define FAPI_MLME_SYNCHRONISED_SIG	14	/* vif, rssi, two words of spare */
+
+static bool sae_support;
+module_param(sae_support, bool, 0644);
+MODULE_PARM_DESC(sae_support, "Advertise WPA3/SAE support.  The peer does not transmit the supplicant's authentication frames on this firmware, so this only turns a WPA2/WPA3 network into a failed join and a peer reset");
 
 static bool eapol_mlme = true;
 module_param(eapol_mlme, bool, 0644);
@@ -1920,6 +1966,102 @@ static void wlbt_hip4_slot_put(struct exynos_wlbt *w, u32 ref)
  * the HIP4 configuration, and one that falls outside them is an assertion on its
  * side, so a segment that is not plainly inside those buffers is never queued.
  */
+static bool wlbt_hip4_ref_valid(struct exynos_wlbt *w, u32 ref);
+
+/*
+ * Take a frame out of the mbulk at ref, if it holds one.  Returns the length
+ * copied: the peer either fills the segment or leaves the frame in a chained
+ * one, and both are worth trying before giving up.
+ */
+static size_t wlbt_mbulk_frame(struct exynos_wlbt *w, u32 ref, u8 *dst,
+			       size_t cap)
+{
+	struct wlbt_mbulk mb;
+	u16 len, head;
+
+	if (!wlbt_hip4_ref_valid(w, ref))
+		return 0;
+
+	memcpy_fromio(&mb, w->dram + ref, sizeof(mb));
+	len = le16_to_cpu(mb.len);
+	head = le16_to_cpu(mb.head);
+	if (len < 2 || len > HIP4_SLOT_SIZE - HIP4_MBULK_SIZE - head || len > cap)
+		return 0;
+
+	memcpy_fromio(dst, w->dram + ref + HIP4_MBULK_SIZE + head, len);
+	return len;
+}
+
+/*
+ * MLME_SYNCHRONISED_IND is an authentication frame the peer exchanged for a
+ * WPA3 join, and it is meant for the supplicant, not for the data path.  Where
+ * it puts the frame is not announced: it can be in the segment itself, in a
+ * chained one (the way MLME_RECEIVED_FRAME_IND hands over its frame), or behind
+ * the pointer the indication carries.  Try all three and note which answered,
+ * because this runs in the drain and cannot ask later.
+ */
+static void wlbt_sae_ind(struct exynos_wlbt *w, u32 ref, const struct wlbt_mbulk *mb,
+			 const u8 *body)
+{
+	u16 len = le16_to_cpu(mb->len), head = le16_to_cpu(mb->head);
+	size_t got = 0;
+
+	w->sae_dbg[0] = mb->flag;
+	w->sae_dbg[1] = le16_to_cpu(mb->sig_bufsz);
+	w->sae_dbg[2] = le16_to_cpu(mb->dat_bufsz);
+	w->sae_dbg[3] = len;
+	w->sae_dbg[4] = head;
+	w->sae_dbg[5] = w->n_sae_ind++;
+
+	if (len >= 24 && len <= HIP4_SLOT_SIZE - HIP4_MBULK_SIZE - head)
+		got = wlbt_mbulk_frame(w, ref, w->sae_frame, sizeof(w->sae_frame));
+
+	/* A chained segment says where the frame is, and the frame is a segment
+	 * of its own rather than a continuation.
+	 */
+	if (!got && (mb->flag & MBULK_F_CHAIN)) {
+		u32 next = le32_to_cpu(mb->chain_next_offset);
+		unsigned int n = 0;
+
+		for (; n < MBULK_MAX_CHAIN && wlbt_hip4_ref_valid(w, next); n++) {
+			struct wlbt_mbulk nb;
+
+			got = wlbt_mbulk_frame(w, next, w->sae_frame,
+					       sizeof(w->sae_frame));
+			if (got) {
+				w->sae_dbg[6] = next;
+				break;
+			}
+			memcpy_fromio(&nb, w->dram + next, sizeof(nb));
+			if (!(nb.flag & MBULK_F_CHAIN))
+				break;
+			next = le32_to_cpu(nb.chain_next_offset);
+		}
+		w->sae_chain = n;
+	}
+
+	/* The indicator carried a reference of its own; the vendor's struct
+	 * calls it spare, the peer may be using it.
+	 */
+	if (!got) {
+		u32 ptr = get_unaligned_le32(body + 10);
+
+		if (ptr != ref) {
+			got = wlbt_mbulk_frame(w, ptr, w->sae_frame,
+					       sizeof(w->sae_frame));
+			if (got)
+				w->sae_dbg[7] = ptr;
+		}
+	}
+
+	if (!got)
+		return;
+
+	w->sae_frame_len = got;
+	w->sae_signal = (s16)get_unaligned_le16(body + 2);
+	schedule_work(&w->sae_work);
+}
+
 static bool wlbt_hip4_ref_valid(struct exynos_wlbt *w, u32 ref)
 {
 	return ref >= w->hip4_ref + HIP4_TX_OFFSET &&
@@ -2768,6 +2910,17 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			}
 
 			/*
+			 * MLME_SYNCHRONISED_IND is an authentication frame the
+			 * peer exchanged with the access point on its own: it
+			 * is how WPA3 asks the host to run SAE.  The frame is in
+			 * the data area, the word after the interface is the
+			 * peer's signal for it.  Copy it out here - this runs in
+			 * the drain - and let the work item do the talking.
+			 */
+			if (le16_to_cpu(hdr.id) == FAPI_MLME_SYNCHRONISED_IND)
+				wlbt_sae_ind(w, ref, &mb, body);
+
+			/*
 			 * The received-frame indication is taken apart for its
 			 * trailing word: if the peer keeps the frame rather than
 			 * sending it, that word is the only pointer to it.
@@ -3386,6 +3539,44 @@ static int wlbt_power_down(struct exynos_wlbt *w)
 
 static int wlbt_wlan_start(struct exynos_wlbt *w);
 static void wlbt_boot(struct exynos_wlbt *w);
+
+/*
+ * One authentication frame for SAE, and the request that goes with it.  Both
+ * matter: the frame is what the supplicant answers (it sends its own commit or
+ * confirm back through cfg80211's management transmit), and the request is what
+ * tells it that this network is being joined with SAE at all.  The peer keeps
+ * the exchange moving by itself; the supplicant only owns the derivation of the
+ * key from the password.
+ */
+static void wlbt_sae_work(struct work_struct *work)
+{
+	struct exynos_wlbt *w = container_of(work, struct exynos_wlbt, sae_work);
+	struct cfg80211_external_auth_params auth = { };
+	const u8 *frame = w->sae_frame;
+	bool delivered;
+
+	if (!w->netdev || !w->sae_frame_len)
+		return;
+
+	delivered = cfg80211_rx_mgmt(w->netdev->ieee80211_ptr, w->connect_freq,
+				     w->sae_signal, frame, w->sae_frame_len, 0);
+
+	auth.action = NL80211_EXTERNAL_AUTH_START;
+	memcpy(auth.bssid, frame + 10, ETH_ALEN);	/* addr2: the access point */
+	memcpy(auth.ssid.ssid, w->connect_ssid, w->connect_ssid_len);
+	auth.ssid.ssid_len = w->connect_ssid_len;
+	auth.key_mgmt_suite = WLAN_AKM_SUITE_SAE;
+
+	dev_info(w->dev,
+		 "sae: frame %zu bytes from %pM type 0x%02x alg %u trans %u (%s)\n",
+		 w->sae_frame_len, auth.bssid, frame[0],
+		 w->sae_frame_len >= 26 ? get_unaligned_le16(frame + 24) : 0,
+		 w->sae_frame_len >= 28 ? get_unaligned_le16(frame + 26) : 0,
+		 delivered ? "delivered" : "no listener");
+
+	if (cfg80211_external_auth_request(w->netdev, &auth, GFP_KERNEL))
+		dev_info(w->dev, "sae: the supplicant did not ask for the frame\n");
+}
 
 /*
  * The peer's firmware stopped.  A panicking peer asserts its own reset and the
@@ -4484,6 +4675,11 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 		   wlbt_state_name(w->state), &w->mem_base, w->n_cfg_req,
 		   w->n_cfg_bad, w->n_wdog, w->n_mbox);
 	seq_printf(s, "peer state: %s\n", w->peer_dead ? "stopped" : "running");
+	if (w->n_sae_ind)
+		seq_printf(s, "sae: %u indication(s), last flag 0x%02x sig %u dat %u len %u head %u chain-ref 0x%x own-ref 0x%x chain %u\n",
+			   w->n_sae_ind, w->sae_dbg[0], w->sae_dbg[1],
+			   w->sae_dbg[2], w->sae_dbg[3], w->sae_dbg[4],
+			   w->sae_dbg[6], w->sae_dbg[7], w->sae_chain);
 	seq_printf(s, "firmware %s, entry 0x%x, runtime %u, dram %s\n",
 		   firmware_name, w->fw_entry, w->fw_runtime_length,
 		   w->fw_loaded ? "loaded" : "not loaded");
@@ -5629,7 +5825,13 @@ static int wlbt_mlme_connect(struct exynos_wlbt *w,
 	memset(sig, 0, sizeof(sig));
 	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif 1 */
 	memcpy(sig + sizeof(hdr) + 2, bssid, ETH_ALEN);
-	put_unaligned_le16(sme->auth_type, sig + sizeof(hdr) + 8);
+	/* The peer has a numbering of its own: what nl80211 calls
+	 * NL80211_AUTHTYPE_SAE it knows as FAPI_AUTHENTICATIONTYPE_SAE, and the
+	 * vendor driver translates the same way before filling this field.
+	 */
+	put_unaligned_le16(sme->auth_type == NL80211_AUTHTYPE_SAE ?
+			   FAPI_AUTHENTICATIONTYPE_SAE : sme->auth_type,
+			   sig + sizeof(hdr) + 8);
 	put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 10);
 
 	dat[n++] = WLAN_EID_SSID;
@@ -5837,6 +6039,12 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	dev_info(w->dev, "connect: request for \"%.*s\" (connected %d connecting %d)\n",
 		 (int)sme->ssid_len, sme->ssid, w->connected, w->connecting);
 
+	/* An SAE join is finished by the supplicant, and it needs to be told
+	 * which network the authentication frames belong to.
+	 */
+	w->connect_ssid_len = min_t(size_t, sme->ssid_len, sizeof(w->connect_ssid));
+	memcpy(w->connect_ssid, sme->ssid, w->connect_ssid_len);
+
 	if (!w->hip4_control)
 		return -EIO;
 	if (w->connecting) {
@@ -5893,6 +6101,8 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 			freq = bss->channel->center_freq;
 		cfg80211_put_bss(wiphy, bss);
 	}
+
+	w->connect_freq = freq;
 
 	dev_info(w->dev, "connect: %pM freq %u auth %u ssid \"%.*s\" ies %zu\n",
 		 bssid, freq, sme->auth_type, (int)sme->ssid_len, sme->ssid,
@@ -6249,6 +6459,93 @@ static int wlbt_cfg_set_default_key(struct wiphy *wiphy, struct net_device *ndev
 	return 0;
 }
 
+/*
+ * A management frame the supplicant wants on the air, which for WPA3 is its own
+ * half of the SAE exchange.  The peer takes it through MLME_SEND_FRAME_REQ like
+ * an EAPOL frame, only with the 802.11 descriptor and the management message
+ * type; the channel is the one being joined, since the peer is sitting on it.
+ */
+static int wlbt_cfg_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+			    struct cfg80211_mgmt_tx_params *params, u64 *cookie)
+{
+	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 30] = { };
+	struct wlbt_fapi_hdr hdr = { };
+	u16 freq = params->chan ? params->chan->center_freq : w->connect_freq;
+	int ret;
+
+	if (w->peer_dead)
+		return -EIO;
+
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
+	put_unaligned_le16(w->host_tag++, sig + sizeof(hdr) + 2);
+	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_11_FRAME,
+			   sig + sizeof(hdr) + 4);
+	put_unaligned_le16(FAPI_MESSAGETYPE_IEEE80211_MGMT,
+			   sig + sizeof(hdr) + 6);
+	put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 8);
+	/* The dwell time and the period stay zero: the peer is already there. */
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SEND_FRAME_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	*cookie = w->mgmt_cookie++;
+	dev_info(w->dev, "mgmt_tx: %zu bytes type 0x%02x freq %u\n",
+		 params->len, params->len ? params->buf[0] : 0, freq);
+	ret = wlbt_hip4_send(w, true, sig, sizeof(sig), params->buf, params->len);
+	if (ret)
+		return ret;
+
+	if (!params->dont_wait_for_ack)
+		cfg80211_mgmt_tx_status(wdev, *cookie, params->buf, params->len,
+					true, GFP_ATOMIC);
+
+	return 0;
+}
+
+/*
+ * The supplicant's verdict on the SAE exchange, passed to the peer so it can
+ * associate.  The status is the 802.11 status code it reports.
+ */
+static int wlbt_cfg_external_auth(struct wiphy *wiphy, struct net_device *ndev,
+				  struct cfg80211_external_auth_params *params)
+{
+	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 16] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
+	put_unaligned_le16(params->status, sig + sizeof(hdr) + 2);
+	memcpy(sig + sizeof(hdr) + 4, params->bssid, ETH_ALEN);
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SYNCHRONISED_RES);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	dev_info(w->dev, "sae: supplicant finished with status %u for %pM\n",
+		 params->status, params->bssid);
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+}
+
+/*
+ * cfg80211 only forwards a management frame to a listener that the wiphy says
+ * the interface may receive, so the station entry has to name the two kinds
+ * that matter here: authentication frames for SAE, and action frames, which is
+ * what a frame subscription defaults to.
+ */
+static const struct ieee80211_txrx_stypes
+wlbt_mgmt_stypes[NUM_NL80211_IFTYPES] = {
+	[NL80211_IFTYPE_STATION] = {
+		.tx = BIT(IEEE80211_STYPE_AUTH >> 4) |
+		      BIT(IEEE80211_STYPE_ACTION >> 4) |
+		      BIT(IEEE80211_STYPE_PROBE_REQ >> 4),
+		.rx = BIT(IEEE80211_STYPE_AUTH >> 4) |
+		      BIT(IEEE80211_STYPE_ACTION >> 4),
+	},
+};
+
 static const struct cfg80211_ops wlbt_cfg80211_ops = {
 	.scan = wlbt_cfg_scan,
 	.connect = wlbt_cfg_connect,
@@ -6258,6 +6555,8 @@ static const struct cfg80211_ops wlbt_cfg80211_ops = {
 	.del_key = wlbt_cfg_del_key,
 	.set_pmk = wlbt_cfg_set_pmk,
 	.del_pmk = wlbt_cfg_del_pmk,
+	.mgmt_tx = wlbt_cfg_mgmt_tx,
+	.external_auth = wlbt_cfg_external_auth,
 };
 
 /*
@@ -6446,6 +6745,21 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	 */
 	wiphy->flags |= WIPHY_FLAG_CONTROL_PORT_PROTOCOL;
 
+	/*
+	 * Only claim SAE when asked to.  The host side is here - the peer hands
+	 * up the access point, the supplicant runs the exchange and its frames go
+	 * out through the management transmit - but this firmware does not send
+	 * those frames: with a live capture on the channel, the only frames that
+	 * leave the peer during a WPA3 join are its own probe requests, and the
+	 * join ends in AUTH_TX_FAIL (0x8015) followed by a watchdog reset.  See
+	 * notes/wifi.md.  Advertising the flag anyway would make NetworkManager
+	 * prefer SAE on a WPA2/WPA3 network and kill the peer, so it stays off
+	 * unless sae_support=1 is given.
+	 */
+	if (sae_support)
+		wiphy->features |= NL80211_FEATURE_SAE;
+	wiphy->mgmt_stypes = wlbt_mgmt_stypes;
+
 	ret = wiphy_register(wiphy);
 	if (ret)
 		goto err_free;
@@ -6485,6 +6799,7 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	INIT_DELAYED_WORK(&w->connect_work, wlbt_connect_work);
 	INIT_WORK(&w->peer_work, wlbt_peer_work);
 	INIT_WORK(&w->peer_gone_work, wlbt_peer_gone_work);
+	INIT_WORK(&w->sae_work, wlbt_sae_work);
 	dev_info(w->dev, "registered %s\n", netdev_name(ndev));
 	return 0;
 
@@ -6502,6 +6817,7 @@ static void wlbt_unregister_wiphy(struct exynos_wlbt *w)
 
 	cancel_delayed_work_sync(&w->scan_work);
 	cancel_work_sync(&w->peer_gone_work);
+	cancel_work_sync(&w->sae_work);
 	cancel_delayed_work_sync(&w->connect_work);
 	if (w->scan_req) {
 		struct cfg80211_scan_info info = { .aborted = true };
