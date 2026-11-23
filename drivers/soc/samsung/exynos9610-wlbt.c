@@ -1089,21 +1089,23 @@ module_param(mgmt_tx_freq_mode, uint, 0644);
 MODULE_PARM_DESC(mgmt_tx_freq_mode, "Management frame transmits: 0 leaves the frequency zero (send on the channel the interface is on), 1 always names the channel, 2 names it and asks for the dwell time");
 
 /*
- * The vendor sends authentication frames with the management message type
- * (cfg80211_ops.c:slsi_wlan_mgmt_tx, "Transmit on the current frequency").  On
- * this firmware a 0x0011 authentication frame from this driver is not
- * transmitted and ends in a peer watchdog reset: twice out of two attempts, each
- * after a clean boot with nothing else running.  So the action type stays the
- * default and the vendor's type is kept behind a knob, because it is the right
- * answer somewhere we have not found yet.
+ * What the vendor puts in an authentication frame, read off its own logring
+ * capture of an SAE join (the vendor driver copies every control frame into it
+ * and tools/testing/vendor-samlog.py decodes it):
+ *
+ *	vif=1 data_unit=0x0000 message_type=0x0011 freq=0 dwell=0 period=0
+ *
+ * data unit 0x0000 is the 802.11 frame descriptor and 0x0011 the management
+ * message type; the dwell time is zero, not the supplicant's wait.  Sending the
+ * same frame with a non-zero dwell is what made the peer reset before.
  */
-static unsigned int mgmt_tx_auth_type = FAPI_MESSAGETYPE_IEEE80211_ACTION;
+static unsigned int mgmt_tx_auth_type = FAPI_MESSAGETYPE_IEEE80211_MGMT;
 module_param(mgmt_tx_auth_type, uint, 0644);
 MODULE_PARM_DESC(mgmt_tx_auth_type, "Message type authentication frames are sent with: 0x10 action (default, does not reach the air) or 0x11 management (what the vendor sends, but it resets the peer here)");
 
-static int mgmt_tx_auth_dwell_us = -1;
+static int mgmt_tx_auth_dwell_us;
 module_param(mgmt_tx_auth_dwell_us, int, 0644);
-MODULE_PARM_DESC(mgmt_tx_auth_dwell_us, "Dwell time in microseconds for authentication frames; -1 uses the supplicant's wait time, as the vendor does");
+MODULE_PARM_DESC(mgmt_tx_auth_dwell_us, "Dwell time in microseconds for authentication frames; 0 is what the vendor sends");
 
 static unsigned int mgmt_tx_dwell_ms = 100;
 module_param(mgmt_tx_dwell_ms, uint, 0644);
@@ -6520,7 +6522,12 @@ static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
  */
 static int wlbt_mlme_set_pmk(struct exynos_wlbt *w, const u8 *pmk, size_t len)
 {
-	u8 sig[sizeof(struct wlbt_fapi_hdr) + 16] = { };
+	/*
+	 * Fourteen bytes: the interface and three spare words (fapi.h:
+	 * mlme_set_pmk_req), with the key appended behind the signal.  Sixteen
+	 * put two bytes of padding in front of it.
+	 */
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14] = { };
 	struct wlbt_fapi_hdr hdr = { };
 
 	if (len > 64)
@@ -6777,12 +6784,12 @@ static int wlbt_cfg_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 			   FAPI_MESSAGETYPE_IEEE80211_ACTION,
 			   sig + sizeof(hdr) + 6);
 	if (auth && mgmt_tx_auth_type == FAPI_MESSAGETYPE_IEEE80211_MGMT) {
-		/* Authentication, as the vendor sends it: the current frequency
-		 * and the supplicant's own wait as dwell time.
+		/* Authentication, as the vendor sends it: the current frequency,
+		 * no dwell time.
 		 */
-		put_unaligned_le32(mgmt_tx_auth_dwell_us >= 0 ?
-				   (u32)mgmt_tx_auth_dwell_us :
-				   params->wait * 1000, sig + sizeof(hdr) + 10);
+		if (mgmt_tx_auth_dwell_us > 0)
+			put_unaligned_le32(mgmt_tx_auth_dwell_us,
+					   sig + sizeof(hdr) + 10);
 	} else if (mgmt_tx_freq_mode ||
 		   (params->chan && freq != w->connect_freq)) {
 		put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 8);
@@ -6817,7 +6824,14 @@ static int wlbt_cfg_external_auth(struct wiphy *wiphy, struct net_device *ndev,
 				  struct cfg80211_external_auth_params *params)
 {
 	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
-	u8 sig[sizeof(struct wlbt_fapi_hdr) + 16] = { };
+	/*
+	 * The signal is fourteen bytes - interface, result code, the access
+	 * point's address and one spare word (fapi.h: mlme_synchronised_res) -
+	 * and the peer checks the size it is given.  This used to send sixteen,
+	 * which is what it was handed when the answer follows a completed SAE,
+	 * exactly where the peer stops answering.
+	 */
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14] = { };
 	struct wlbt_fapi_hdr hdr = { };
 
 	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
