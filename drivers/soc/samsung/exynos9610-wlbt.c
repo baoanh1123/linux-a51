@@ -36,6 +36,10 @@
 #include <linux/arm-smccc.h>
 #include <linux/unaligned.h>
 #include <linux/completion.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/nmi.h>
+#include <linux/timer.h>
 #include <linux/debugfs.h>
 #include <linux/rtnetlink.h>
 #include <linux/delay.h>
@@ -760,6 +764,20 @@ struct exynos_wlbt {
 	struct cfg80211_scan_request *scan_req;
 	struct delayed_work scan_work;
 	struct delayed_work connect_work;
+	/*
+	 * Diagnostics for a send that never comes back.  A management frame is
+	 * written straight into the peer's memory, so if the peer has stopped
+	 * reading its bus, the store never completes and the CPU that issued it
+	 * stays there with interrupts off: the machine stops without leaving a
+	 * single line behind.  A timer on another CPU notices the deadline and
+	 * prints every CPU's stack into the persistent console before panicking,
+	 * so the next reset explains itself.
+	 */
+	struct timer_list stall_timer;
+	struct work_struct stall_report;
+	unsigned long stall_deadline;
+	/* Which store inside the send was in flight when the deadline passed. */
+	unsigned int stall_phase;
 	struct work_struct peer_work;	/* answers the connect indications */
 	unsigned long scan_done;	/* when the last scan finished */
 	bool port_authorized;	/* the peer has a pairwise key, so data may flow */
@@ -2434,6 +2452,116 @@ static void wlbt_hip4_read_limits(struct exynos_wlbt *w)
 		 w->tx_headroom, w->tx_tailroom);
 }
 
+static unsigned int stall_watchdog;
+module_param(stall_watchdog, uint, 0644);
+MODULE_PARM_DESC(stall_watchdog, "Panic with every CPU's stack if a management send does not come back within a few seconds (0 off)");
+
+static const char * const wlbt_stall_phases[] = {
+	"nothing",
+	"taking a segment from the pool",
+	"writing the segment descriptor",
+	"clearing the signal area",
+	"writing the signal",
+	"writing the frame",
+	"handing the segment to the peer",
+	"storing to the tx log",
+};
+
+/*
+ * Breadcrumbs.  When the peer stops taking writes, the machine stops with no
+ * console to show for it: the journal never flushes, there is no persistent
+ * console region, and the supplicant's own log dies in its buffer.  These write
+ * one line to a file on the root file system (NFS here) and sync it before
+ * going on, so whatever happened last is still readable after the reset.  Only
+ * call this from process context - the drain must never touch it.
+ */
+static char *trace_file;
+module_param(trace_file, charp, 0644);
+MODULE_PARM_DESC(trace_file, "File to append a synced line to at each step of a join (empty off)");
+
+static void wlbt_trace(struct exynos_wlbt *w, const char *fmt, ...)
+{
+	struct va_format vaf;
+	struct file *f;
+	char buf[192];
+	va_list args;
+	int n;
+
+	if (!trace_file || !*trace_file)
+		return;
+	va_start(args, fmt);
+	vaf.fmt = fmt;
+	vaf.va = &args;
+	n = scnprintf(buf, sizeof(buf), "%u %pV\n", jiffies_to_msecs(jiffies), &vaf);
+	va_end(args);
+
+	f = filp_open(trace_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	if (IS_ERR(f))
+		return;
+	kernel_write(f, buf, n, &f->f_pos);
+	vfs_fsync(f, 0);
+	filp_close(f, NULL);
+}
+
+static char *stall_path = "/root/wlbt-stall.log";
+module_param(stall_path, charp, 0644);
+MODULE_PARM_DESC(stall_path, "File the stall watchdog leaves its finding in before panicking");
+
+/*
+ * Runs in process context, so unlike the timer it can write the finding where it
+ * will survive the reset: the root file system here is NFS, and a panic leaves
+ * nothing in the journal because journald never gets to flush.
+ */
+static void wlbt_stall_report(struct work_struct *work)
+{
+	struct exynos_wlbt *w = container_of(work, struct exynos_wlbt, stall_report);
+	unsigned int phase = READ_ONCE(w->stall_phase);
+	char buf[200];
+	int n;
+
+	n = scnprintf(buf, sizeof(buf),
+		      "stall: %s (phase %u), peer %s, state %s, tx %u rx %u, watchdog %u\n",
+		      phase < ARRAY_SIZE(wlbt_stall_phases) ?
+		      wlbt_stall_phases[phase] : "unknown", phase,
+		      w->peer_dead ? "stopped" : "running",
+		      wlbt_state_name(w->state), w->n_hip4_tx, w->n_hip4_rx,
+		      w->n_wdog);
+	if (stall_path && *stall_path) {
+		struct file *f = filp_open(stall_path,
+					   O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+		if (!IS_ERR(f)) {
+			kernel_write(f, buf, n, &f->f_pos);
+			vfs_fsync(f, 0);
+			filp_close(f, NULL);
+		} else {
+			pr_emerg("wlbt: cannot open %s: %ld\n", stall_path,
+				 PTR_ERR(f));
+		}
+	}
+	pr_emerg("wlbt: %s", buf);
+	panic("wlbt: the peer stopped taking writes");
+}
+
+static void wlbt_stall_check(struct timer_list *t)
+{
+	struct exynos_wlbt *w = container_of(t, struct exynos_wlbt, stall_timer);
+	unsigned long deadline;
+
+	deadline = READ_ONCE(w->stall_deadline);
+	if (deadline && time_after(jiffies, deadline)) {
+		unsigned int phase = READ_ONCE(w->stall_phase);
+
+		WRITE_ONCE(w->stall_deadline, 0);
+		pr_emerg("wlbt: the send never came back, it was %s\n",
+			 phase < ARRAY_SIZE(wlbt_stall_phases) ?
+			 wlbt_stall_phases[phase] : "somewhere unexpected");
+		schedule_work(&w->stall_report);
+		return;
+	}
+	mod_timer(&w->stall_timer, jiffies + msecs_to_jiffies(500));
+}
+
 static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 			  size_t sig_len, const void *data, size_t data_len)
 {
@@ -2450,6 +2578,7 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 
 	/* The pools are shared with the drain that runs in interrupt context. */
 	spin_lock_irqsave(&w->hip4_lock, flags);
+	WRITE_ONCE(w->stall_phase, 1);
 	ret = wlbt_hip4_slot_get(w, ctrl, &ref);
 	if (ret) {
 		spin_unlock_irqrestore(&w->hip4_lock, flags);
@@ -2498,11 +2627,16 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	mb.head = cpu_to_le16(head);
 
 	m = w->dram + ref;
+	WRITE_ONCE(w->stall_phase, 2);
 	memcpy_toio(m, &mb, sizeof(mb));
+	WRITE_ONCE(w->stall_phase, 3);
 	memset_io(m + HIP4_MBULK_SIZE, 0, HIP4_SIG_RESERVED);
+	WRITE_ONCE(w->stall_phase, 4);
 	memcpy_toio(m + HIP4_MBULK_SIZE + HIP4_SIG_RESERVED, sig, sig_len);
-	if (data_len)
+	if (data_len) {
+		WRITE_ONCE(w->stall_phase, 5);
 		memcpy_toio(m + HIP4_MBULK_SIZE + head, data, data_len);
+	}
 	if (sig_self_ref) {
 		/*
 		 * The peer validates this word against the transmit and receive
@@ -2521,6 +2655,7 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	/* The whole segment has to be in DRAM before the peer sees the ref. */
 	wmb();
 
+	WRITE_ONCE(w->stall_phase, 6);
 	wlbt_hip4_push(w, ctrl ? HIP4_Q_FH_CTL : HIP4_Q_FH_DAT, ref);
 	w->n_hip4_tx++;
 	if (ctrl && tx_log && w->tx) {
@@ -2537,6 +2672,7 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 		if (w->tx_used < WLBT_TX_SLOTS)
 			w->tx_used++;
 	}
+	WRITE_ONCE(w->stall_phase, 0);
 	spin_unlock_irqrestore(&w->hip4_lock, flags);
 
 	return 0;
@@ -6195,6 +6331,8 @@ static void wlbt_peer_work(struct work_struct *work)
 	 * precedes the indication only says the request was accepted, so
 	 * answering that is both too early and unnecessary.
 	 */
+	wlbt_trace(w, "peer_work: connect_ind %d connected_ind %d disc %d status 0x%04x",
+		   cind, cted, disc, status);
 	if (cind && !w->connect_res_sent) {
 		/*
 		 * Before the join the peer has no record to attach a key to, so
@@ -6425,6 +6563,8 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 				  sizeof(placeholder), NULL, 0);
 	}
 
+	wlbt_trace(w, "connect: request for \"%.*s\" auth %u",
+		   (int)sme->ssid_len, sme->ssid, sme->auth_type);
 	ret = wlbt_mlme_connect(w, sme, bssid, freq);
 	if (ret)
 		return ret;
@@ -6805,7 +6945,14 @@ static int wlbt_cfg_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 	*cookie = w->mgmt_cookie++;
 	dev_info(w->dev, "mgmt_tx: %zu bytes type 0x%02x freq %u\n",
 		 params->len, params->len ? params->buf[0] : 0, freq);
+	if (stall_watchdog)
+		WRITE_ONCE(w->stall_deadline, jiffies + msecs_to_jiffies(4000));
+	wlbt_trace(w, "mgmt_tx: %zu bytes type 0x%02x before the send",
+		   params->len, params->len ? params->buf[0] : 0);
 	ret = wlbt_hip4_send(w, true, sig, sizeof(sig), params->buf, params->len);
+	wlbt_trace(w, "mgmt_tx: send returned %d", ret);
+	if (stall_watchdog)
+		WRITE_ONCE(w->stall_deadline, 0);
 	if (ret)
 		return ret;
 
@@ -6846,6 +6993,7 @@ static int wlbt_cfg_external_auth(struct wiphy *wiphy, struct net_device *ndev,
 		 params->status, params->bssid);
 	wlbt_unsync_vif_down(w);
 
+	wlbt_trace(w, "external_auth: finished status %u", params->status);
 	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
 }
 
@@ -7117,6 +7265,10 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	w->netdev = ndev;
 	INIT_DELAYED_WORK(&w->scan_work, wlbt_scan_work);
 	INIT_DELAYED_WORK(&w->connect_work, wlbt_connect_work);
+	timer_setup(&w->stall_timer, wlbt_stall_check, 0);
+	INIT_WORK(&w->stall_report, wlbt_stall_report);
+	if (stall_watchdog)
+		mod_timer(&w->stall_timer, jiffies + msecs_to_jiffies(500));
 	INIT_WORK(&w->peer_work, wlbt_peer_work);
 	INIT_WORK(&w->peer_gone_work, wlbt_peer_gone_work);
 	INIT_WORK(&w->sae_work, wlbt_sae_work);
