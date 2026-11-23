@@ -800,6 +800,18 @@ struct exynos_wlbt {
 	 */
 	u32 sae_dbg[8];
 	unsigned int n_sae_ind;
+	unsigned int n_mgmt_rx;
+	/* The peer logs what its own state machine does, and those events say why
+	 * a join was abandoned.  Kept as ids: this is the drain path.
+	 */
+	struct {
+		u16 event;
+		u16 vif;
+	} fw_events[32];
+	unsigned int n_fw_event;
+	bool unsync_vif;		/* the pre-association interface is up */
+	bool station_channel_set;	/* the station interface was put on a channel */
+	u16 unsync_index;		/* the interface the pre-association frames use */
 	unsigned int sae_chain;
 	bool vif_created;		/* MLME_ADD_VIF was accepted */
 	bool connect_reported;		/* the peer answered the join */
@@ -1023,7 +1035,7 @@ MODULE_PARM_DESC(wlan_start_on_boot, "Start the peer's WLAN service once the fir
 #define FAPI_MLME_SEND_FRAME_REQ	0x2010
 #define FAPI_MESSAGETYPE_EAPOL_KEY_M123	0x0002
 #define FAPI_MESSAGETYPE_EAPOL_KEY_M4	0x0003
-#define FAPI_MESSAGETYPE_IEEE80211_MGMT	0x0011
+#define FAPI_MESSAGETYPE_IEEE80211_ACTION	0x0010
 #define FAPI_DATAUNIT_IEEE802_3_FRAME	0x0001
 #define FAPI_DATAUNIT_IEEE802_11_FRAME	0x0000
 
@@ -1041,10 +1053,37 @@ MODULE_PARM_DESC(wlan_start_on_boot, "Start the peer's WLAN service once the fir
  * cfg80211_ops.c sets NL80211_FEATURE_SAE, rx.c turns MLME_SYNCHRONISED_IND into
  * an external auth request, and mlme.c answers it with MLME_SYNCHRONISED_RES.
  */
+#define FAPI_MLME_SET_CHANNEL_REQ	0x200a
+#define FAPI_MLME_REGISTER_ACTION_FRAME_REQ 0x200f
+#define FAPI_VIFTYPE_UNSYNCHRONISED	0x0000
+/*
+ * The vendor keeps a second interface for the frames a station has to send
+ * before it is on a network: SAE authentication frames.  It creates one with
+ * FAPI_VIFTYPE_UNSYNCHRONISED, registers the action frame categories it wants
+ * and puts it on the channel (mgt.c: slsi_wlan_unsync_vif_activate).  The index
+ * is this driver's own - the vendor reuses the station's because in its flow
+ * that one does not exist yet, while here it is already carrying the join.
+ */
+#define WLBT_UNSYNC_VIF			2
+#define FAPI_ACTION_FRAME_PUBLIC	BIT(4)
+#define FAPI_ACTION_FRAME_RADIO_MEAS	BIT(5)
+
 #define FAPI_MLME_SYNCHRONISED_RES	0x2205
 #define FAPI_MLME_SYNCHRONISED_IND	0x231b
 #define FAPI_AUTHENTICATIONTYPE_SAE	0x0003
 #define FAPI_MLME_SYNCHRONISED_SIG	14	/* vif, rssi, two words of spare */
+
+static unsigned int mgmt_tx_freq_mode;
+module_param(mgmt_tx_freq_mode, uint, 0644);
+MODULE_PARM_DESC(mgmt_tx_freq_mode, "Management frame transmits: 0 leaves the frequency zero (send on the channel the interface is on), 1 always names the channel, 2 names it and asks for the dwell time");
+
+static unsigned int mgmt_tx_dwell_ms = 100;
+module_param(mgmt_tx_dwell_ms, uint, 0644);
+MODULE_PARM_DESC(mgmt_tx_dwell_ms, "Dwell time asked for when mgmt_tx_freq_mode names the channel");
+
+static unsigned int mgmt_tx_vif = 3;
+module_param(mgmt_tx_vif, uint, 0644);
+MODULE_PARM_DESC(mgmt_tx_vif, "Which interface management frames leave by before the station is on a network: 2 a second, unsynchronised interface, 3 the station's own index turned unsynchronised the way the vendor does it, 1 the station interface as it is");
 
 static bool sae_support;
 module_param(sae_support, bool, 0644);
@@ -1967,6 +2006,8 @@ static void wlbt_hip4_slot_put(struct exynos_wlbt *w, u32 ref)
  * side, so a segment that is not plainly inside those buffers is never queued.
  */
 static bool wlbt_hip4_ref_valid(struct exynos_wlbt *w, u32 ref);
+static void wlbt_scan_report_one(struct exynos_wlbt *w, const u8 *frame,
+				 size_t len, u16 freq);
 
 /*
  * Take a frame out of the mbulk at ref, if it holds one.  Returns the length
@@ -1993,15 +2034,14 @@ static size_t wlbt_mbulk_frame(struct exynos_wlbt *w, u32 ref, u8 *dst,
 }
 
 /*
- * MLME_SYNCHRONISED_IND is an authentication frame the peer exchanged for a
- * WPA3 join, and it is meant for the supplicant, not for the data path.  Where
- * it puts the frame is not announced: it can be in the segment itself, in a
- * chained one (the way MLME_RECEIVED_FRAME_IND hands over its frame), or behind
- * the pointer the indication carries.  Try all three and note which answered,
- * because this runs in the drain and cannot ask later.
+ * Where the peer keeps the frame an indication refers to is not announced.  It
+ * can be in the segment itself, in a chained one (the way
+ * MLME_RECEIVED_FRAME_IND hands its frames over), or behind the pointer the
+ * indication carries.  Try all three and record which answered: this runs in
+ * the drain, where nothing can be printed.
  */
-static void wlbt_sae_ind(struct exynos_wlbt *w, u32 ref, const struct wlbt_mbulk *mb,
-			 const u8 *body)
+static size_t wlbt_take_frame(struct exynos_wlbt *w, u32 ref,
+			      const struct wlbt_mbulk *mb, const u8 *body)
 {
 	u16 len = le16_to_cpu(mb->len), head = le16_to_cpu(mb->head);
 	size_t got = 0;
@@ -2011,14 +2051,10 @@ static void wlbt_sae_ind(struct exynos_wlbt *w, u32 ref, const struct wlbt_mbulk
 	w->sae_dbg[2] = le16_to_cpu(mb->dat_bufsz);
 	w->sae_dbg[3] = len;
 	w->sae_dbg[4] = head;
-	w->sae_dbg[5] = w->n_sae_ind++;
 
 	if (len >= 24 && len <= HIP4_SLOT_SIZE - HIP4_MBULK_SIZE - head)
 		got = wlbt_mbulk_frame(w, ref, w->sae_frame, sizeof(w->sae_frame));
 
-	/* A chained segment says where the frame is, and the frame is a segment
-	 * of its own rather than a continuation.
-	 */
 	if (!got && (mb->flag & MBULK_F_CHAIN)) {
 		u32 next = le32_to_cpu(mb->chain_next_offset);
 		unsigned int n = 0;
@@ -2040,9 +2076,6 @@ static void wlbt_sae_ind(struct exynos_wlbt *w, u32 ref, const struct wlbt_mbulk
 		w->sae_chain = n;
 	}
 
-	/* The indicator carried a reference of its own; the vendor's struct
-	 * calls it spare, the peer may be using it.
-	 */
 	if (!got) {
 		u32 ptr = get_unaligned_le32(body + 10);
 
@@ -2054,6 +2087,23 @@ static void wlbt_sae_ind(struct exynos_wlbt *w, u32 ref, const struct wlbt_mbulk
 		}
 	}
 
+	return got;
+}
+
+/*
+ * MLME_SYNCHRONISED_IND (0x231b) is how a WPA3 join starts: the peer hands up
+ * the access point it is about to authenticate against, and the supplicant has
+ * to be asked to run SAE.  The payload is a beacon or probe response - the
+ * vendor's own handler overwrites its u.beacon.timestamp before feeding it to
+ * cfg80211 - so it goes into the BSS table rather than to the data path.
+ */
+static void wlbt_sae_ind(struct exynos_wlbt *w, u32 ref, const struct wlbt_mbulk *mb,
+			 const u8 *body)
+{
+	size_t got;
+
+	w->n_sae_ind++;
+	got = wlbt_take_frame(w, ref, mb, body);
 	if (!got)
 		return;
 
@@ -2930,6 +2980,33 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			 * frame it received but did not fill into the
 			 * indication itself.
 			 */
+			/*
+			 * A received frame is either user data (an 802.3 frame) or
+			 * a management frame the peer took off the air.  The second
+			 * kind matters during a WPA3 join: the access point's half
+			 * of the SAE exchange arrives this way and belongs to the
+			 * supplicant, not to the networking stack.
+			 */
+			if (le16_to_cpu(hdr.id) == 0x230d &&
+			    le16_to_cpu(mb.len) == 0 &&
+			    len >= sizeof(hdr) + 6) {
+				u16 desc = get_unaligned_le16(body + 2);
+
+				if (desc == FAPI_DATAUNIT_IEEE802_11_FRAME) {
+					size_t got = wlbt_take_frame(w, ref, &mb, body);
+
+					w->n_mgmt_rx++;
+					if (got >= 24 &&
+					    ((w->sae_frame[0] >> 4) & 0xf) ==
+					    (IEEE80211_STYPE_AUTH >> 4)) {
+						w->sae_frame_len = got;
+						w->sae_signal = 0;
+						schedule_work(&w->sae_work);
+						continue;
+					}
+				}
+			}
+
 			if (le16_to_cpu(hdr.id) == 0x230d &&
 			    (mb.flag & MBULK_F_CHAIN))
 				wlbt_rx_chain(w, ref);
@@ -3553,13 +3630,30 @@ static void wlbt_sae_work(struct work_struct *work)
 	struct exynos_wlbt *w = container_of(work, struct exynos_wlbt, sae_work);
 	struct cfg80211_external_auth_params auth = { };
 	const u8 *frame = w->sae_frame;
-	bool delivered;
+	size_t len = w->sae_frame_len;
+	u8 stype;
+	bool delivered = false;
 
-	if (!w->netdev || !w->sae_frame_len)
+	if (!w->netdev || !len || len < 24)
 		return;
 
-	delivered = cfg80211_rx_mgmt(w->netdev->ieee80211_ptr, w->connect_freq,
-				     w->sae_signal, frame, w->sae_frame_len, 0);
+	stype = (frame[0] >> 4) & 0xf;
+
+	if (stype == (IEEE80211_STYPE_AUTH >> 4)) {
+		/* The access point's half of the exchange: the supplicant
+		 * registered for these and answers through the management
+		 * transmit.
+		 */
+		delivered = cfg80211_rx_mgmt(w->netdev->ieee80211_ptr,
+					     w->connect_freq, w->sae_signal,
+					     frame, len, 0);
+	} else {
+		/* A beacon or probe response: the vendor feeds these into the BSS
+		 * table as well, so the supplicant has an access point to run the
+		 * exchange against even though this scan never returned it.
+		 */
+		wlbt_scan_report_one(w, frame, len, w->connect_freq);
+	}
 
 	auth.action = NL80211_EXTERNAL_AUTH_START;
 	memcpy(auth.bssid, frame + 10, ETH_ALEN);	/* addr2: the access point */
@@ -3568,11 +3662,10 @@ static void wlbt_sae_work(struct work_struct *work)
 	auth.key_mgmt_suite = WLAN_AKM_SUITE_SAE;
 
 	dev_info(w->dev,
-		 "sae: frame %zu bytes from %pM type 0x%02x alg %u trans %u (%s)\n",
-		 w->sae_frame_len, auth.bssid, frame[0],
-		 w->sae_frame_len >= 26 ? get_unaligned_le16(frame + 24) : 0,
-		 w->sae_frame_len >= 28 ? get_unaligned_le16(frame + 26) : 0,
-		 delivered ? "delivered" : "no listener");
+		 "sae: frame %zu bytes from %pM type 0x%02x stype %u (%s)\n",
+		 len, auth.bssid, frame[0], stype,
+		 stype == (IEEE80211_STYPE_AUTH >> 4) ?
+		 (delivered ? "delivered" : "no listener") : "bss informed");
 
 	if (cfg80211_external_auth_request(w->netdev, &auth, GFP_KERNEL))
 		dev_info(w->dev, "sae: the supplicant did not ask for the frame\n");
@@ -3610,6 +3703,7 @@ static void wlbt_peer_gone_work(struct work_struct *work)
 	w->connect_res_sent = false;
 	w->vif_created = false;
 	w->port_authorized = false;
+	w->unsync_vif = false;
 	w->peer_dead = true;
 	if (w->netdev)
 		netif_carrier_off(w->netdev);
@@ -4675,6 +4769,21 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 		   wlbt_state_name(w->state), &w->mem_base, w->n_cfg_req,
 		   w->n_cfg_bad, w->n_wdog, w->n_mbox);
 	seq_printf(s, "peer state: %s\n", w->peer_dead ? "stopped" : "running");
+	if (w->n_fw_event) {
+		unsigned int i, n = min_t(unsigned int, w->n_fw_event, 32);
+
+		seq_printf(s, "firmware events (%u):", w->n_fw_event);
+		for (i = 0; i < n; i++) {
+			unsigned int k = (w->n_fw_event - n + i) & 31;
+
+			seq_printf(s, " %u/%u", w->fw_events[k].vif,
+				   w->fw_events[k].event);
+		}
+		seq_putc(s, '\n');
+	}
+	if (w->n_mgmt_rx)
+		seq_printf(s, "mgmt: %u management frame(s) received\n",
+			   w->n_mgmt_rx);
 	if (w->n_sae_ind)
 		seq_printf(s, "sae: %u indication(s), last flag 0x%02x sig %u dat %u len %u head %u chain-ref 0x%x own-ref 0x%x chain %u\n",
 			   w->n_sae_ind, w->sae_dbg[0], w->sae_dbg[1],
@@ -5547,7 +5656,7 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
  * opens; all three are sent here on the first join instead, because the peer has
  * to be running before any of them makes sense.
  */
-static int wlbt_mlme_add_vif(struct exynos_wlbt *w)
+static int wlbt_mlme_add_vif_at(struct exynos_wlbt *w, u16 vif, u16 type)
 {
 	static const u8 mac[6] = { 0x8c, 0x77, 0x12, 0xaa, 0xbb, 0xcc };
 	/*
@@ -5566,9 +5675,9 @@ static int wlbt_mlme_add_vif(struct exynos_wlbt *w)
 	 * peer accepted when the vif was created by hand.
 	 */
 	memset(sig, 0, sizeof(sig));
-	put_unaligned_le16(1, sig + sizeof(hdr) + 0);	/* vif */
+	put_unaligned_le16(vif, sig + sizeof(hdr) + 0);
 	memcpy(sig + sizeof(hdr) + 2, mac, sizeof(mac));
-	put_unaligned_le16(2, sig + sizeof(hdr) + 8);	/* FAPI_VIFTYPE_STATION */
+	put_unaligned_le16(type, sig + sizeof(hdr) + 8);
 	memcpy(sig + sizeof(hdr) + 10, partner, sizeof(partner));
 
 	hdr.id = cpu_to_le16(FAPI_MLME_ADD_VIF_REQ);
@@ -5576,6 +5685,124 @@ static int wlbt_mlme_add_vif(struct exynos_wlbt *w)
 	memcpy(sig, &hdr, sizeof(hdr));
 
 	return wlbt_hip4_send(w, true, sig, sizeof(hdr) + 28, NULL, 0);
+}
+
+static int wlbt_mlme_add_vif(struct exynos_wlbt *w)
+{
+	/* FAPI_VIFTYPE_STATION */
+	return wlbt_mlme_add_vif_at(w, 1, 2);
+}
+
+static int wlbt_mlme_set_channel(struct exynos_wlbt *w, u16 vif, u16 freq)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 22] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	put_unaligned_le16(vif, sig + sizeof(hdr) + 0);
+	/* availability_duration, availability_interval and count stay zero: the
+	 * vendor asks for an unspecified duration on this path.
+	 */
+	put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 8);
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SET_CHANNEL_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+}
+
+static int wlbt_mlme_register_action_frame(struct exynos_wlbt *w, u16 vif,
+					    u32 bitmap)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 22] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	put_unaligned_le16(vif, sig + sizeof(hdr) + 0);
+	put_unaligned_le32(bitmap, sig + sizeof(hdr) + 2);
+	put_unaligned_le32(bitmap, sig + sizeof(hdr) + 6);
+
+	hdr.id = cpu_to_le16(FAPI_MLME_REGISTER_ACTION_FRAME_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+}
+
+static int wlbt_mlme_del_vif_at(struct exynos_wlbt *w, u16 vif)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	put_unaligned_le16(vif, sig + sizeof(hdr) + 0);
+
+	hdr.id = cpu_to_le16(FAPI_MLME_DEL_VIF_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+}
+
+static int wlbt_mlme_del_vif(struct exynos_wlbt *w);
+
+/*
+ * The interface a management frame leaves by.  Before the station is on a
+ * network the peer will not transmit from its own vif, so the vendor's answer is
+ * a second interface of the unsynchronised kind, put on the channel the exchange
+ * happens on.  It is created on the first frame and torn down when the join
+ * finishes, because the peer associates on the station interface.
+ */
+static int wlbt_unsync_vif_up(struct exynos_wlbt *w, u16 freq)
+{
+	u16 vif = mgmt_tx_vif == 2 ? WLBT_UNSYNC_VIF : 1;
+	int ret;
+
+	if (w->unsync_vif)
+		return 0;
+
+	/*
+	 * The vendor does not use a second index: it turns the station's own
+	 * interface into an unsynchronised one (mgt.c: it sets vif_type before
+	 * adding the interface, and the index it adds is the netdev's).  Keep
+	 * that as an option, because which index the peer forwards received
+	 * authentication frames on is the question this answers.
+	 */
+	if (vif == 1 && w->vif_created) {
+		wlbt_mlme_del_vif(w);
+		w->vif_created = false;
+		msleep(60);
+	}
+
+	w->unsync_index = vif;
+	ret = wlbt_mlme_add_vif_at(w, vif, FAPI_VIFTYPE_UNSYNCHRONISED);
+	if (ret)
+		return ret;
+	msleep(60);
+
+	ret = wlbt_mlme_register_action_frame(w, vif,
+					      FAPI_ACTION_FRAME_PUBLIC |
+					      FAPI_ACTION_FRAME_RADIO_MEAS);
+	if (ret)
+		return ret;
+	msleep(30);
+
+	ret = wlbt_mlme_set_channel(w, vif, freq);
+	if (ret)
+		return ret;
+	msleep(30);
+
+	w->unsync_vif = true;
+	dev_info(w->dev, "sae: unsynchronised interface %u on %u MHz\n", vif, freq);
+	return 0;
+}
+
+static void wlbt_unsync_vif_down(struct exynos_wlbt *w)
+{
+	if (!w->unsync_vif)
+		return;
+
+	wlbt_mlme_del_vif_at(w, w->unsync_index);
+	w->unsync_vif = false;
+	dev_info(w->dev, "sae: unsynchronised interface released\n");
 }
 
 static int wlbt_mlme_host_state(struct exynos_wlbt *w, u16 state)
@@ -5748,6 +5975,11 @@ static int wlbt_mlme_set_packet_filter(struct exynos_wlbt *w)
 	put_unaligned_le16(1, sig + sizeof(hdr));	/* vif 1 */
 
 	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+}
+
+static int wlbt_mlme_del_vif(struct exynos_wlbt *w)
+{
+	return wlbt_mlme_del_vif_at(w, 1);
 }
 
 /* MLME_SET_ACL with no entries: the station accepts its peer and nothing else. */
@@ -6163,19 +6395,6 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
  * without that a second join in the same boot never gets a
  * MLME_CONNECT_IND back.
  */
-static int wlbt_mlme_del_vif(struct exynos_wlbt *w)
-{
-	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14] = { };
-	struct wlbt_fapi_hdr hdr = { };
-
-	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
-
-	hdr.id = cpu_to_le16(FAPI_MLME_DEL_VIF_REQ);
-	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
-	memcpy(sig, &hdr, sizeof(hdr));
-
-	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
-}
 
 static int wlbt_mlme_disconnect(struct exynos_wlbt *w, const u8 *bssid, u16 reason)
 {
@@ -6223,6 +6442,8 @@ static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	 * The peer keeps the interface's own state across a disconnect, so drop
 	 * it here and let the next join create it again.
 	 */
+	wlbt_unsync_vif_down(w);
+
 	if (w->vif_created) {
 		msleep(20);
 		wlbt_mlme_del_vif(w);
@@ -6477,14 +6698,47 @@ static int wlbt_cfg_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 	if (w->peer_dead)
 		return -EIO;
 
-	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
+	/*
+	 * Ask for the interface the vendor uses for frames sent before the
+	 * station is on a network; the peer refuses to transmit them from the
+	 * station interface and reports it as FAPI_RESULTCODE 0x0001.
+	 */
+	if (!w->connected) {
+		if (mgmt_tx_vif == 1) {
+			/* The station interface, told which channel to sit on: the
+			 * join request named a frequency but never moved it.
+			 */
+			if (!w->station_channel_set) {
+				wlbt_mlme_set_channel(w, 1, freq);
+				msleep(30);
+				w->station_channel_set = true;
+			}
+		} else {
+			wlbt_unsync_vif_up(w, freq);
+		}
+	}
+
+	put_unaligned_le16(w->unsync_vif ? w->unsync_index : 1,
+			   sig + sizeof(hdr) + 0);
 	put_unaligned_le16(w->host_tag++, sig + sizeof(hdr) + 2);
 	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_11_FRAME,
 			   sig + sizeof(hdr) + 4);
-	put_unaligned_le16(FAPI_MESSAGETYPE_IEEE80211_MGMT,
+	/*
+	 * The vendor sends every management frame with the action message type,
+	 * authentication included (cfg80211_ops.c: slsi_wlan_mgmt_tx), and names
+	 * the channel only when the frame has to go to a different one: for a
+	 * frame on the channel the interface is already on both the frequency and
+	 * the dwell time are left zero.
+	 */
+	put_unaligned_le16(FAPI_MESSAGETYPE_IEEE80211_ACTION,
 			   sig + sizeof(hdr) + 6);
-	put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 8);
-	/* The dwell time and the period stay zero: the peer is already there. */
+	if (mgmt_tx_freq_mode ||
+	    (params->chan && freq != w->connect_freq)) {
+		put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 8);
+		if (mgmt_tx_freq_mode == 2)
+			put_unaligned_le32(mgmt_tx_dwell_ms * 1000,
+					   sig + sizeof(hdr) + 10);
+	}
 
 	hdr.id = cpu_to_le16(FAPI_MLME_SEND_FRAME_REQ);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
@@ -6525,6 +6779,7 @@ static int wlbt_cfg_external_auth(struct wiphy *wiphy, struct net_device *ndev,
 
 	dev_info(w->dev, "sae: supplicant finished with status %u for %pM\n",
 		 params->status, params->bssid);
+	wlbt_unsync_vif_down(w);
 
 	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
 }
