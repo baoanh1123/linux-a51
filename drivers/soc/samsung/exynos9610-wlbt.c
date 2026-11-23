@@ -5324,10 +5324,8 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
 	 * the scan - data included - waits with it.  Refuse instead of
 	 * reporting a scan that will not happen.
 	 */
-	if (w->connected || netif_carrier_ok(w->netdev)) {
-		dev_info_ratelimited(w->dev,
-				     "scan refused: connected %d carrier %d\n",
-				     w->connected, netif_carrier_ok(w->netdev));
+	if (w->connected) {
+		dev_info_ratelimited(w->dev, "scan refused: connected\n");
 		return -EBUSY;
 	}
 
