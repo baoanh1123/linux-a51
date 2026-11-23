@@ -979,6 +979,24 @@ static bool load_firmware;
 module_param(load_firmware, bool, 0644);
 MODULE_PARM_DESC(load_firmware, "Copy the firmware image into MIF DRAM and let the peer run it");
 
+/*
+ * EAPOL does not travel on the data queue.  The vendor driver hands key
+ * frames to the MLME instead (tx.c: slsi_tx_eapol() ends in
+ * slsi_mlme_send_frame_data()), and the message type tells the peer which of
+ * them finishes a handshake - M4 - and which of them starts one.  The peer runs
+ * the 4-way state machine itself and only settles a link whose M4 arrived this
+ * way, which is why the pairwise key never landed while these frames went out
+ * as ordinary data.
+ */
+#define FAPI_MLME_SEND_FRAME_REQ	0x2010
+#define FAPI_MESSAGETYPE_EAPOL_KEY_M123	0x0002
+#define FAPI_MESSAGETYPE_EAPOL_KEY_M4	0x0003
+#define FAPI_DATAUNIT_IEEE802_3_FRAME	0x0001
+
+static bool eapol_mlme = true;
+module_param(eapol_mlme, bool, 0644);
+MODULE_PARM_DESC(eapol_mlme, "Send EAPOL key frames through MLME_SEND_FRAME_REQ like the vendor driver");
+
 static bool hip4_return = true;
 module_param(hip4_return, bool, 0644);
 MODULE_PARM_DESC(hip4_return, "Hand received HIP4 segments back to the peer");
@@ -2101,7 +2119,14 @@ static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 	 */
 	head = sig_bufsz;
 	dat_bufsz = data_len;
-	if (!ctrl && data_len) {
+	/*
+	 * A signal whose payload the peer will put on the air - an EAPOL frame sent
+	 * through MLME_SEND_FRAME_REQ just as much as a data frame - needs room for
+	 * the header it builds in front of it and for whatever it appends behind
+	 * it.  The vendor's hip4_skb_to_mbulk() says the same thing without looking
+	 * at the queue: "if signal include payload, add headroom and tailroom".
+	 */
+	if (data_len) {
 		head = sig_bufsz + w->tx_headroom;
 		dat_bufsz = w->tx_headroom + data_len + w->tx_tailroom;
 	}
@@ -5880,6 +5905,52 @@ static int wlbt_net_stop(struct net_device *ndev)
 }
 
 /*
+ * Which message type an EAPOL key frame is, by the vendor's rule (tx.c): the
+ * frame that ends the handshake carries no ACK, is a pairwise frame and has the
+ * secure bit set - or, for a WPA1 key, the MIC bit and no key data.
+ */
+static u16 wlbt_eapol_message_type(const u8 *frame, size_t len)
+{
+	const u8 *eapol;
+
+	if (len < ETH_HLEN + 99)
+		return FAPI_MESSAGETYPE_EAPOL_KEY_M123;
+	eapol = frame + ETH_HLEN;
+	if (eapol[1] != 3)	/* 802.1X type: EAPOL-Key */
+		return FAPI_MESSAGETYPE_EAPOL_KEY_M123;
+	if (!(eapol[6] & 0x80) && (eapol[6] & 0x08) &&
+	    ((eapol[4] == 2 && (eapol[5] & 0x02)) ||
+	     (eapol[4] == 254 && (eapol[5] & 0x01) &&
+	      !eapol[97] && !eapol[98])))
+		return FAPI_MESSAGETYPE_EAPOL_KEY_M4;
+	return FAPI_MESSAGETYPE_EAPOL_KEY_M123;
+}
+
+/*
+ * One EAPOL frame, handed to the MLME: interface, a host tag, the descriptor
+ * saying the payload is an 802.3 frame, the message type, and a dwell time the
+ * vendor leaves at zero for key frames.
+ */
+static int wlbt_mlme_send_eapol(struct exynos_wlbt *w, const u8 *frame,
+				 size_t len)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 30] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
+	put_unaligned_le16(w->host_tag++, sig + sizeof(hdr) + 2);
+	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_3_FRAME, sig + sizeof(hdr) + 4);
+	put_unaligned_le16(wlbt_eapol_message_type(frame, len),
+			   sig + sizeof(hdr) + 6);
+
+	hdr.id = cpu_to_le16(FAPI_MLME_SEND_FRAME_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), frame, len);
+}
+
+/*
  * The peer takes ethernet frames and does the 802.11 conversion itself, so a
  * transmit is the frame handed over on the data queue with a MA_UNITDATA_REQ in
  * front of it.  The body names the interface, a tag the confirm echoes, the
@@ -5899,6 +5970,19 @@ static netdev_tx_t wlbt_net_xmit(struct sk_buff *skb, struct net_device *ndev)
 	}
 
 	w->n_tx_calls++;
+	if (eapol_mlme && skb->protocol == htons(ETH_P_PAE)) {
+		ret = wlbt_mlme_send_eapol(w, skb->data, skb->len);
+		if (ret) {
+			w->n_tx_dropped++;
+			dev_info_ratelimited(w->dev, "tx: eapol send failed: %d\n", ret);
+		} else {
+			ndev->stats.tx_packets++;
+			ndev->stats.tx_bytes += skb->len;
+		}
+		dev_kfree_skb(skb);
+		return NETDEV_TX_OK;
+	}
+
 	hdr.id = cpu_to_le16(FAPI_MA_UNITDATA_REQ);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
 	memcpy(sig, &hdr, sizeof(hdr));
