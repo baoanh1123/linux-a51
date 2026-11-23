@@ -2556,7 +2556,22 @@ static void wlbt_stall_check(struct timer_list *t)
 		pr_emerg("wlbt: the send never came back, it was %s\n",
 			 phase < ARRAY_SIZE(wlbt_stall_phases) ?
 			 wlbt_stall_phases[phase] : "somewhere unexpected");
-		schedule_work(&w->stall_report);
+		if (stall_watchdog) {
+			schedule_work(&w->stall_report);
+			return;
+		}
+		/*
+		 * Otherwise contain it: a management frame went out and nothing
+		 * came back, which is what the peer does just before it stops
+		 * reading its bus, and touching its memory again is what turns
+		 * that into a dead machine.  Give the link up here instead; every
+		 * path that would write to the peer then refuses.
+		 */
+		if (!w->peer_dead) {
+			w->peer_dead = true;
+			dev_err(w->dev,
+				"marking the peer dead: a management send went unanswered\n");
+		}
 		return;
 	}
 	mod_timer(&w->stall_timer, jiffies + msecs_to_jiffies(500));
@@ -6945,14 +6960,12 @@ static int wlbt_cfg_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 	*cookie = w->mgmt_cookie++;
 	dev_info(w->dev, "mgmt_tx: %zu bytes type 0x%02x freq %u\n",
 		 params->len, params->len ? params->buf[0] : 0, freq);
-	if (stall_watchdog)
-		WRITE_ONCE(w->stall_deadline, jiffies + msecs_to_jiffies(4000));
+	WRITE_ONCE(w->stall_deadline, jiffies + msecs_to_jiffies(4000));
 	wlbt_trace(w, "mgmt_tx: %zu bytes type 0x%02x before the send",
 		   params->len, params->len ? params->buf[0] : 0);
 	ret = wlbt_hip4_send(w, true, sig, sizeof(sig), params->buf, params->len);
 	wlbt_trace(w, "mgmt_tx: send returned %d", ret);
-	if (stall_watchdog)
-		WRITE_ONCE(w->stall_deadline, 0);
+	WRITE_ONCE(w->stall_deadline, 0);
 	if (ret)
 		return ret;
 
@@ -7267,8 +7280,7 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	INIT_DELAYED_WORK(&w->connect_work, wlbt_connect_work);
 	timer_setup(&w->stall_timer, wlbt_stall_check, 0);
 	INIT_WORK(&w->stall_report, wlbt_stall_report);
-	if (stall_watchdog)
-		mod_timer(&w->stall_timer, jiffies + msecs_to_jiffies(500));
+	mod_timer(&w->stall_timer, jiffies + msecs_to_jiffies(500));
 	INIT_WORK(&w->peer_work, wlbt_peer_work);
 	INIT_WORK(&w->peer_gone_work, wlbt_peer_gone_work);
 	INIT_WORK(&w->sae_work, wlbt_sae_work);
