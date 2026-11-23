@@ -1036,6 +1036,7 @@ MODULE_PARM_DESC(wlan_start_on_boot, "Start the peer's WLAN service once the fir
 #define FAPI_MESSAGETYPE_EAPOL_KEY_M123	0x0002
 #define FAPI_MESSAGETYPE_EAPOL_KEY_M4	0x0003
 #define FAPI_MESSAGETYPE_IEEE80211_ACTION	0x0010
+#define FAPI_MESSAGETYPE_IEEE80211_MGMT		0x0011
 #define FAPI_DATAUNIT_IEEE802_3_FRAME	0x0001
 #define FAPI_DATAUNIT_IEEE802_11_FRAME	0x0000
 
@@ -1086,6 +1087,23 @@ MODULE_PARM_DESC(wlan_start_on_boot, "Start the peer's WLAN service once the fir
 static unsigned int mgmt_tx_freq_mode;
 module_param(mgmt_tx_freq_mode, uint, 0644);
 MODULE_PARM_DESC(mgmt_tx_freq_mode, "Management frame transmits: 0 leaves the frequency zero (send on the channel the interface is on), 1 always names the channel, 2 names it and asks for the dwell time");
+
+/*
+ * The vendor sends authentication frames with the management message type
+ * (cfg80211_ops.c:slsi_wlan_mgmt_tx, "Transmit on the current frequency").  On
+ * this firmware a 0x0011 authentication frame from this driver is not
+ * transmitted and ends in a peer watchdog reset: twice out of two attempts, each
+ * after a clean boot with nothing else running.  So the action type stays the
+ * default and the vendor's type is kept behind a knob, because it is the right
+ * answer somewhere we have not found yet.
+ */
+static unsigned int mgmt_tx_auth_type = FAPI_MESSAGETYPE_IEEE80211_ACTION;
+module_param(mgmt_tx_auth_type, uint, 0644);
+MODULE_PARM_DESC(mgmt_tx_auth_type, "Message type authentication frames are sent with: 0x10 action (default, does not reach the air) or 0x11 management (what the vendor sends, but it resets the peer here)");
+
+static int mgmt_tx_auth_dwell_us = -1;
+module_param(mgmt_tx_auth_dwell_us, int, 0644);
+MODULE_PARM_DESC(mgmt_tx_auth_dwell_us, "Dwell time in microseconds for authentication frames; -1 uses the supplicant's wait time, as the vendor does");
 
 static unsigned int mgmt_tx_dwell_ms = 100;
 module_param(mgmt_tx_dwell_ms, uint, 0644);
@@ -6087,12 +6105,14 @@ static int wlbt_mlme_connect(struct exynos_wlbt *w,
 	memset(sig, 0, sizeof(sig));
 	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif 1 */
 	memcpy(sig + sizeof(hdr) + 2, bssid, ETH_ALEN);
-	/* The peer has a numbering of its own: what nl80211 calls
-	 * NL80211_AUTHTYPE_SAE it knows as FAPI_AUTHENTICATIONTYPE_SAE, and the
-	 * vendor driver translates the same way before filling this field.
+	/* A WPA3 join is not announced to the peer as SAE: the vendor rewrites
+	 * NL80211_AUTHTYPE_SAE to NL80211_AUTHTYPE_NETWORK_EAP (5) in this
+	 * field, which makes the peer hand authentication over to us and
+	 * forward the access point's frames.  Announcing SAE itself makes it
+	 * accept our commit and then drop it without a word.
 	 */
 	put_unaligned_le16(sme->auth_type == NL80211_AUTHTYPE_SAE ?
-			   FAPI_AUTHENTICATIONTYPE_SAE : sme->auth_type,
+			   NL80211_AUTHTYPE_NETWORK_EAP : sme->auth_type,
 			   sig + sizeof(hdr) + 8);
 	put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 10);
 
@@ -6723,6 +6743,7 @@ static int wlbt_cfg_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 	u8 sig[sizeof(struct wlbt_fapi_hdr) + 30] = { };
 	struct wlbt_fapi_hdr hdr = { };
 	u16 freq = params->chan ? params->chan->center_freq : w->connect_freq;
+	bool auth;
 	int ret;
 
 	if (w->peer_dead)
@@ -6734,16 +6755,7 @@ static int wlbt_cfg_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 	 * station interface and reports it as FAPI_RESULTCODE 0x0001.
 	 */
 	if (!w->connected) {
-		if (mgmt_tx_vif == 1) {
-			/* The station interface, told which channel to sit on: the
-			 * join request named a frequency but never moved it.
-			 */
-			if (!w->station_channel_set) {
-				wlbt_mlme_set_channel(w, 1, freq);
-				msleep(30);
-				w->station_channel_set = true;
-			}
-		} else {
+		if (mgmt_tx_vif != 1) {
 			wlbt_unsync_vif_up(w, freq);
 		}
 	}
@@ -6754,16 +6766,25 @@ static int wlbt_cfg_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 	put_unaligned_le16(FAPI_DATAUNIT_IEEE802_11_FRAME,
 			   sig + sizeof(hdr) + 4);
 	/*
-	 * The vendor sends every management frame with the action message type,
-	 * authentication included (cfg80211_ops.c: slsi_wlan_mgmt_tx), and names
-	 * the channel only when the frame has to go to a different one: for a
-	 * frame on the channel the interface is already on both the frequency and
-	 * the dwell time are left zero.
+	 * The message type depends on the frame: the vendor sends authentication
+	 * with the management type and everything else as an action frame
+	 * (cfg80211_ops.c:slsi_wlan_mgmt_tx, "Transmit on the current
+	 * frequency").  Sending authentication as an action frame is what made
+	 * the peer accept our SAE commit with result 0 and then drop it.
 	 */
-	put_unaligned_le16(FAPI_MESSAGETYPE_IEEE80211_ACTION,
+	auth = (params->buf[0] & 0x00fc) == 0x00b0;	/* management, auth */
+	put_unaligned_le16(auth ? mgmt_tx_auth_type :
+			   FAPI_MESSAGETYPE_IEEE80211_ACTION,
 			   sig + sizeof(hdr) + 6);
-	if (mgmt_tx_freq_mode ||
-	    (params->chan && freq != w->connect_freq)) {
+	if (auth && mgmt_tx_auth_type == FAPI_MESSAGETYPE_IEEE80211_MGMT) {
+		/* Authentication, as the vendor sends it: the current frequency
+		 * and the supplicant's own wait as dwell time.
+		 */
+		put_unaligned_le32(mgmt_tx_auth_dwell_us >= 0 ?
+				   (u32)mgmt_tx_auth_dwell_us :
+				   params->wait * 1000, sig + sizeof(hdr) + 10);
+	} else if (mgmt_tx_freq_mode ||
+		   (params->chan && freq != w->connect_freq)) {
 		put_unaligned_le16(freq * 2, sig + sizeof(hdr) + 8);
 		if (mgmt_tx_freq_mode == 2)
 			put_unaligned_le32(mgmt_tx_dwell_ms * 1000,
