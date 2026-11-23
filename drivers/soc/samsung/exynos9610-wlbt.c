@@ -446,6 +446,8 @@ struct wlbt_hip4_q {
 #define FAPI_PURPOSE_ASSOCIATION_REQUEST	0x0010
 #define FAPI_MLME_SET_IP_ADDRESS_REQ	0x2015
 #define FAPI_MLME_CONNECT_REQ		0x200b
+#define FAPI_MLME_DISCONNECT_REQ	0x200e
+#define FAPI_MLME_DEL_VIF_REQ		0x2008
 #define FAPI_MLME_CONNECT_RES		0x2200
 #define FAPI_MLME_CONNECTED_RES		0x2201
 #define FAPI_MLME_SET_ACL_REQ		0x2016
@@ -5719,6 +5721,13 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	u16 freq = 2437;
 	int ret;
 
+	/* cfg80211 can refuse a connect before this op is reached, and then the
+	 * only trace of it is the supplicant complaining that the driver failed
+	 * to associate: say whether the request arrived at all.
+	 */
+	dev_info(w->dev, "connect: request for \"%.*s\" (connected %d connecting %d)\n",
+		 (int)sme->ssid_len, sme->ssid, w->connected, w->connecting);
+
 	if (!w->hip4_control)
 		return -EIO;
 	if (w->connecting) {
@@ -5811,20 +5820,91 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 }
 
 /*
- * A disconnect the supplicant asked for needs no report back - cfg80211 issued
- * it and already knows.  All this has to do is forget the connection, or the
- * next scan is refused as if the station were still associated.
+ * Telling the peer to leave is MLME_DISCONNECT_REQ: the vif, the access point's
+ * address and the reason code, which is what the vendor sends from its
+ * disconnect path (mlme.c:slsi_mlme_disconnect, and the 0x200e seen in a
+ * capture when the vendor drops a link).
+ */
+/*
+ * The peer keeps per-vif state that a disconnect does not clear: the vendor
+ * deletes the interface and creates it again for the next join (mlme.c,
+ * slsi_mlme_add_vif calls slsi_mlme_del_vif when require_vif_delete is set), and
+ * without that a second join in the same boot never gets a
+ * MLME_CONNECT_IND back.
+ */
+static int wlbt_mlme_del_vif(struct exynos_wlbt *w)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
+
+	hdr.id = cpu_to_le16(FAPI_MLME_DEL_VIF_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+}
+
+static int wlbt_mlme_disconnect(struct exynos_wlbt *w, const u8 *bssid, u16 reason)
+{
+	u8 sig[sizeof(struct wlbt_fapi_hdr) + 22] = { };
+	struct wlbt_fapi_hdr hdr = { };
+
+	put_unaligned_le16(1, sig + sizeof(hdr) + 0);		/* vif */
+	memcpy(sig + sizeof(hdr) + 2, bssid, ETH_ALEN);
+	put_unaligned_le16(reason, sig + sizeof(hdr) + 8);
+
+	hdr.id = cpu_to_le16(FAPI_MLME_DISCONNECT_REQ);
+	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
+	memcpy(sig, &hdr, sizeof(hdr));
+
+	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
+}
+
+/*
+ * A disconnect has two sides.  The peer has to be told, or it keeps the link
+ * and the next join finds a station that is already associated; and cfg80211
+ * has to be told, because when the station was connected it keeps both the
+ * connection state and the SSID until the driver reports the disconnection
+ * (sme.c:cfg80211_disconnect only clears them when the station was not
+ * connected).  Without the report, every later connect is refused with
+ * -EALREADY before this driver is called at all, which the supplicant shows as
+ * "Association request to the driver failed" and which used to need a reboot.
  */
 static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 			       u16 reason_code)
 {
 	struct exynos_wlbt *w = wlbt_from_wiphy(wiphy);
+	bool was_connected = w->connected;
 
 	cancel_delayed_work_sync(&w->connect_work);
 	cancel_work_sync(&w->peer_work);
+
+	if (was_connected) {
+		wlbt_mlme_disconnect(w, w->connect_bssid,
+				     reason_code ? reason_code : 3);
+		dev_info(w->dev, "disconnect: left %pM, reason %u\n",
+			 w->connect_bssid, reason_code);
+	}
+
+	/*
+	 * The peer keeps the interface's own state across a disconnect, so drop
+	 * it here and let the next join create it again.
+	 */
+	if (w->vif_created) {
+		msleep(20);
+		wlbt_mlme_del_vif(w);
+		w->vif_created = false;
+	}
+
 	w->connecting = false;
 	w->connected = false;
 	netif_carrier_off(ndev);
+
+	if (was_connected)
+		cfg80211_disconnected(ndev, reason_code, NULL, 0, true,
+				      GFP_KERNEL);
 
 	return 0;
 }
