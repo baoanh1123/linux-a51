@@ -455,9 +455,6 @@ struct wlbt_hip4_q {
 /* The data the peer carries for a station is ethernet, not 802.11. */
 #define FAPI_DATAUNIT_IEEE802_3		0x0001
 #define FAPI_MLME_SET_CACHED_CHANNELS	0x201f
-
-/* Channels offered to the peer once a connection is up. */
-#define WLBT_CACHED_CHANNELS		11
 #define FAPI_MLME_ADD_VIF_REQ		0x2007
 #define FAPI_MLME_SET_PMK_REQ		0x201c
 #define FAPI_MLME_SET_HOST_STATE_REQ	0x2028
@@ -1959,23 +1956,86 @@ static void wlbt_hip4_state(struct exynos_wlbt *w)
 static int wlbt_hip4_send(struct exynos_wlbt *w, bool ctrl, const void *sig,
 			  size_t sig_len, const void *data, size_t data_len);
 
-static int wlbt_mlme_add_scan(struct exynos_wlbt *w, u16 scan_id)
+static struct ieee80211_channel wlbt_2ghz_channels[] = {
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2412, .hw_value = 1 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2417, .hw_value = 2 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2422, .hw_value = 3 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2427, .hw_value = 4 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2432, .hw_value = 5 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2437, .hw_value = 6 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2442, .hw_value = 7 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2447, .hw_value = 8 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2452, .hw_value = 9 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2457, .hw_value = 10 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2462, .hw_value = 11 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2467, .hw_value = 12 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2472, .hw_value = 13 },
+};
+
+
+/*
+ * The 5 GHz channels the vendor driver offers (cfg80211_ops.c,
+ * slsi_5ghz_channels): UNII 1 to UNII 3, with no DFS flag of our own because
+ * the peer decides what it may transmit on.  Channels sharing a primary channel
+ * with a radar-detection band are scanned passively below.
+ */
+static struct ieee80211_channel wlbt_5ghz_channels[] = {
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5180, .hw_value = 36 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5200, .hw_value = 40 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5220, .hw_value = 44 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5240, .hw_value = 48 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5260, .hw_value = 52 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5280, .hw_value = 56 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5300, .hw_value = 60 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5320, .hw_value = 64 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5500, .hw_value = 100 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5520, .hw_value = 104 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5540, .hw_value = 108 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5560, .hw_value = 112 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5580, .hw_value = 116 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5600, .hw_value = 120 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5620, .hw_value = 124 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5640, .hw_value = 128 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5660, .hw_value = 132 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5680, .hw_value = 136 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5700, .hw_value = 140 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5720, .hw_value = 144 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5745, .hw_value = 149 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5765, .hw_value = 153 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5785, .hw_value = 157 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5805, .hw_value = 161 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5825, .hw_value = 165 },
+};
+
+
+/*
+ * A channel the peer may only listen on: the radar detection bands, which
+ * regulation forbids probing from.  The scan descriptor's policy byte says so
+ * per channel, so one list can cover both kinds.
+ */
+static bool wlbt_channel_passive(u16 freq)
+{
+	return freq >= 5260 && freq <= 5720;
+}
+
+static int wlbt_mlme_add_scan(struct exynos_wlbt *w, u16 scan_id,
+			      struct cfg80211_scan_request *req)
 {
 	static const u8 scan_mac[6] = { 0x8c, 0x77, 0x12, 0xaa, 0xbb, 0xcc };
-	static const u16 channels[] = { 2412, 2437, 2462 };
 	u8 sig[sizeof(struct wlbt_fapi_hdr) + 26];
-	u8 dat[2 + 19 + 7 + 3 * ARRAY_SIZE(channels)];
+	u8 dat[2 + 19 + 7 + 3 * (ARRAY_SIZE(wlbt_2ghz_channels) +
+				 ARRAY_SIZE(wlbt_5ghz_channels))];
 	struct wlbt_fapi_hdr hdr = { };
-	unsigned int i, n = 0;
+	unsigned int i, n = 0, n_chan = 0;
 	u8 *c;
 
 	/* Body: interface 0 for a scan, because a scan is not tied to a vif. */
+	memset(sig, 0, sizeof(sig));
 	put_unaligned_le16(0, sig + sizeof(hdr) + 0);
 	put_unaligned_le16(scan_id, sig + sizeof(hdr) + 2);
 	put_unaligned_le16(2, sig + sizeof(hdr) + 4);	/* full scan */
 	memcpy(sig + sizeof(hdr) + 6, scan_mac, sizeof(scan_mac));
 	put_unaligned_le16(4, sig + sizeof(hdr) + 12);	/* real time results */
-	memset(sig + sizeof(hdr) + 14, 0, 12);
 
 	/* Wildcard SSID: a broadcast scan always carries one. */
 	dat[n++] = 0;
@@ -2002,12 +2062,44 @@ static int wlbt_mlme_add_scan(struct exynos_wlbt *w, u16 scan_id)
 	c[5] = 0x01;
 	c[6] = 0x02;
 	n += 7;
-	for (i = 0; i < ARRAY_SIZE(channels); i++) {
-		put_unaligned_le16(channels[i] * 2, dat + n);
-		dat[n + 2] = 0;			/* active */
-		n += 3;
-		c[1] += 3;
+
+	/*
+	 * The supplicant names the channels it wants, and both bands can be in
+	 * one request, so take them from the request rather than from a fixed
+	 * list.  A request without channels means every channel this wiphy has.
+	 */
+	if (req && req->n_channels) {
+		for (i = 0; i < req->n_channels; i++) {
+			u16 freq = req->channels[i]->center_freq;
+
+			put_unaligned_le16(freq * 2, dat + n);
+			dat[n + 2] = wlbt_channel_passive(freq) ? 0x01 : 0;
+			n += 3;
+			c[1] += 3;
+			n_chan++;
+		}
+	} else {
+		for (i = 0; i < ARRAY_SIZE(wlbt_2ghz_channels); i++) {
+			put_unaligned_le16(wlbt_2ghz_channels[i].center_freq * 2,
+					   dat + n);
+			dat[n + 2] = 0;
+			n += 3;
+			c[1] += 3;
+			n_chan++;
+		}
+		for (i = 0; i < ARRAY_SIZE(wlbt_5ghz_channels); i++) {
+			u16 freq = wlbt_5ghz_channels[i].center_freq;
+
+			put_unaligned_le16(freq * 2, dat + n);
+			dat[n + 2] = wlbt_channel_passive(freq) ? 0x01 : 0;
+			n += 3;
+			c[1] += 3;
+			n_chan++;
+		}
 	}
+
+	if (!n_chan)
+		return -EINVAL;
 
 	hdr.id = cpu_to_le16(FAPI_MLME_ADD_SCAN_REQ);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
@@ -3605,7 +3697,7 @@ static ssize_t wlbt_debugfs_hip4(struct file *file, const char __user *buf,
 			goto out;
 		}
 
-		ret = wlbt_mlme_add_scan(w, 0x0100);
+		ret = wlbt_mlme_add_scan(w, 0x0100, NULL);
 		if (ret)
 			goto out;
 		msleep(500);
@@ -4767,21 +4859,6 @@ static int wlbt_parse_memory(struct exynos_wlbt *w)
 #define WLBT_SCAN_RSSI		(-65 * 100)	/* dBm, this firmware reports none */
 #define WLBT_SCAN_DELAY_MS	5000
 
-static struct ieee80211_channel wlbt_2ghz_channels[] = {
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2412, .hw_value = 1 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2417, .hw_value = 2 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2422, .hw_value = 3 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2427, .hw_value = 4 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2432, .hw_value = 5 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2437, .hw_value = 6 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2442, .hw_value = 7 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2447, .hw_value = 8 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2452, .hw_value = 9 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2457, .hw_value = 10 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2462, .hw_value = 11 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2467, .hw_value = 12 },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2472, .hw_value = 13 },
-};
 
 static struct ieee80211_rate wlbt_2ghz_rates[] = {
 	{ .bitrate = 10 },
@@ -4818,6 +4895,26 @@ static struct ieee80211_supported_band wlbt_band_2ghz = {
 	.n_channels = ARRAY_SIZE(wlbt_2ghz_channels),
 	.bitrates = wlbt_2ghz_rates,
 	.n_bitrates = ARRAY_SIZE(wlbt_2ghz_rates),
+};
+
+
+static struct ieee80211_rate wlbt_5ghz_rates[] = {
+	{ .bitrate = 60 },
+	{ .bitrate = 90 },
+	{ .bitrate = 120 },
+	{ .bitrate = 180 },
+	{ .bitrate = 240 },
+	{ .bitrate = 360 },
+	{ .bitrate = 480 },
+	{ .bitrate = 540 },
+};
+
+static struct ieee80211_supported_band wlbt_band_5ghz = {
+	.band = NL80211_BAND_5GHZ,
+	.channels = wlbt_5ghz_channels,
+	.n_channels = ARRAY_SIZE(wlbt_5ghz_channels),
+	.bitrates = wlbt_5ghz_rates,
+	.n_bitrates = ARRAY_SIZE(wlbt_5ghz_rates),
 };
 
 static struct exynos_wlbt *wlbt_from_wiphy(struct wiphy *wiphy)
@@ -4881,6 +4978,14 @@ static bool wlbt_bss_frame(const u8 *buf, size_t avail, size_t *frame_len,
 			have_ssid = true;
 		} else if (id == WLAN_EID_DS_PARAMS && len >= 1) {
 			channel = buf[off + 2];
+		} else if (id == WLAN_EID_HT_OPERATION && len >= 1 && !channel) {
+			/*
+			 * A 5 GHz beacon usually has no DS parameters, so the
+			 * primary channel comes from the HT operation element: its
+			 * first payload byte.  The channel number it carries is what
+			 * says which band the frame is from.
+			 */
+			channel = buf[off + 2];
 		}
 		off += 2 + len;
 		if (off - 36 > WLBT_SCAN_IE_MAX)
@@ -4898,13 +5003,17 @@ static bool wlbt_bss_frame(const u8 *buf, size_t avail, size_t *frame_len,
 	/*
 	 * A channel the wiphy does not know makes cfg80211 dereference a NULL
 	 * channel pointer, and since this runs from the scan work that oops
-	 * takes cfg80211_scan_done() with it.  Anything outside the band is a
-	 * misread buffer, not an access point.
+	 * takes cfg80211_scan_done() with it.  Anything the tables do not have is
+	 * a misread buffer, not an access point.
 	 */
 	if (channel) {
-		if (channel > 13)
+		u16 f = ieee80211_channel_to_frequency(channel,
+				channel <= 14 ? NL80211_BAND_2GHZ :
+						NL80211_BAND_5GHZ);
+
+		if (!f)
 			return false;
-		*freq = 2412 + 5 * (channel - 1);
+		*freq = f;
 	} else {
 		*freq = 2437;
 	}
@@ -5116,7 +5225,7 @@ static int wlbt_cfg_scan(struct wiphy *wiphy,
 	 * refuses anything below 0x100, so the low byte just wraps.
 	 */
 	w->scan_id = 0x0100 | ((w->scan_id + 1) & 0xff);
-	ret = wlbt_mlme_add_scan(w, w->scan_id);
+	ret = wlbt_mlme_add_scan(w, w->scan_id, request);
 	if (ret)
 		return ret;
 
@@ -5276,7 +5385,8 @@ static void wlbt_mlme_connect_res(struct exynos_wlbt *w)
 static int wlbt_mlme_set_cached_channels(struct exynos_wlbt *w)
 {
 	u8 sig[sizeof(struct wlbt_fapi_hdr) + 14];
-	u8 dat[7 + 3 * WLBT_CACHED_CHANNELS];
+	u8 dat[7 + 3 * (ARRAY_SIZE(wlbt_2ghz_channels) +
+			ARRAY_SIZE(wlbt_5ghz_channels))];
 	struct wlbt_fapi_hdr hdr = { };
 	unsigned int i, n = 0;
 
@@ -5291,9 +5401,23 @@ static int wlbt_mlme_set_cached_channels(struct exynos_wlbt *w)
 	dat[n++] = 0x01;			/* scan parameters */
 	dat[n++] = 0x02;			/* channel list */
 
-	for (i = 0; i < WLBT_CACHED_CHANNELS; i++) {
-		put_unaligned_le16((2412 + 5 * i) * 2, dat + n);
-		dat[n + 2] = 0x18;		/* 2.4 GHz and 5 GHz */
+	/*
+	 * Both bands, because the peer keeps this list for its own scans and a
+	 * 5 GHz access point is only found if its channel is in it.  The policy
+	 * byte carries the band bits (0x08 for 2.4 GHz, 0x10 for 5 GHz) and, for
+	 * the radar detection bands, the DFS bit as well.
+	 */
+	for (i = 0; i < ARRAY_SIZE(wlbt_2ghz_channels); i++) {
+		put_unaligned_le16(wlbt_2ghz_channels[i].center_freq * 2, dat + n);
+		dat[n + 2] = 0x08;
+		n += 3;
+		dat[1] += 3;
+	}
+	for (i = 0; i < ARRAY_SIZE(wlbt_5ghz_channels); i++) {
+		u16 freq = wlbt_5ghz_channels[i].center_freq;
+
+		put_unaligned_le16(freq * 2, dat + n);
+		dat[n + 2] = wlbt_channel_passive(freq) ? 0x58 : 0x18;
 		n += 3;
 		dat[1] += 3;
 	}
@@ -6063,6 +6187,7 @@ static int wlbt_register_wiphy(struct exynos_wlbt *w)
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	wiphy->max_scan_ssids = 1;
 	wiphy->bands[NL80211_BAND_2GHZ] = &wlbt_band_2ghz;
+	wiphy->bands[NL80211_BAND_5GHZ] = &wlbt_band_5ghz;
 	wiphy->cipher_suites = wlbt_cipher_suites;
 	wiphy->n_cipher_suites = ARRAY_SIZE(wlbt_cipher_suites);
 	wiphy->max_num_akm_suites = 8;
