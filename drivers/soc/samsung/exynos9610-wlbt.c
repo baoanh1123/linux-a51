@@ -1067,6 +1067,16 @@ MODULE_PARM_DESC(wlan_start_on_boot, "Start the peer's WLAN service once the fir
 #define WLBT_UNSYNC_VIF			2
 #define FAPI_ACTION_FRAME_PUBLIC	BIT(4)
 #define FAPI_ACTION_FRAME_RADIO_MEAS	BIT(5)
+/*
+ * What the vendor registers for a station: public, WMM, WNM, QoS, protected
+ * dual and radio measurement (dev.h: SLSI_STA_ACTION_FRAME_BITMAP), with radio
+ * measurement left out of the suspended set.  Registration is part of bringing
+ * the interface up there, and this driver was skipping it.
+ */
+#define WLBT_STA_ACTION_FRAME_BITMAP \
+	(BIT(4) | BIT(17) | BIT(10) | BIT(1) | BIT(9) | BIT(5))
+#define WLBT_STA_ACTION_FRAME_SUSPEND \
+	(BIT(4) | BIT(17) | BIT(10) | BIT(1) | BIT(9))
 
 #define FAPI_MLME_SYNCHRONISED_RES	0x2205
 #define FAPI_MLME_SYNCHRONISED_IND	0x231b
@@ -5711,15 +5721,24 @@ static int wlbt_mlme_set_channel(struct exynos_wlbt *w, u16 vif, u16 freq)
 	return wlbt_hip4_send(w, true, sig, sizeof(sig), NULL, 0);
 }
 
+static int wlbt_mlme_register_action_frame2(struct exynos_wlbt *w, u16 vif,
+					    u32 bitmap, u32 suspended);
+
 static int wlbt_mlme_register_action_frame(struct exynos_wlbt *w, u16 vif,
 					    u32 bitmap)
+{
+	return wlbt_mlme_register_action_frame2(w, vif, bitmap, bitmap);
+}
+
+static int wlbt_mlme_register_action_frame2(struct exynos_wlbt *w, u16 vif,
+					    u32 bitmap, u32 suspended)
 {
 	u8 sig[sizeof(struct wlbt_fapi_hdr) + 22] = { };
 	struct wlbt_fapi_hdr hdr = { };
 
 	put_unaligned_le16(vif, sig + sizeof(hdr) + 0);
 	put_unaligned_le32(bitmap, sig + sizeof(hdr) + 2);
-	put_unaligned_le32(bitmap, sig + sizeof(hdr) + 6);
+	put_unaligned_le32(suspended, sig + sizeof(hdr) + 6);
 
 	hdr.id = cpu_to_le16(FAPI_MLME_REGISTER_ACTION_FRAME_REQ);
 	hdr.sender_pid = cpu_to_le16(FAPI_SENDER_PID);
@@ -5743,6 +5762,8 @@ static int wlbt_mlme_del_vif_at(struct exynos_wlbt *w, u16 vif)
 }
 
 static int wlbt_mlme_del_vif(struct exynos_wlbt *w);
+static int wlbt_mlme_register_action_frame2(struct exynos_wlbt *w, u16 vif,
+					    u32 bitmap, u32 suspended);
 
 /*
  * The interface a management frame leaves by.  Before the station is on a
@@ -5863,6 +5884,15 @@ static int wlbt_vif_up(struct exynos_wlbt *w)
 	if (ret)
 		return ret;
 	msleep(50);
+
+	/* The vendor registers the station's action frame categories as part of
+	 * bringing the interface up, not only when it wants a specific one.
+	 */
+	ret = wlbt_mlme_register_action_frame2(w, 1, WLBT_STA_ACTION_FRAME_BITMAP,
+					       WLBT_STA_ACTION_FRAME_SUSPEND);
+	if (ret)
+		return ret;
+	msleep(30);
 
 	ret = wlbt_mlme_set_country(w, "VN");
 	if (ret)
