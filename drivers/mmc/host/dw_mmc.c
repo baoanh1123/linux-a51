@@ -846,7 +846,7 @@ err_own_bit:
 		 (u64)mci_readl(host, IDSTS64),
 		 (u64)mci_readl(host, IDINTEN64));
 	memset(host->sg_cpu, 0,
-	       host->ring_size * sizeof(struct idmac_desc_64addr));
+	       host->ring_size * sizeof(struct idmac_desc));
 	dw_mci_idmac_init(host);
 	return -EINVAL;
 }
