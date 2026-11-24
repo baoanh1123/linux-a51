@@ -119,6 +119,22 @@
 #define DSIM_INTSRC_LPRX_TOUT		BIT(21)
 #define DSIM_INTSRC_ERR_RX_ECC		BIT(15)
 #define DSIM_INTSRC_RX_CRC		BIT(14)
+/*
+ * SFR_PH_FIFO_EMPTY (vendor regs-dsim.h) is a level state, not an event: in
+ * command mode the packet FIFO is empty whenever nothing is queued, so the
+ * pending bit holds the level IRQ line asserted forever.  The other sources
+ * the line can carry are one-shot events the handler can acknowledge.
+ */
+#define DSIM_INTSRC_SFR_PH_FIFO_EMPTY	BIT(28)
+
+/*
+ * Bits the DCS read path polls INTSRC for and writes back itself.  While a
+ * read is in flight the interrupt handler must not take them away, or the
+ * poll loses the response that is sitting in the RX FIFO.
+ */
+#define DSIM_INTSRC_POLL		(DSIM_INTSRC_RX_DATA_DONE | \
+				 DSIM_INTSRC_BTA_TOUT | DSIM_INTSRC_LPRX_TOUT | \
+				 DSIM_INTSRC_RX_CRC | DSIM_INTSRC_ERR_RX_ECC)
 
 #define DSIM_MIPI_STATUS_TE		BIT(0)
 #define DSIM_CMD_TE_CTRL0		0x084
@@ -193,6 +209,7 @@ struct exynos9610_dsim {
 	u32 lanes;
 	u32 last_intsrc;
 	int irq;
+	atomic_t polling;		/* a DCS read is waiting on INTSRC */
 	atomic64_t te_count;
 	atomic64_t te_other;
 	unsigned int brightness;
@@ -284,9 +301,16 @@ static int exynos9610_dsim_dcs_read(struct exynos9610_dsim *dsim, u8 cmd,
 	       DSIM_INTSRC_LPRX_TOUT | DSIM_INTSRC_ERR_RX_ECC |
 	       DSIM_INTSRC_RX_CRC, dsim->base + DSIM_INTSRC);
 
+	/*
+	 * From here to the acknowledgement below the poll owns the
+	 * INTSRC bits, so the interrupt handler leaves them alone.
+	 */
+	atomic_set(&dsim->polling, 1);
 	ret = exynos9610_dsim_send(dsim, MIPI_DSI_DCS_READ, cmd, 0, true, NULL, 0);
-	if (ret)
+	if (ret) {
+		atomic_set(&dsim->polling, 0);
 		return ret;
+	}
 
 	timeout = DSIM_POLL_TIMEOUT_US;
 	for (;;) {
@@ -296,14 +320,17 @@ static int exynos9610_dsim_dcs_read(struct exynos9610_dsim *dsim, u8 cmd,
 			      DSIM_INTSRC_ERR_RX_ECC))
 			break;
 
-		if (!timeout)
+		if (!timeout) {
+			atomic_set(&dsim->polling, 0);
 			return -ETIMEDOUT;
+		}
 
 		usleep_range(DSIM_POLL_INTERVAL_US, 2 * DSIM_POLL_INTERVAL_US);
 		timeout -= DSIM_POLL_INTERVAL_US;
 	}
 
 	writel(intsrc, dsim->base + DSIM_INTSRC);
+	atomic_set(&dsim->polling, 0);
 
 	dsim->last_intsrc = intsrc;
 
@@ -1167,23 +1194,36 @@ static irqreturn_t exynos9610_dsim_irq(int irq, void *data)
 {
 	struct exynos9610_dsim *dsim = data;
 	u32 pending = exynos9610_dsim_read(dsim, DSIM_INTSRC);
-	u32 handled = pending & DSIM_INTSRC_RX_TE;
-
+	bool polling = atomic_read(&dsim->polling);
 	/*
-	 * The read path polls INTSRC for RX_DATA_DONE, ACK and error bits, so
-	 * only acknowledge what is consumed here.  Acknowledging everything
-	 * makes reads time out with the response sitting in the RX FIFO.
+	 * Acknowledge everything the DCS read path does not wait on, and
+	 * everything at all when nobody is polling.  Leaving an unhandled bit
+	 * pending holds this level line asserted, which is how the boot chain's
+	 * SFR_PH_FIFO_EMPTY once flooded the GIC with 100000 unhandled
+	 * interrupts and got the whole line switched off.  The poll-critical
+	 * bits are written back by the read itself, so the handler only
+	 * preserves them while that read is running.
 	 */
+	u32 ack = polling ? pending & ~DSIM_INTSRC_POLL : pending;
+
 	if (pending & ~DSIM_INTSRC_RX_TE)
 		atomic64_inc(&dsim->te_other);
 
-	if (!handled)
+	if (pending & DSIM_INTSRC_RX_TE)
+		atomic64_inc(&dsim->te_count);
+
+	if (ack)
+		writel(ack, dsim->base + DSIM_INTSRC);
+
+	if (!pending)
 		return IRQ_NONE;
 
-	writel(handled, dsim->base + DSIM_INTSRC);
-	atomic64_inc(&dsim->te_count);
-
-	return IRQ_HANDLED;
+	/*
+	 * While a read is running the poll owns the remaining pending bits,
+	 * so the interrupt counts as served even though nothing was
+	 * acknowledged here.
+	 */
+	return (ack || polling) ? IRQ_HANDLED : IRQ_NONE;
 }
 
 static int exynos9610_dsim_te_show(struct seq_file *seq, void *unused)
@@ -1445,6 +1485,21 @@ static int exynos9610_dsim_probe(struct platform_device *pdev)
 		return dsim->irq;
 
 	if (dsim->irq) {
+		/*
+		 * The boot chain left sources enabled and pending.  In command
+		 * mode SFR_PH_FIFO_EMPTY is a level state (the FIFO is empty
+		 * whenever nothing is queued), so an unmasked pending bit holds
+		 * the line asserted; with the handler historically returning
+		 * IRQ_NONE for it the GIC saw 100000 unhandled interrupts, the
+		 * kernel reported "irq: nobody cared" and switched the line off
+		 * less than a second into every boot.  Mask that source and
+		 * drain the stale pending bits before the line goes live.
+		 */
+		exynos9610_dsim_update(dsim, DSIM_INTMSK,
+				       DSIM_INTSRC_SFR_PH_FIFO_EMPTY,
+				       DSIM_INTSRC_SFR_PH_FIFO_EMPTY);
+		writel(~0, dsim->base + DSIM_INTSRC);
+
 		ret = devm_request_irq(dsim->dev, dsim->irq,
 				       exynos9610_dsim_irq, 0,
 				       dev_name(dsim->dev), dsim);
