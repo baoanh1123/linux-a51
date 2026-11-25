@@ -4,7 +4,8 @@ Mainline Linux support for the Samsung Galaxy A51, an Exynos 9611 phone.
 It boots into a full GPU-composited desktop: the kernel owns the display
 controller, the MIPI link and the AMOLED panel, the Mali-G72 runs under
 panfrost, and touchscreen, thermal sensors and the charger are all driven by
-mainline drivers.  Wi-Fi station mode works as well, including WPA3.
+mainline drivers.  Wi-Fi station mode works as well, including WPA3, and
+the same block now carries a working Bluetooth HCI transport.
 
 ![Weston desktop with Xwayland, htop and a Wayland terminal](screenshots/a51-desktop.png)
 
@@ -50,6 +51,9 @@ Working:
 - **Wi-Fi** - station mode on 2.4 and 5 GHz, WPA2-PSK and WPA3-SAE, DHCP,
   and a join at boot with a saved connection.  ~90 Mbps on the LAN,
   ~47 Mbps down and 36-42 Mbps up to the internet.
+- **Bluetooth** - BSMHCP HCI transport, LE and BR/EDR discovery, LE
+  advertising and ACL data.  BlueZ powers the adapter at boot; no manual
+  `hciconfig` step is needed.
 - **Desktops** - Weston with Xwayland, Sway, Phosh and KDE Plasma Mobile all
   render on the panel.
 
@@ -63,15 +67,16 @@ Not supported yet:
 - **GPU DVFS** - no OPP table and no `mali-supply`, so the GPU clock is fixed.
 - **USB host / OTG** - the controller is fixed to peripheral mode. The boost
   and MUIC switching are in place, the role switch is not wired up yet.
-- Audio (ABOX), cameras, modem, Bluetooth and NFC - untouched subsystems.
+- Audio (ABOX), cameras, modem and NFC - untouched subsystems.  Bluetooth
+  audio (SCO/AVDTP) is also not implemented yet.
 
 ## Wi-Fi
 
 The A51 has no SDIO or PCIe wireless interface: Wi-Fi and Bluetooth sit
 behind Samsung's SCSC ("mx140") block, which the host drives through a HIP4
 queue pair in DRAM and a mailbox.  `CONFIG_EXYNOS9610_WLBT` builds
-`exynos9610-wlbt.ko` from five translation units under
-`drivers/soc/samsung/` (core, HIP4, MLME, debugfs and netdev).
+`exynos9610-wlbt.ko` from six translation units under
+`drivers/soc/samsung/` (core, HIP4, MLME, debugfs, netdev and BT).
 
 On this port the module copies the firmware into the peer's MIF window
 itself, so `load_firmware=1` is required.  The three files the module asks
@@ -134,12 +139,43 @@ WPA2-PSK uses the same driver with `key_mgmt=WPA-PSK` and no `sae_pwe`.
 
 Limitations:
 
-- Bluetooth is not usable yet: the block is powered and the firmware runs,
-  but there is no HCI transport in this tree.
 - If the first join after boot does not finish within about a minute, the
   firmware can assert its watchdog and stop.  A warm reboot leaves the
   companion in that state; a cold boot clears it.
 - Only station mode has been exercised.
+
+## Bluetooth
+
+Bluetooth is a separate SCSC service (`SCSC_SERVICE_ID_BT = 2`), not an HCI
+UART or a HIP4 queue.  `wlbt-bt.c` starts that service through the
+service-management channel, lays out the BHCS and BSMHCP shared-memory block,
+and registers a virtual HCI device.  Command, event and ACL rings are bridged
+to the HCI core; ACL TX buffers are reclaimed from the BSMHCP free ring and
+turned into Number Of Completed Packets credits.
+
+The firmware file is `mx140/mx140_bt.hcf` and must be next to the Wi-Fi
+firmware.  `CONFIG_BT=m`, `CONFIG_BT_BREDR=y` and `CONFIG_BT_LE=y` are
+enabled; `exynos9610_wlbt` then depends on `bluetooth.ko`,
+`ecdh_generic.ko` and `ecc.ko`.  All are installed in the rootfs module
+tree, and `/etc/modules-load.d/wlbt.conf` loads the transport at boot.
+
+Verified on the SM-A515F:
+
+| test | result |
+| --- | --- |
+| `hciconfig -a` | `UP RUNNING`, HCI 5.0, manufacturer 117 (Samsung) |
+| `bluetoothctl --timeout 5 scan on` | LE advertisers and the Samsung TV over BR/EDR |
+| `bluetoothctl advertise on` | one active advertising instance |
+| host Intel controller | connected to the advertisement and exchanged ACL packets |
+| `bluetoothctl power off` / `power on` | adapter returns to `UP RUNNING` |
+
+Limitations:
+
+- The address is still the placeholder `00:11:22:33:44:55`; it should come
+  from the SoC unique ID or the Android `bt_addr` file.
+- SCO/AVDTP audio, vendor-specific HCI commands and a sustained 30-buffer ACL
+  transfer are not implemented or not yet exercised.
+- Pairing and a long-lived LE connection are not yet validated end to end.
 
 ## Building
 
