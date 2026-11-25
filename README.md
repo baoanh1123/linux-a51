@@ -68,7 +68,8 @@ Not supported yet:
 - **USB host / OTG** - the controller is fixed to peripheral mode. The boost
   and MUIC switching are in place, the role switch is not wired up yet.
 - Audio (ABOX), cameras, modem and NFC - untouched subsystems.  Bluetooth
-  audio (SCO/AVDTP) is also not implemented yet.
+  SCO/HFP audio and AVDTP coexistence detection are not implemented; A2DP
+  playback over the ACL transport works when a media session is running.
 
 ## Wi-Fi
 
@@ -173,6 +174,7 @@ Verified on the SM-A515F:
 | `bluetoothctl advertise on` | one active advertising instance |
 | host `bluetoothctl pair` over BR/EDR | `Pairing successful`; both sides bonded and trusted |
 | host SDP stress over BR/EDR | 80/80 requests on one link; 200/200 while 40 LE GATT reads ran |
+| host A2DP stream to phone | 5 s stream on `a2dp-duplex`; phone sink `RUNNING`, `dmesg` clean |
 | host LE link, 80 GATT reads | 80 `Device Name` responses on one connection, no ACL stall |
 | reboot, host LE link, 40 GATT reads | 40 responses; address, bond and HCI startup persist |
 | three `hciconfig hci0 down` / `up` cycles | adapter returns to `UP RUNNING` each time |
@@ -180,7 +182,9 @@ Verified on the SM-A515F:
 
 Limitations:
 
-- SCO/AVDTP audio and vendor-specific HCI commands are not implemented.
+- A2DP playback over the ACL transport works when PipeWire/WirePlumber are
+  started manually; it is not enabled at boot.  SCO/HFP audio, AVDTP
+  coexistence detection and vendor-specific HCI commands are not implemented.
 - LE SMP pairing was not completed in the host tests; BR/EDR pairing and an
   unpaired LE GATT link are validated.
 - `l2ping` stops with `Connection reset by peer` after four or five echoes in
