@@ -87,12 +87,16 @@ and the module has to be told to load them:
 
 ```sh
 # /etc/modprobe.d/wlbt.conf
-options exynos9610_wlbt load_firmware=1 sae_support=1
+options exynos9610_wlbt send_pmk=0 eapol_mlme=1 rx_chain_frame=1 load_firmware=1 sae_support=1
 ```
 
-`sae_support` is off at boot because advertising WPA3 changes what the peer
-does on every boot, and one failed join would then repeat forever.  WPA2
-does not need it; turn it on for a WPA3 network.
+`send_pmk=0` keeps the four-way handshake in the supplicant: the peer's
+`SET_PMK` path can reset its firmware.  `eapol_mlme=1` is the EAPOL path that
+gets message 2 past the peer's key gate, and `rx_chain_frame=1` takes a frame
+out of a received chain (needed for the SAE indications).  `sae_support` is
+off at boot because advertising WPA3 changes what the peer does on every
+boot, and one failed join would then repeat forever.  WPA2 does not need it;
+turn it on for a WPA3 network.
 
 Measured on the SM-A515F with 6.18.58, against a 5 GHz access point on
 channel 64:
