@@ -438,6 +438,8 @@ struct wlbt_hip4_q {
 /* mbulk flags, classes and pool ids (mbulk_def.h, mbulk.h). */
 #define MBULK_F_SIG			0x01
 #define MBULK_F_OBOUND			0x04
+#define WLBT_AMSDU_FRAME		16384
+#define WLBT_ETH_FRAME			2400
 #define MBULK_F_CHAIN_HEAD		0x40
 #define MBULK_F_CHAIN			0x80
 #define MBULK_MAX_CHAIN			16
@@ -734,6 +736,12 @@ struct exynos_wlbt {
 	struct wlbt_hip4_pool hip4_pool[2];
 	unsigned int n_hip4_tx;
 	unsigned int n_hip4_rx;
+	unsigned int n_rx_amsdu_frames;
+	unsigned int n_chain_probe;
+	u64 drain_ns;
+	unsigned int drain_calls;
+	u8 amsdu_frame[WLBT_AMSDU_FRAME];
+	u8 eth_frame[WLBT_ETH_FRAME];
 	struct wiphy *wiphy;
 	struct net_device *netdev;
 	struct cfg80211_scan_request *scan_req;

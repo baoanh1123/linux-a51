@@ -1038,6 +1038,12 @@ static int wlbt_debugfs_show(struct seq_file *s, void *unused)
 		   w->netdev ? w->netdev->stats.tx_packets : 0UL,
 		   w->n_tx_calls, w->n_tx_dropped, w->n_tx_unauthed,
 		   w->n_hip4_tx, w->n_hip4_rx);
+	if (w->drain_calls)
+		seq_printf(s, "drain %u calls %llu us %llu ns/call, amsdu frames %u\n",
+			   w->drain_calls,
+			   w->drain_ns / 1000,
+			   w->drain_ns / w->drain_calls,
+			   w->n_rx_amsdu_frames);
 	if (w->hip4_ref)
 		seq_printf(s, "hip4 0x%x control 0x%x mib 0x%x (%u bytes)\n",
 			   w->hip4_ref, w->hip4_control,

@@ -1224,6 +1224,118 @@ static void wlbt_rx_frame(struct exynos_wlbt *w, const void *data, size_t len)
 	netif_rx(skb);
 }
 
+/*
+ * Take an A-MSDU apart.  Each sub-frame is DA(6) SA(6) length(2, big endian)
+ * and a payload that starts with the LLC/SNAP header AA AA 03 00 00 00 and the
+ * protocol; the whole sub-frame is padded to a four byte boundary except the
+ * last, and the indication's length may include that padding.  Rebuild the
+ * ethernet header the stack expects around each payload.
+ */
+static unsigned int wlbt_rx_amsdu(struct exynos_wlbt *w, const u8 *buf,
+				  size_t len)
+{
+	u8 *frame = w->eth_frame;
+	unsigned int n = 0;
+	size_t p = 0;
+
+	while (p + 14 <= len) {
+		const u8 *sub = buf + p;
+		const u8 *snap = sub + 14;
+		u16 slen, proto;
+		size_t flen;
+
+		slen = get_unaligned_be16(sub + 12);
+		if (slen < 8 || slen > len - p - 14)
+			break;
+		if (snap[0] != 0xaa || snap[1] != 0xaa || snap[2] != 0x03 ||
+		    snap[3] || snap[4] || snap[5])
+			break;
+		proto = get_unaligned_be16(snap + 6);
+		if (proto < ETH_P_802_3_MIN)
+			break;
+		flen = 14 + slen - 8;
+		if (flen > WLBT_ETH_FRAME)
+			break;
+		memcpy(frame, sub, 12);
+		put_unaligned_be16(proto, frame + 12);
+		memcpy(frame + 14, snap + 8, slen - 8);
+		wlbt_rx_frame(w, frame, flen);
+		w->n_rx_amsdu_frames++;
+		n++;
+		p += (14 + slen + 3) & ~3u;
+	}
+
+	return n;
+}
+
+/*
+ * A unitdata indication describes one received frame, but the peer is free to
+ * spread the frame - and the A-MSDU it really is - over a chain of segments.
+ * Gather the chain first: reading only the head delivered the sub-frames the
+ * head happened to contain and recycled the rest unread, which is what kept a
+ * download at a few hundred kilobytes a second while pings were unaffected.
+ */
+static void wlbt_rx_unitdata(struct exynos_wlbt *w, const struct wlbt_mbulk *mb,
+			     const void __iomem *src, size_t len)
+{
+	u8 *buf = w->amsdu_frame;
+	struct wlbt_mbulk cur = *mb;
+	size_t total = min_t(size_t, len, WLBT_AMSDU_FRAME);
+	unsigned int segs = 1;
+	u8 proto[2];
+
+	memcpy_fromio(buf, src, total);
+	memcpy_fromio(proto, src + 12, sizeof(proto));
+
+	/* An ordinary ethernet frame with nothing chained behind it. */
+	if (get_unaligned_be16(proto) >= ETH_P_802_3_MIN &&
+	    !(mb->flag & MBULK_F_CHAIN)) {
+		wlbt_rx_frame(w, src, len);
+		return;
+	}
+
+	while ((cur.flag & MBULK_F_CHAIN) && segs < MBULK_MAX_CHAIN &&
+	       total < WLBT_AMSDU_FRAME) {
+		u32 next = le32_to_cpu(cur.chain_next_offset);
+		u16 off, take;
+
+		if (!wlbt_hip4_ref_valid(w, next))
+			break;
+		memcpy_fromio(&cur, w->dram + next, sizeof(cur));
+		off = le16_to_cpu(cur.head);
+		if (off > HIP4_SLOT_SIZE - HIP4_MBULK_SIZE)
+			break;
+		take = min_t(size_t, le16_to_cpu(cur.len),
+			     WLBT_AMSDU_FRAME - total);
+		if (take)
+			memcpy_fromio(buf + total,
+				      w->dram + next + HIP4_MBULK_SIZE + off,
+				      take);
+		total += take;
+		segs++;
+	}
+
+	/* One frame split over the chain rather than an aggregate. */
+	if (total >= ETH_HLEN && get_unaligned_be16(buf + 12) >= ETH_P_802_3_MIN) {
+		wlbt_rx_frame(w, buf, total);
+		return;
+	}
+
+	/*
+	 * A short 802.3 frame has a length where the ethertype would be and
+	 * reaches neither the A-MSDU parser nor an IP handler; hand it over
+	 * the old way rather than dropping it.
+	 */
+	if (!wlbt_rx_amsdu(w, buf, total))
+		wlbt_rx_frame(w, buf, total);
+
+	if (hip4_log && segs > 1 && total > 1514 && w->n_chain_probe < 6) {
+		w->n_chain_probe++;
+		dev_info(w->dev, "rx chain: %u segments, %zu bytes\n",
+			 segs, total);
+	}
+}
+
 static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 {
 	u8 *scb = wlbt_hip4_scb(w);
@@ -1297,12 +1409,28 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 				size_t dlen = le16_to_cpu(mb.len);
 				u16 off = le16_to_cpu(mb.head);
 
-				dev_info(w->dev,
-					 "unitdata: len %zu head %u\n", dlen, off);
+				if (hip4_log)
+					dev_info(w->dev,
+						 "unitdata: len %zu head %u flag %02x\n",
+						 dlen, off, mb.flag);
 
-				if (dlen && dlen <= HIP4_SLOT_SIZE - HIP4_MBULK_SIZE - off)
-					wlbt_rx_frame(w, m + HIP4_MBULK_SIZE + off,
-						      dlen);
+				/*
+				 * The peer aggregates what it received into
+				 * an A-MSDU and marks the indication with
+				 * CHAIN_HEAD.  An aggregate is not one
+				 * ethernet frame: sub-frame one starts with
+				 * DA/SA and an 802.3 length, not with an
+				 * ethertype.  Handing the whole thing to
+				 * the stack delivered the first sub-frame
+				 * as an unknown 802.3 protocol and dropped
+				 * the rest, so a download crawled while
+				 * pings went through.
+				 */
+				if (dlen >= ETH_HLEN &&
+				    dlen <= HIP4_SLOT_SIZE - HIP4_MBULK_SIZE - off)
+					wlbt_rx_unitdata(w, &mb,
+							 m + HIP4_MBULK_SIZE + off,
+							 dlen);
 			}
 
 			/*
@@ -1337,9 +1465,10 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 			    len >= sizeof(hdr) + 6) {
 				u16 desc = get_unaligned_le16(body + 2);
 
-				dev_info(w->dev,
-					 "ind230d: desc 0x%04x mblen %u\n",
-					 desc, le16_to_cpu(mb.len));
+				if (hip4_log)
+					dev_info(w->dev,
+						 "ind230d: desc 0x%04x mblen %u\n",
+						 desc, le16_to_cpu(mb.len));
 
 				/*
 				 * The vendor's indication carries the frame inline, with
@@ -1361,10 +1490,11 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 				    le16_to_cpu(mb.len) >= 24) {
 					size_t got = wlbt_take_frame(w, ref, &mb, body);
 
-					dev_info(w->dev,
-						 "ind230d: got %zu flag %08x sigb %u datb %u head %u\n",
-						 got, w->sae_dbg[0], w->sae_dbg[1],
-						 w->sae_dbg[2], w->sae_dbg[4]);
+					if (hip4_log)
+						dev_info(w->dev,
+							 "ind230d: got %zu flag %08x sigb %u datb %u head %u\n",
+							 got, w->sae_dbg[0], w->sae_dbg[1],
+							 w->sae_dbg[2], w->sae_dbg[4]);
 
 					/*
 					 * A recovered 802.3 frame is a received
@@ -1378,10 +1508,11 @@ static void wlbt_hip4_show(struct exynos_wlbt *w, u32 q)
 					w->n_mgmt_rx++;
 					if (got >= 24 &&
 					    ((w->sae_frame[0] >> 2) & 0x3) == 2)
-						dev_info(w->dev,
-							 "ind: data frame %zu bytes fc %02x %02x\n",
-							 got, w->sae_frame[0],
-							 w->sae_frame[1]);
+						if (hip4_log)
+							dev_info(w->dev,
+								 "ind: data frame %zu bytes fc %02x %02x\n",
+								 got, w->sae_frame[0],
+								 w->sae_frame[1]);
 					if (got >= 24 &&
 					    ((w->sae_frame[0] >> 4) & 0xf) ==
 					    (IEEE80211_STYPE_AUTH >> 4)) {
@@ -1657,11 +1788,15 @@ void wlbt_hip4_drain(struct exynos_wlbt *w)
 	 * assertion on its side.  Holding the lock with interrupts off is what
 	 * keeps the two contexts off the same index.
 	 */
+	ktime_t t0 = ktime_get();
+
 	spin_lock_irqsave(&w->hip4_lock, flags);
 	wlbt_hip4_release(w);
 	wlbt_hip4_show(w, HIP4_Q_TH_CTL);
 	wlbt_hip4_show(w, HIP4_Q_TH_DAT);
 	spin_unlock_irqrestore(&w->hip4_lock, flags);
+	w->drain_ns += ktime_to_ns(ktime_sub(ktime_get(), t0));
+	w->drain_calls++;
 }
 
 
