@@ -200,7 +200,7 @@ MODULE_PARM_DESC(mgmt_tx_freq_mode, "Management frame transmits: 0 leaves the fr
  */
 unsigned int mgmt_tx_auth_type = FAPI_MESSAGETYPE_IEEE80211_MGMT;
 module_param(mgmt_tx_auth_type, uint, 0644);
-MODULE_PARM_DESC(mgmt_tx_auth_type, "Message type authentication frames are sent with: 0x10 action (default, does not reach the air) or 0x11 management (what the vendor sends, but it resets the peer here)");
+MODULE_PARM_DESC(mgmt_tx_auth_type, "Message type authentication frames are sent with: 0x10 action or 0x11 management (the default, and what the vendor sends)");
 
 int mgmt_tx_auth_dwell_us;
 module_param(mgmt_tx_auth_dwell_us, int, 0644);

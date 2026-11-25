@@ -199,20 +199,17 @@ int wlbt_register_wiphy(struct exynos_wlbt *w)
 	wiphy->n_cipher_suites = ARRAY_SIZE(wlbt_cipher_suites);
 	wiphy->max_num_akm_suites = 8;
 	/* The supplicant names the EAPOL ethertype it wants; accepting the
-	 * attribute is enough for now, the peer's data path is not there yet.
+	 * attribute is enough, EAPOL leaves through the MLME path.
 	 */
 	wiphy->flags |= WIPHY_FLAG_CONTROL_PORT_PROTOCOL;
 
 	/*
-	 * Only claim SAE when asked to.  The host side is here - the peer hands
-	 * up the access point, the supplicant runs the exchange and its frames go
-	 * out through the management transmit - but this firmware does not send
-	 * those frames: with a live capture on the channel, the only frames that
-	 * leave the peer during a WPA3 join are its own probe requests, and the
-	 * join ends in AUTH_TX_FAIL (0x8015) followed by a watchdog reset.  See
-	 * notes/wifi.md.  Advertising the flag anyway would make NetworkManager
-	 * prefer SAE on a WPA2/WPA3 network and kill the peer, so it stays off
-	 * unless sae_support=1 is given.
+	 * Only claim SAE when asked to.  The host side works: the peer hands the
+	 * access point's authentication frames up, the supplicant runs the
+	 * exchange, and its answers leave through the management transmit.  A
+	 * failed join can still end in AUTH_TX_FAIL and leave the peer stopped
+	 * until the board is power cycled, so the boot default stays off and the
+	 * flag is turned on for a WPA3 network.  See notes/wifi.md.
 	 */
 	if (sae_support)
 		wiphy->features |= NL80211_FEATURE_SAE;
