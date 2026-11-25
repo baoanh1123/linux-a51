@@ -106,14 +106,14 @@ config EXYNOS9610_G3D_PD
 	  before any device is attached to the domain.
 
 config EXYNOS9610_WLBT
-	tristate "Exynos 9610 SCSC/WLBT power and boot handshake"
+	tristate "Exynos 9610 SCSC/WLBT Wi-Fi transport"
 	depends on ARCH_EXYNOS || COMPILE_TEST
 	depends on ARM64
 	help
-	  Power up the Samsung SCSC ("mx140") WiFi/Bluetooth subsystem and
-	  answer its configuration request on Exynos 9610.  The subsystem is
-	  driven over a mailbox: this driver only brings it out of reset and
-	  lets it start, which is the foundation the transport driver needs.
+	  Power up the Samsung SCSC ("mx140") WiFi/Bluetooth subsystem, load
+	  its firmware and drive its Wi-Fi transport over the HIP4 queues: a
+	  station interface on 2.4 and 5 GHz with WPA2 and WPA3, registered
+	  with cfg80211.
 
 	  The Galaxy A51 has no SDIO and no PCIe WiFi, so this block is the
 	  only route to a built-in wireless interface.  Say M unless you are
