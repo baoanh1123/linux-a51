@@ -160,8 +160,9 @@ enabled; `exynos9610_wlbt` then depends on `bluetooth.ko`,
 tree, and `/etc/modules-load.d/wlbt.conf` loads the transport at boot.
 
 The address is read at probe time from `mx140/bt_addr`, an ASCII file copied
-from the Android `efs` partition (`/bluetooth/bt_addr`).  `bt_addr=` overrides
-it; if the file is missing the driver keeps a placeholder and warns.
+from the Android `efs` partition (`/bluetooth/bt_addr`).  The SM-A515F file
+contains `C0:D2:DD:24:44:94`.  `bt_addr=` overrides it; if the file is missing
+the driver keeps a placeholder and warns.
 
 Verified on the SM-A515F:
 
@@ -170,14 +171,21 @@ Verified on the SM-A515F:
 | `hciconfig -a` | `UP RUNNING`, HCI 5.0, manufacturer 117 (Samsung) |
 | `bluetoothctl --timeout 5 scan on` | LE advertisers and the Samsung TV over BR/EDR |
 | `bluetoothctl advertise on` | one active advertising instance |
-| host Intel controller | connected to the advertisement and exchanged ACL packets |
-| `bluetoothctl power off` / `power on` | adapter returns to `UP RUNNING` |
+| host `bluetoothctl pair` over BR/EDR | `Pairing successful`; both sides bonded and trusted |
+| host SDP stress over BR/EDR | 80/80 requests on one link; 200/200 while 40 LE GATT reads ran |
+| host LE link, 80 GATT reads | 80 `Device Name` responses on one connection, no ACL stall |
+| reboot, host LE link, 40 GATT reads | 40 responses; address, bond and HCI startup persist |
+| three `hciconfig hci0 down` / `up` cycles | adapter returns to `UP RUNNING` each time |
+| reboot with WPA3 AP | Bluetooth and Wi-Fi both come up hands-free |
 
 Limitations:
 
-- SCO/AVDTP audio, vendor-specific HCI commands and a sustained 30-buffer ACL
-  transfer are not implemented or not yet exercised.
-- Pairing and a long-lived LE connection are not yet validated end to end.
+- SCO/AVDTP audio and vendor-specific HCI commands are not implemented.
+- LE SMP pairing was not completed in the host tests; BR/EDR pairing and an
+  unpaired LE GATT link are validated.
+- `l2ping` stops with `Connection reset by peer` after four or five echoes in
+  either direction.  A long GATT session is used for ACL credit coverage
+  instead; the reset appears to be in the L2CAP echo path, not the HCI rings.
 
 ## Building
 
