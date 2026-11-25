@@ -159,6 +159,10 @@ enabled; `exynos9610_wlbt` then depends on `bluetooth.ko`,
 `ecdh_generic.ko` and `ecc.ko`.  All are installed in the rootfs module
 tree, and `/etc/modules-load.d/wlbt.conf` loads the transport at boot.
 
+The address is read at probe time from `mx140/bt_addr`, an ASCII file copied
+from the Android `efs` partition (`/bluetooth/bt_addr`).  `bt_addr=` overrides
+it; if the file is missing the driver keeps a placeholder and warns.
+
 Verified on the SM-A515F:
 
 | test | result |
@@ -171,8 +175,6 @@ Verified on the SM-A515F:
 
 Limitations:
 
-- The address is still the placeholder `00:11:22:33:44:55`; it should come
-  from the SoC unique ID or the Android `bt_addr` file.
 - SCO/AVDTP audio, vendor-specific HCI commands and a sustained 30-buffer ACL
   transfer are not implemented or not yet exercised.
 - Pairing and a long-lived LE connection are not yet validated end to end.

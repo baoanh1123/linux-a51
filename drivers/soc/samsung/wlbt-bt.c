@@ -228,6 +228,7 @@ struct wlbt_bt {
 	u32 bsmhcp_ref;
 	u32 config_ref;
 	u32 config_len;
+	u64 addr;
 	bool started;
 	unsigned long tx_used[BITS_TO_LONGS(BSMHCP_ACL_TX_BUFFERS)];
 	u16 l2cap_remaining[BSMHCP_MAX_HANDLE];
@@ -255,9 +256,16 @@ static_assert(sizeof(struct bsmhcp_protocol) == 0x165c0);
 	((BSMHCP_ACL_BUFFER_SIZE | BSMHCP_CMD_EVT_BUFFER_SIZE | \
 	  (BT_OFF(acl_tx_buffer) << 15)) ^ sizeof(struct bsmhcp_protocol))
 
-static u64 bt_addr = 0x001122334455ULL;
+#define BSMHCP_DEFAULT_BT_ADDR	0x001122334455ULL
+
+/* Zero means: read the address from bt_addr_file, then fall back. */
+static u64 bt_addr;
 module_param(bt_addr, ullong, 0644);
-MODULE_PARM_DESC(bt_addr, "Bluetooth address to hand the peer (default 00:11:22:33:44:55)");
+MODULE_PARM_DESC(bt_addr, "Bluetooth address override (0 reads bt_addr_file)");
+
+static char bt_addr_file[64] = "mx140/bt_addr";
+module_param_string(bt_addr_file, bt_addr_file, sizeof(bt_addr_file), 0444);
+MODULE_PARM_DESC(bt_addr_file, "firmware file with the Bluetooth address");
 
 static int wlbt_bt_start(struct wlbt_bt *bt);
 static void wlbt_bt_stop(struct wlbt_bt *bt);
@@ -627,6 +635,73 @@ static void wlbt_bt_rx_work(struct work_struct *work)
 	}
 }
 
+static int bt_addr_from_text(const u8 *buf, size_t len, u64 *addr)
+{
+	u8 nibble[12];
+	int n = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		u8 c = buf[i];
+		int v;
+
+		if (c == ':' || c == '-' || c == ' ' || c == '\n' ||
+		    c == '\r' || c == '\t')
+			continue;
+		if (c >= '0' && c <= '9')
+			v = c - '0';
+		else if (c >= 'a' && c <= 'f')
+			v = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F')
+			v = c - 'A' + 10;
+		else
+			return -EINVAL;
+		if (n == ARRAY_SIZE(nibble))
+			return -EINVAL;
+		nibble[n++] = v;
+	}
+
+	if (n != ARRAY_SIZE(nibble))
+		return -EINVAL;
+
+	*addr = 0;
+	for (i = 0; i < ARRAY_SIZE(nibble); i++)
+		*addr = (*addr << 4) | nibble[i];
+
+	return 0;
+}
+
+static void wlbt_bt_load_addr(struct wlbt_bt *bt)
+{
+	struct exynos_wlbt *w = bt->w;
+	const struct firmware *fw;
+	u64 addr;
+
+	if (bt_addr) {
+		bt->addr = bt_addr;
+		return;
+	}
+
+	if (bt_addr_file[0] &&
+	    !request_firmware(&fw, bt_addr_file, w->dev)) {
+		if (!bt_addr_from_text(fw->data, fw->size, &addr)) {
+			bt->addr = addr;
+			dev_info(w->dev, "Bluetooth address %012llx from %s\n",
+				 bt->addr, bt_addr_file);
+		} else {
+			dev_warn(w->dev, "invalid Bluetooth address in %s\n",
+				 bt_addr_file);
+		}
+		release_firmware(fw);
+	}
+
+	if (!bt->addr) {
+		bt->addr = BSMHCP_DEFAULT_BT_ADDR;
+		dev_warn(w->dev, "Bluetooth address file unavailable, using %012llx\n",
+			 bt->addr);
+	}
+}
+
 static int wlbt_bt_start(struct wlbt_bt *bt)
 {
 	struct exynos_wlbt *w = bt->w;
@@ -707,9 +782,9 @@ static int wlbt_bt_start(struct wlbt_bt *bt)
 	bhcs->bsmhcp_protocol_length = cpu_to_le32(sizeof(struct bsmhcp_protocol));
 	bhcs->configuration_offset = cpu_to_le32(bt->config_ref);
 	bhcs->configuration_length = cpu_to_le32(bt->config_len);
-	bhcs->bluetooth_address_lap = cpu_to_le32(bt_addr & 0xffffff);
-	bhcs->bluetooth_address_uap = (bt_addr >> 24) & 0xff;
-	bhcs->bluetooth_address_nap = cpu_to_le16((bt_addr >> 32) & 0xffff);
+	bhcs->bluetooth_address_lap = cpu_to_le32(bt->addr & 0xffffff);
+	bhcs->bluetooth_address_uap = (bt->addr >> 24) & 0xff;
+	bhcs->bluetooth_address_nap = cpu_to_le16((bt->addr >> 32) & 0xffff);
 	wmb();
 
 	put_unaligned_le32(bt->bhcs_ref, frame + 3);
@@ -840,6 +915,7 @@ struct wlbt_bt *wlbt_bt_init(struct exynos_wlbt *w)
 		return ERR_PTR(-ENOMEM);
 
 	bt->w = w;
+	wlbt_bt_load_addr(bt);
 	mutex_init(&bt->lock);
 	spin_lock_init(&bt->ring_lock);
 	init_completion(&bt->start_cfm);
