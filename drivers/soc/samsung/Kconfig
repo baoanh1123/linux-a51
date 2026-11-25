@@ -106,7 +106,7 @@ config EXYNOS9610_G3D_PD
 	  before any device is attached to the domain.
 
 config EXYNOS9610_WLBT
-	tristate "Exynos 9610 SCSC/WLBT Wi-Fi transport"
+	tristate "Exynos 9610 SCSC/WLBT Wi-Fi and Bluetooth transport"
 	depends on ARCH_EXYNOS || COMPILE_TEST
 	depends on ARM64
 	help
@@ -114,6 +114,11 @@ config EXYNOS9610_WLBT
 	  its firmware and drive its Wi-Fi transport over the HIP4 queues: a
 	  station interface on 2.4 and 5 GHz with WPA2 and WPA3, registered
 	  with cfg80211.
+
+	  When CONFIG_BT is enabled the same driver also starts the peer Bluetooth
+	  service over the shared service-management channel, lays out the BHCS
+	  and BSMHCP shared memory, and registers an HCI device driven through
+	  the Bluetooth core.
 
 	  The Galaxy A51 has no SDIO and no PCIe WiFi, so this block is the
 	  only route to a built-in wireless interface.  Say M unless you are

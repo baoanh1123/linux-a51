@@ -245,6 +245,18 @@
  */
 #define WLBT_BIT_HIP4_FROM_HOST		7	/* host -> peer */
 #define WLBT_BIT_HIP4_TO_HOST		8	/* peer -> host */
+/*
+ * Bluetooth uses the next free mailbox bits.  The peer writes the two to-host
+ * bits; the host raises the two from-host bits.  They stay masked until the BT
+ * service is started so a stray edge cannot take the shared IRQ line.
+ */
+#define WLBT_BIT_BT_BG_TO_HOST		9	/* peer -> host, HCI events */
+#define WLBT_BIT_BT_FG_TO_HOST		10	/* peer -> host, ACL data */
+#define WLBT_BIT_BT_AP_TO_BG		11	/* host -> peer, HCI commands */
+#define WLBT_BIT_BT_AP_TO_FG		12	/* host -> peer, ACL data */
+#define WLBT_BIT_BT_AP_TO_FG_M4		14	/* host -> peer, ACL data (M4) */
+#define WLBT_BIT_BT_INFO_BG_TO_HOST	13	/* peer -> host, info channel */
+#define WLBT_BIT_BT_INFO_AP_TO_BG	15	/* host -> peer, info channel */
 
 #define HIP4_CONFIG_OFFSET		0x00000
 #define HIP4_CONFIG_SIZE		0x02000	/* 8 KiB, the control block */
@@ -959,6 +971,7 @@ struct exynos_wlbt {
 	atomic_t trace_running;
 	struct wlbt_trace_rec *trace;
 	struct dentry *debugfs;
+	struct wlbt_bt *bt;		/* Bluetooth service and HCI bridge */
 };
 
 u32 wlbt_stream_read(struct exynos_wlbt *w, struct wlbt_stream *s,
@@ -977,6 +990,12 @@ extern const struct wlbt_pbus_window wlbt_pbus_windows[];
 extern const u32 wlbt_rom_patch[];
 
 /* Cross-file declarations are appended below as the split needs them. */
+
+struct wlbt_bt;
+struct wlbt_bt *wlbt_bt_init(struct exynos_wlbt *w);
+void wlbt_bt_exit(struct wlbt_bt *bt);
+bool wlbt_bt_mgmt(struct wlbt_bt *bt, const u8 *msg, u32 len);
+void wlbt_bt_irq(struct wlbt_bt *bt, u32 status);
 
 void wlbt_boot(struct exynos_wlbt *w);
 int wlbt_build_mxconf(struct exynos_wlbt *w);

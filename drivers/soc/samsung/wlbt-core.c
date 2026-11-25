@@ -774,6 +774,8 @@ void wlbt_mgmt_drain(struct exynos_wlbt *w)
 
 	while ((got = wlbt_stream_read(w, &w->mgmt_in, msg, MGMT_PACKET_SIZE))) {
 		w->n_mgmt++;
+		if (w->bt && wlbt_bt_mgmt(w->bt, msg, got))
+			continue;
 		memset(hex, 0, sizeof(hex));
 		for (i = 1; i < got && i < 32; i++)
 			snprintf(hex + (i - 1) * 3, 4, " %02x", msg[i]);
@@ -816,6 +818,9 @@ static irqreturn_t wlbt_mbox_isr(int irq, void *data)
 		wlbt_mgmt_drain(w);
 	if (status & BIT(WLBT_BIT_HIP4_TO_HOST))
 		wlbt_hip4_drain(w);
+	if (w->bt && (status & (BIT(WLBT_BIT_BT_BG_TO_HOST) |
+				 BIT(WLBT_BIT_BT_FG_TO_HOST))))
+		wlbt_bt_irq(w->bt, status);
 
 	return IRQ_HANDLED;
 }
@@ -1524,6 +1529,19 @@ static int wlbt_probe(struct platform_device *pdev)
 
 	wlbt_boot(w);
 
+	/*
+	 * Register the HCI device after the peer's WLAN service is up: the BT
+	 * service start is part of the same firmware and needs the MIF heap that
+	 * wlbt_hip4_build() lays out.  The device stays down until userspace
+	 * opens it.
+	 */
+	w->bt = wlbt_bt_init(w);
+	if (IS_ERR(w->bt)) {
+		dev_warn(w->dev, "no Bluetooth interface: %ld\n",
+			 PTR_ERR(w->bt));
+		w->bt = NULL;
+	}
+
 	return 0;
 }
 
@@ -1531,6 +1549,8 @@ static void wlbt_remove(struct platform_device *pdev)
 {
 	struct exynos_wlbt *w = platform_get_drvdata(pdev);
 
+	wlbt_bt_exit(w->bt);
+	w->bt = NULL;
 	wlbt_unregister_wiphy(w);
 
 	mutex_lock(&w->lock);
