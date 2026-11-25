@@ -4,7 +4,7 @@ Mainline Linux support for the Samsung Galaxy A51, an Exynos 9611 phone.
 It boots into a full GPU-composited desktop: the kernel owns the display
 controller, the MIPI link and the AMOLED panel, the Mali-G72 runs under
 panfrost, and touchscreen, thermal sensors and the charger are all driven by
-mainline drivers.
+mainline drivers.  Wi-Fi station mode works as well, including WPA3.
 
 ![Weston desktop with Xwayland, htop and a Wayland terminal](screenshots/a51-desktop.png)
 
@@ -28,6 +28,7 @@ panel.*
 | RAM | 6 GB |
 | Display | 6.5" 1080x2400 AMOLED (Samsung EA8076), MIPI DSI, command mode |
 | Storage | UFS (Android), microSD |
+| Wi-Fi/Bluetooth | Samsung SCSC ("mx140") over HIP4, 2.4 and 5 GHz |
 | Power | Samsung SM5713 charger, fuel gauge and MUIC, S2MPU09 PMIC |
 | Input | Melfas mss100 touchscreen, GPIO keys |
 
@@ -46,6 +47,9 @@ Working:
 - **USB** - DWC3 peripheral mode, used here as an ECM gadget (the root
   filesystem runs over it).
 - **Storage** - microSD in non-UHS 50 MHz high-speed mode, UFS.
+- **Wi-Fi** - station mode on 2.4 and 5 GHz, WPA2-PSK and WPA3-SAE, DHCP,
+  and a join at boot with a saved connection.  ~90 Mbps on the LAN,
+  ~47 Mbps down and 36-42 Mbps up to the internet.
 - **Desktops** - Weston with Xwayland, Sway, Phosh and KDE Plasma Mobile all
   render on the panel.
 
@@ -59,7 +63,79 @@ Not supported yet:
 - **GPU DVFS** - no OPP table and no `mali-supply`, so the GPU clock is fixed.
 - **USB host / OTG** - the controller is fixed to peripheral mode. The boost
   and MUIC switching are in place, the role switch is not wired up yet.
-- Audio (ABOX), cameras, modem, WiFi/Bluetooth, NFC - untouched subsystems.
+- Audio (ABOX), cameras, modem, Bluetooth and NFC - untouched subsystems.
+
+## Wi-Fi
+
+The A51 has no SDIO or PCIe wireless interface: Wi-Fi and Bluetooth sit
+behind Samsung's SCSC ("mx140") block, which the host drives through a HIP4
+queue pair in DRAM and a mailbox.  `CONFIG_EXYNOS9610_WLBT` builds
+`exynos9610-wlbt.ko` from five translation units under
+`drivers/soc/samsung/` (core, HIP4, MLME, debugfs and netdev).
+
+On this port the module copies the firmware into the peer's MIF window
+itself, so `load_firmware=1` is required.  The three files the module asks
+for have to be in place (they come from the vendor partition):
+
+```sh
+install -D -m 0644 mx140.bin          /lib/firmware/mx140/mx140.bin
+install -D -m 0644 mx140_wlan.hcf     /lib/firmware/mx140/mx140_wlan.hcf
+install -D -m 0644 mx140_wlan_sw.hcf  /lib/firmware/mx140/mx140_wlan_sw.hcf
+```
+
+and the module has to be told to load them:
+
+```sh
+# /etc/modprobe.d/wlbt.conf
+options exynos9610_wlbt load_firmware=1 sae_support=1
+```
+
+`sae_support` is off at boot because advertising WPA3 changes what the peer
+does on every boot, and one failed join would then repeat forever.  WPA2
+does not need it; turn it on for a WPA3 network.
+
+Measured on the SM-A515F with 6.18.58, against a 5 GHz access point on
+channel 64:
+
+| test | result |
+| --- | --- |
+| `wpa_cli -i wlan0 status` | `wpa_state=COMPLETED`, `key_mgmt=SAE`, `mgmt_group_cipher=BIP` |
+| DHCP address | `192.168.100.78/24` |
+| ping | 33-36 ms |
+| LAN download | 10-11.5 MB/s (~90 Mbps) |
+| internet download | ~47 Mbps |
+| internet upload | 36-42 Mbps |
+| kernel log during a bulk transfer | 0 lines |
+| cold boot | joins with a saved connection, 0 firmware resets |
+
+Throughput was measured with `curl --interface wlan0` against a host HTTP
+server on the LAN and against an internet speed-test endpoint; the USB
+gadget carries the root filesystem, so naming the interface matters.
+
+For WPA3, the access point used here never answers the SAE H2E exchange;
+`sae_pwe=0` (hunting-and-pecking) is what completes:
+
+```ini
+# /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+sae_pwe=0
+network={
+        ssid="..."
+        psk="..."
+        key_mgmt=SAE
+        ieee80211w=1
+}
+```
+
+WPA2-PSK uses the same driver with `key_mgmt=WPA-PSK` and no `sae_pwe`.
+
+Limitations:
+
+- Bluetooth is not usable yet: the block is powered and the firmware runs,
+  but there is no HCI transport in this tree.
+- If the first join after boot does not finish within about a minute, the
+  firmware can assert its watchdog and stop.  A warm reboot leaves the
+  companion in that state; a cold boot clears it.
+- Only station mode has been exercised.
 
 ## Building
 
