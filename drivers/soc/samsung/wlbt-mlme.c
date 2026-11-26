@@ -1146,6 +1146,22 @@ int wlbt_mlme_setkeys(struct exynos_wlbt *w, u16 key_id, u16 key_type,
 			     const u8 *address, u32 cipher, const u8 *key,
 			     size_t key_len, const u8 *seq, size_t seq_len);
 
+/*
+ * Drop the peer's per-vif state after a join the peer refused or timed out.
+ * Leaving the half-built station behind is what lets its watchdog fire later;
+ * deleting the vif also lets the next connect create a clean one.
+ */
+static void wlbt_join_abort(struct exynos_wlbt *w)
+{
+	wlbt_unsync_vif_down(w);
+
+	if (w->vif_created) {
+		msleep(20);
+		wlbt_mlme_del_vif(w);
+		w->vif_created = false;
+	}
+}
+
 void wlbt_peer_work(struct work_struct *work)
 {
 	struct exynos_wlbt *w = container_of(work, struct exynos_wlbt, peer_work);
@@ -1201,11 +1217,22 @@ void wlbt_peer_work(struct work_struct *work)
 							      msecs_to_jiffies(120));
 				return;
 			}
+			bool was_connected = w->connected;
+
 			dev_info(w->dev, "connect: peer refused the join: 0x%04x\n",
 				 status);
+			wlbt_join_abort(w);
 			w->connecting = false;
-			cfg80211_disconnected(w->netdev, status, NULL, 0, true,
-					      GFP_KERNEL);
+			w->connected = false;
+			netif_carrier_off(w->netdev);
+			if (was_connected)
+				cfg80211_disconnected(w->netdev, status, NULL, 0,
+						      true, GFP_KERNEL);
+			else
+				cfg80211_connect_result(w->netdev, w->connect_bssid,
+							NULL, 0, NULL, 0,
+							WLAN_STATUS_UNSPECIFIED_FAILURE,
+							GFP_KERNEL);
 			return;
 		}
 
@@ -1313,6 +1340,9 @@ void wlbt_connect_work(struct work_struct *work)
 	dev_info(w->dev, "connect: failed, peer result 0x%04x%s\n",
 		 w->connect_status,
 		 w->connect_reported ? "" : " (no indication)");
+	wlbt_join_abort(w);
+	w->connected = false;
+	netif_carrier_off(w->netdev);
 	cfg80211_connect_result(w->netdev, w->connect_bssid, NULL, 0, NULL, 0,
 				WLAN_STATUS_UNSPECIFIED_FAILURE, GFP_KERNEL);
 }
