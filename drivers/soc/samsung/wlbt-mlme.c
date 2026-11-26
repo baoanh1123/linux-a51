@@ -263,6 +263,8 @@ void wlbt_peer_gone_work(struct work_struct *work)
 	w->connect_res_sent = false;
 	w->vif_created = false;
 	w->port_authorized = false;
+	w->post_connect_done = false;
+	wlbt_eapol_purge(w);
 	w->unsync_vif = false;
 	w->peer_dead = true;
 	if (w->netdev)
@@ -1153,6 +1155,8 @@ int wlbt_mlme_setkeys(struct exynos_wlbt *w, u16 key_id, u16 key_type,
  */
 static void wlbt_join_abort(struct exynos_wlbt *w)
 {
+	w->post_connect_done = false;
+	wlbt_eapol_purge(w);
 	wlbt_unsync_vif_down(w);
 
 	if (w->vif_created) {
@@ -1266,6 +1270,8 @@ void wlbt_peer_work(struct work_struct *work)
 		wlbt_trace(w, "peer_work: setting cached channels");
 		wlbt_mlme_set_cached_channels(w);
 		wlbt_trace(w, "peer_work: post-connect commands done");
+		w->post_connect_done = true;
+		wlbt_eapol_drain(w);
 	}
 
 	if (cted && !netif_carrier_ok(w->netdev)) {
@@ -1293,6 +1299,8 @@ void wlbt_peer_work(struct work_struct *work)
 		}
 		w->connected = false;
 		w->connecting = false;
+		w->post_connect_done = false;
+		wlbt_eapol_purge(w);
 		netif_carrier_off(w->netdev);
 		dev_info(w->dev, "connect: peer lost the link, reason %u (was %s)\n",
 			 reason, was_connected ? "connected" : "connecting");
@@ -1355,6 +1363,8 @@ static int wlbt_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 
 	if (w->peer_dead)
 		return -EIO;
+	w->post_connect_done = false;
+	wlbt_eapol_purge(w);
 	struct cfg80211_bss *bss;
 	u8 bssid[ETH_ALEN];
 	u16 freq = 2437;
@@ -1551,6 +1561,8 @@ static int wlbt_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	w->connecting = false;
 	w->connected = false;
 	w->port_authorized = false;
+	w->post_connect_done = false;
+	wlbt_eapol_purge(w);
 	netif_carrier_off(ndev);
 
 	if (was_connected)

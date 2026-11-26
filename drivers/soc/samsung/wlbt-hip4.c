@@ -1200,6 +1200,39 @@ static void wlbt_mib_capture(struct exynos_wlbt *w, u32 ref)
 	w->mibresp_len = len;
 }
 
+#define WLBT_EAPOL_HOLD_MAX	16
+
+/*
+ * The peer starts the four-way handshake before its own post-connect
+ * housekeeping has finished.  Passing message 1 up immediately lets the
+ * supplicant answer it while the peer is still busy with the packet filter,
+ * ACL and cached-channel requests, and the firmware occasionally asks for a
+ * reset right there.  Hold EAPOL until peer_work has sent those requests; the
+ * supplicant then runs the handshake against a peer that is listening again.
+ */
+static void wlbt_eapol_hold(struct exynos_wlbt *w, struct sk_buff *skb)
+{
+	if (skb_queue_len(&w->eapol_hold) >= WLBT_EAPOL_HOLD_MAX) {
+		kfree_skb(skb);
+		return;
+	}
+
+	skb_queue_tail(&w->eapol_hold, skb);
+}
+
+void wlbt_eapol_drain(struct exynos_wlbt *w)
+{
+	struct sk_buff *skb;
+
+	while ((skb = skb_dequeue(&w->eapol_hold)))
+		netif_rx(skb);
+}
+
+void wlbt_eapol_purge(struct exynos_wlbt *w)
+{
+	skb_queue_purge(&w->eapol_hold);
+}
+
 static void wlbt_rx_frame(struct exynos_wlbt *w, const void *data, size_t len)
 {
 	struct sk_buff *skb;
@@ -1221,6 +1254,12 @@ static void wlbt_rx_frame(struct exynos_wlbt *w, const void *data, size_t len)
 			 len, ntohs(skb->protocol));
 	w->netdev->stats.rx_packets++;
 	w->netdev->stats.rx_bytes += len;
+
+	if (skb->protocol == htons(ETH_P_PAE) && !w->post_connect_done) {
+		wlbt_eapol_hold(w, skb);
+		return;
+	}
+
 	netif_rx(skb);
 }
 

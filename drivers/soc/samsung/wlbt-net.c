@@ -268,6 +268,7 @@ int wlbt_register_wiphy(struct exynos_wlbt *w)
 	INIT_WORK(&w->stall_report, wlbt_stall_report);
 	mod_timer(&w->stall_timer, jiffies + msecs_to_jiffies(500));
 	INIT_WORK(&w->peer_work, wlbt_peer_work);
+	skb_queue_head_init(&w->eapol_hold);
 	INIT_WORK(&w->peer_gone_work, wlbt_peer_gone_work);
 	INIT_WORK(&w->sae_work, wlbt_sae_work);
 	spin_lock_init(&w->sae_q_lock);

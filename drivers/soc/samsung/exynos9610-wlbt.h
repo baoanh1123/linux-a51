@@ -65,6 +65,7 @@
 #include <linux/inet.h>
 #include <net/cfg80211.h>
 #include <linux/slab.h>
+#include <linux/skbuff.h>
 
 /* PMU (0x11860000) - WLBT power and reset control, Exynos 9610 UM 9.6.6. */
 #define WLBT_CTRL_NS			0x0050	/* non-secure control */
@@ -774,6 +775,9 @@ struct exynos_wlbt {
 	/* Which store inside the send was in flight when the deadline passed. */
 	unsigned int stall_phase;
 	struct work_struct peer_work;	/* answers the connect indications */
+	/* EAPOL that arrived while the post-connect housekeeping was still running. */
+	struct sk_buff_head eapol_hold;
+	bool post_connect_done;
 	unsigned long scan_done;	/* when the last scan finished */
 	bool port_authorized;	/* the peer has a pairwise key, so data may flow */
 	unsigned int n_tx_unauthed;	/* frames dropped before the 4-way finished */
@@ -1126,6 +1130,8 @@ void wlbt_sae_work(struct work_struct *work);
 void wlbt_scan_rep_work(struct work_struct *work);
 void wlbt_scan_work(struct work_struct *work);
 void wlbt_peer_work(struct work_struct *work);
+void wlbt_eapol_drain(struct exynos_wlbt *w);
+void wlbt_eapol_purge(struct exynos_wlbt *w);
 void wlbt_connect_work(struct work_struct *work);
 void wlbt_peer_gone_work(struct work_struct *work);
 void wlbt_stall_report(struct work_struct *work);
