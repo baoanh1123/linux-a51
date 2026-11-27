@@ -165,6 +165,36 @@ from the Android `efs` partition (`/bluetooth/bt_addr`).  The SM-A515F file
 contains `C0:D2:DD:24:44:94`.  `bt_addr=` overrides it; if the file is missing
 the driver keeps a placeholder and warns.
 
+The audio graph starts at boot as the root user.  Debian's PipeWire and
+WirePlumber user units carry `ConditionUser=!root`, and WirePlumber's default
+profile waits for a logind seat to become active.  This port has neither a
+non-root session nor an active seat at boot, so the units need these drop-ins:
+
+```sh
+# /etc/systemd/user/pipewire.service.d/root.conf
+# /etc/systemd/user/pipewire-pulse.service.d/root.conf
+# /etc/systemd/user/wireplumber.service.d/root.conf
+[Unit]
+ConditionUser=
+```
+
+```sh
+# /etc/systemd/user/wireplumber.service.d/embedded.conf
+[Service]
+ExecStart=
+ExecStart=/usr/bin/wireplumber -p main-embedded
+```
+
+Then enable the root session's units and lingering:
+
+```sh
+loginctl enable-linger root
+systemctl --user enable --now pipewire pipewire-pulse wireplumber
+```
+
+The `main-embedded` profile disables seat monitoring, so the BlueZ monitor
+registers A2DP sink/source, AVRCP and HFP without a logind seat.
+
 Verified on the SM-A515F:
 
 | test | result |
@@ -174,7 +204,8 @@ Verified on the SM-A515F:
 | `bluetoothctl advertise on` | one active advertising instance |
 | host `bluetoothctl pair` over BR/EDR | `Pairing successful`; both sides bonded and trusted |
 | host SDP stress over BR/EDR | 80/80 requests on one link; 200/200 while 40 LE GATT reads ran |
-| host A2DP stream to phone | 5 s stream on `a2dp-duplex`; phone sink `RUNNING`, `dmesg` clean |
+| host A2DP stream to phone | 6 s host stream; phone `bluez_input...` → Dummy Output `RUNNING`, no Bluetooth errors |
+| cold boot, host reconnect, A2DP stream | services active, bond and profiles persist, phone sink `RUNNING` |
 | host LE link, 80 GATT reads | 80 `Device Name` responses on one connection, no ACL stall |
 | reboot, host LE link, 40 GATT reads | 40 responses; address, bond and HCI startup persist |
 | three `hciconfig hci0 down` / `up` cycles | adapter returns to `UP RUNNING` each time |
@@ -182,9 +213,10 @@ Verified on the SM-A515F:
 
 Limitations:
 
-- A2DP playback over the ACL transport works when PipeWire/WirePlumber are
-  started manually; it is not enabled at boot.  SCO/HFP audio, AVDTP
-  coexistence detection and vendor-specific HCI commands are not implemented.
+- A2DP sink/source are registered at boot and a host stream reaches the
+  phone's `bluez_input` node, but there is no ABOX/audio hardware yet, so it
+  plays into `Dummy Output`.  SCO/HFP audio, AVDTP coexistence detection and
+  vendor-specific HCI commands are not implemented.
 - LE SMP pairing was not completed in the host tests; BR/EDR pairing and an
   unpaired LE GATT link are validated.
 - `l2ping` stops with `Connection reset by peer` after four or five echoes in
