@@ -52,8 +52,8 @@ Working:
   and a join at boot with a saved connection.  ~90 Mbps on the LAN,
   ~47 Mbps down and 36-42 Mbps up to the internet.
 - **Bluetooth** - BSMHCP HCI transport, LE and BR/EDR discovery, LE
-  advertising and ACL data.  BlueZ powers the adapter at boot; no manual
-  `hciconfig` step is needed.
+  advertising, LE Secure Connections pairing and bonds, and ACL data.
+  BlueZ powers the adapter at boot; no manual `hciconfig` step is needed.
 - **Desktops** - Weston with Xwayland, Sway, Phosh and KDE Plasma Mobile all
   render on the panel.
 
@@ -160,6 +160,21 @@ enabled; `exynos9610_wlbt` then depends on `bluetooth.ko`,
 `ecdh_generic.ko` and `ecc.ko`.  All are installed in the rootfs module
 tree, and `/etc/modules-load.d/wlbt.conf` loads the transport at boot.
 
+Secure Connections also needs the default DRBG.  The kernel builds
+`CONFIG_CRYPTO_RNG_DEFAULT`, `CONFIG_CRYPTO_DRBG` and
+`CONFIG_CRYPTO_JITTERENTROPY` as modules, so `drbg.ko` has to be installed
+and loaded as well:
+
+```sh
+cp crypto/drbg.ko /lib/modules/$(uname -r)/kernel/crypto/
+depmod -a
+printf 'drbg\n' > /etc/modules-load.d/bluetooth-crypto.conf
+```
+
+Without `drbg.ko`, the controller completes legacy LE pairing but
+`generate_ecdh_keys()` fails, the phone never sends its P-256 public key,
+and the host logs `Pairing Failed` with reason `Unspecified (0x08)`.
+
 The address is read at probe time from `mx140/bt_addr`, an ASCII file copied
 from the Android `efs` partition (`/bluetooth/bt_addr`).  The SM-A515F file
 contains `C0:D2:DD:24:44:94`.  `bt_addr=` overrides it; if the file is missing
@@ -207,6 +222,8 @@ Verified on the SM-A515F:
 | host A2DP stream to phone | 6 s host stream; phone `bluez_input...` → Dummy Output `RUNNING`, no Bluetooth errors |
 | cold boot, host reconnect, A2DP stream | services active, bond and profiles persist, phone sink `RUNNING` |
 | host LE link, 80 GATT reads | 80 `Device Name` responses on one connection, no ACL stall |
+| host LE Secure Connections pair | `Pairing successful`; both P-256 public keys and DHKey checks present, AES-CCM encryption enabled, bond saved |
+| host LE reconnect with saved bond | existing SC bond reconnects without re-pairing |
 | reboot, host LE link, 40 GATT reads | 40 responses; address, bond and HCI startup persist |
 | three `hciconfig hci0 down` / `up` cycles | adapter returns to `UP RUNNING` each time |
 | reboot with WPA3 AP | Bluetooth and Wi-Fi both come up hands-free |
@@ -217,8 +234,8 @@ Limitations:
   phone's `bluez_input` node, but there is no ABOX/audio hardware yet, so it
   plays into `Dummy Output`.  SCO/HFP audio, AVDTP coexistence detection and
   vendor-specific HCI commands are not implemented.
-- LE SMP pairing was not completed in the host tests; BR/EDR pairing and an
-  unpaired LE GATT link are validated.
+- LE Secure Connections requires `drbg.ko`; legacy LE pairing works without
+  it, but SC fails before the phone sends its public key.
 - `l2ping` stops with `Connection reset by peer` after four or five echoes in
   either direction.  A long GATT session is used for ACL credit coverage
   instead; the reset appears to be in the L2CAP echo path, not the HCI rings.
