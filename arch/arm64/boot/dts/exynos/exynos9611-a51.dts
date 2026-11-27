@@ -72,7 +72,7 @@
 		cap-sd-highspeed;
 		supports-4bit;
 		supports-cmd23;
-		samsung,dw-mshc-ciu-div = <3>;
+		samsung,dw-mshc-ciu-div = <1>;
 		samsung,dw-mshc-sdr-timing = <0 2>;
 		samsung,dw-mshc-ddr-timing = <0 0>;
 		pinctrl-names = "default";

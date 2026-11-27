@@ -141,7 +141,14 @@ static int dw_mci_exynos_priv_init(struct dw_mci *host)
 	host->desc_sz = priv->desc_sz ? priv->desc_sz : 1;
 
 	if (priv->ctrl_type == DW_MCI_TYPE_EXYNOS9611) {
-		host->bus_hz /= priv->ciu_div + 1;
+		/*
+		 * The 9611 controller takes cclk_in from the 40 MHz
+		 * sdclkin path divided by ciu_div + 1, not from the
+		 * 800 MHz ciu clock.  Derive bus_hz from that real input
+		 * so CLKDIV is programmed for the actual card clock.  The
+		 * A51 uses ciu_div = 1, giving a 20 MHz input.
+		 */
+		host->bus_hz = 40000000 / (priv->ciu_div + 1);
 		return 0;
 	}
 
