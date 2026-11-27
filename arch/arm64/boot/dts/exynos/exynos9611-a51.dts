@@ -31,14 +31,14 @@
 		/*
 		 * The card clock path is gout_fsys_mmc_card (800 MHz) ->
 		 * dout_fsys_mmc_card -> sdclkin -> ciu divider.  Run
-		 * sdclkin at 100 MHz; ciu_div = 1 then gives the 50 MHz
-		 * cclk_in needed for UHS SDR50.  The first assigned rate
+		 * sdclkin at 200 MHz; ciu_div = 1 then gives the 100 MHz
+		 * cclk_in needed for UHS SDR104.  The first assigned rate
 		 * is zero because the mux itself is not rate-controlled.
 		 */
 		assigned-clocks = <&cmu_top CLK_TOP_MOUT_FSYS_MMC_CARD>,
 				   <&cmu_top CLK_TOP_DOUT_FSYS_MMC_CARD>;
 		assigned-clock-parents = <&cmu_top CLK_TOP_FOUT_MMC_PLL>;
-		assigned-clock-rates = <0 100000000>;
+		assigned-clock-rates = <0 200000000>;
 		interrupts = <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>;
 		fifo-depth = <64>;
 		desc-size = <4>;
@@ -57,14 +57,15 @@
 		vqmmc-supply = <&vqmmc_reg>;
 		bus-width = <4>;
 		/*
-		 * UHS-I SDR50 at 1.8 V.  CMD11 switches vqmmc (LDO2)
-		 * to 1.8 V and the controller drives UHS_REG[0].
-		 * SDR104 would need 200 MHz sdclkin and is not enabled.
+		 * UHS-I SDR50/SDR104 at 1.8 V.  CMD11 switches vqmmc
+		 * (LDO2) to 1.8 V and the controller drives UHS_REG[0].
+		 * Field reports so far use SDR104 at 100 MHz.
 		 */
-		max-frequency = <50000000>;
+		max-frequency = <100000000>;
 		disable-wp;
 		cap-sd-highspeed;
 		sd-uhs-sdr50;
+		sd-uhs-sdr104;
 		supports-4bit;
 		supports-cmd23;
 		samsung,dw-mshc-ciu-div = <1>;

@@ -743,12 +743,13 @@ static const struct dw_mci_drv_data exynos_drv_data = {
 };
 
 /*
- * Slot capabilities for Exynos 9610/9611.  UHS-I SDR50 is enabled:
- * the CMD11 -> vqmmc 1.8 V switch and execute_tuning are both wired.
- * SDR104 still needs a 200 MHz sdclkin path and is not advertised.
+ * Slot capabilities for Exynos 9610/9611.  UHS-I SDR50 and SDR104 are
+ * enabled: the CMD11 -> vqmmc 1.8 V switch and execute_tuning are both
+ * wired, and sdclkin is 200 MHz so the bus can run at 100 MHz.
  */
 static unsigned long exynos9611_dwmmc_caps[4] = {
-	MMC_CAP_1_8V_DDR | MMC_CAP_8_BIT_DATA | MMC_CAP_UHS_SDR50,
+	MMC_CAP_1_8V_DDR | MMC_CAP_8_BIT_DATA | MMC_CAP_UHS_SDR50 |
+	MMC_CAP_UHS_SDR104,
 	0,
 	0,
 	0,
