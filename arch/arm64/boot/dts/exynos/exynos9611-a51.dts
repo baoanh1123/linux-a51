@@ -31,14 +31,18 @@
 		/*
 		 * The card clock path is gout_fsys_mmc_card (800 MHz) ->
 		 * dout_fsys_mmc_card -> sdclkin -> ciu divider.  Run
-		 * sdclkin at 200 MHz; ciu_div = 1 then gives the 100 MHz
-		 * cclk_in needed for UHS SDR104.  The first assigned rate
-		 * is zero because the mux itself is not rate-controlled.
+		 * dout/sdclkin at 400 MHz; ciu_div = 1 then gives a
+		 * 200 MHz bus clock, so a 100 MHz SDR104 card clock uses
+		 * CLKDIV = 1.  Do not lower this to 200 MHz: that makes
+		 * 100 MHz need CLKDIV = 0, and CLKDIV = 0 deterministically
+		 * trips the WLBT firmware watchdog at the first EAPOL frame.
+		 * The first assigned rate is zero because the mux itself is
+		 * not rate-controlled.
 		 */
 		assigned-clocks = <&cmu_top CLK_TOP_MOUT_FSYS_MMC_CARD>,
 				   <&cmu_top CLK_TOP_DOUT_FSYS_MMC_CARD>;
 		assigned-clock-parents = <&cmu_top CLK_TOP_FOUT_MMC_PLL>;
-		assigned-clock-rates = <0 200000000>;
+		assigned-clock-rates = <0 400000000>;
 		interrupts = <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>;
 		fifo-depth = <64>;
 		desc-size = <4>;
