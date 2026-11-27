@@ -47,6 +47,7 @@ struct dw_mci_exynos_priv_data {
 	u32				saved_dqs_en;
 	u32				saved_strobe_ctrl;
 	unsigned int			desc_sz;
+	struct clk			*sdclkin_clk;
 };
 
 static bool dw_mci_exynos_uses_clksel64(struct dw_mci_exynos_priv_data *priv)
@@ -142,13 +143,21 @@ static int dw_mci_exynos_priv_init(struct dw_mci *host)
 
 	if (priv->ctrl_type == DW_MCI_TYPE_EXYNOS9611) {
 		/*
-		 * The 9611 controller takes cclk_in from the 40 MHz
-		 * sdclkin path divided by ciu_div + 1, not from the
-		 * 800 MHz ciu clock.  Derive bus_hz from that real input
-		 * so CLKDIV is programmed for the actual card clock.  The
-		 * A51 uses ciu_div = 1, giving a 20 MHz input.
+		 * The 9611 controller takes cclk_in from the sdclkin gate
+		 * divided by ciu_div + 1, not from the 800 MHz ciu clock.
+		 * Derive bus_hz from that real input so CLKDIV matches the
+		 * card clock after the CMU divider is raised for UHS.
 		 */
-		host->bus_hz = 40000000 / (priv->ciu_div + 1);
+		priv->sdclkin_clk = devm_clk_get(host->dev, "sdclkin");
+		if (IS_ERR(priv->sdclkin_clk))
+			return dev_err_probe(host->dev, PTR_ERR(priv->sdclkin_clk),
+					     "failed to get sdclkin clock\n");
+
+		host->bus_hz = clk_get_rate(priv->sdclkin_clk) /
+			       (priv->ciu_div + 1);
+		dev_info(host->dev, "sdclkin=%lu ciu_div=%u bus_hz=%u\n",
+			 clk_get_rate(priv->sdclkin_clk), priv->ciu_div,
+			 host->bus_hz);
 		return 0;
 	}
 
@@ -734,14 +743,12 @@ static const struct dw_mci_drv_data exynos_drv_data = {
 };
 
 /*
- * Slot capabilities for Exynos 9610/9611.  UHS-I is deliberately not advertised:
- * the 1.8 V switch fails on this board (see the vqmmc/no-1-8-v comment in
- * exynos9611-a51.dts) and the microSD is the boot medium.  Add
- * MMC_CAP_UHS_SDR50 and MMC_CAP_1_8V_DDR only together with a working
- * CMD11/tuning path, never on their own.
+ * Slot capabilities for Exynos 9610/9611.  UHS-I SDR50 is enabled:
+ * the CMD11 -> vqmmc 1.8 V switch and execute_tuning are both wired.
+ * SDR104 still needs a 200 MHz sdclkin path and is not advertised.
  */
 static unsigned long exynos9611_dwmmc_caps[4] = {
-	MMC_CAP_1_8V_DDR | MMC_CAP_8_BIT_DATA,
+	MMC_CAP_1_8V_DDR | MMC_CAP_8_BIT_DATA | MMC_CAP_UHS_SDR50,
 	0,
 	0,
 	0,
@@ -754,6 +761,7 @@ static const struct dw_mci_drv_data exynos9611_drv_data = {
 	.set_ios		= dw_mci_exynos_set_ios,
 	.hwacg_control		= dw_mci_exynos_hwacg_control,
 	.parse_dt		= dw_mci_exynos_parse_dt,
+	.execute_tuning		= dw_mci_exynos_execute_tuning,
 	.dump_debug_regs	= dw_mci_exynos_dump_debug_regs,
 	.set_data_timeout	= dw_mci_exynos_set_data_timeout,
 	.get_drto_clks		= dw_mci_exynos_get_drto_clks,

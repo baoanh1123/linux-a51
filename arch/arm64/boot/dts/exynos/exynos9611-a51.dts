@@ -29,18 +29,16 @@
 			 <&cmu_fsys CLK_FSYS_GOUT_MMC_CARD_QCH>;
 		clock-names = "biu", "ciu", "sdclkin", "qch";
 		/*
-		 * Match the vendor identification setup: downstream reports
-		 * "Bus speed = 24999996Hz (slot req 400000Hz, actual 390624Hz
-		 * div = 32)" for CMD8/ACMD41, i.e. a ~25 MHz CIU with CLKDIV 32,
-		 * and only raises the CIU per speed mode through its ciu_clkin
-		 * table. mainline keeps a fixed CIU, and the composite clock's
-		 * divider is read-only, so selecting a rate alone does nothing;
-		 * select the 26 MHz oscillator on the MMC card mux instead.
-		 * That switching per speed mode is the missing feature to
-		 * implement once identification works.
+		 * The card clock path is gout_fsys_mmc_card (800 MHz) ->
+		 * dout_fsys_mmc_card -> sdclkin -> ciu divider.  Run
+		 * sdclkin at 100 MHz; ciu_div = 1 then gives the 50 MHz
+		 * cclk_in needed for UHS SDR50.  The first assigned rate
+		 * is zero because the mux itself is not rate-controlled.
 		 */
-		assigned-clocks = <&cmu_top CLK_TOP_MOUT_FSYS_MMC_CARD>;
+		assigned-clocks = <&cmu_top CLK_TOP_MOUT_FSYS_MMC_CARD>,
+				   <&cmu_top CLK_TOP_DOUT_FSYS_MMC_CARD>;
 		assigned-clock-parents = <&cmu_top CLK_TOP_FOUT_MMC_PLL>;
+		assigned-clock-rates = <0 100000000>;
 		interrupts = <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>;
 		fifo-depth = <64>;
 		desc-size = <4>;
@@ -59,21 +57,19 @@
 		vqmmc-supply = <&vqmmc_reg>;
 		bus-width = <4>;
 		/*
-		 * High Speed only.  UHS-I was tried and parked: the CMD11
-		 * switch fails with the S2MPU09 vqmmc rail ("SD UHS voltage
-		 * switch err=-11", then "CMD8 failure", so card enumeration
-		 * fails).  Never re-enable sd-uhs-* without a working 1.8 V
-		 * switch and tuning: this card is the boot medium and the
-		 * failure mode is an unbootable board.
+		 * UHS-I SDR50 at 1.8 V.  CMD11 switches vqmmc (LDO2)
+		 * to 1.8 V and the controller drives UHS_REG[0].
+		 * SDR104 would need 200 MHz sdclkin and is not enabled.
 		 */
 		max-frequency = <50000000>;
-		no-1-8-v;
 		disable-wp;
 		cap-sd-highspeed;
+		sd-uhs-sdr50;
 		supports-4bit;
 		supports-cmd23;
 		samsung,dw-mshc-ciu-div = <1>;
 		samsung,dw-mshc-sdr-timing = <0 2>;
+		samsung,dw-mshc-sdr50-timing = <0 2>;
 		samsung,dw-mshc-ddr-timing = <0 0>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&dwmmc2_cd_ext_irq &sd2_clk &sd2_cmd &sd2_bus1

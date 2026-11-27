@@ -43,6 +43,7 @@
 #define S2MPU09_LDO_ENABLE_VAL		GENMASK(7, 6)
 #define S2MPU09_LDO_VSEL_MASK		GENMASK(5, 0)
 #define S2MPU09_LDO_N_VOLTAGES		BIT(6)
+#define S2MPU09_XFER_RETRIES		5
 
 struct s2mpu09_regulator {
 	struct acpm_handle *acpm;
@@ -53,17 +54,33 @@ struct s2mpu09_regulator {
 static int s2mpu09_read(struct s2mpu09_regulator *reg, u8 *val)
 {
 	const struct acpm_pmic_ops *ops = &reg->acpm->ops.pmic_ops;
+	int ret, i;
 
-	return ops->read_reg(reg->acpm, S2MPU09_PMIC_CHAN,
-			     S2MPU09_PMIC_TYPE, reg->ctrl_reg, 0, val);
+	for (i = 0; i < S2MPU09_XFER_RETRIES; i++) {
+		ret = ops->read_reg(reg->acpm, S2MPU09_PMIC_CHAN,
+				    S2MPU09_PMIC_TYPE, reg->ctrl_reg, 0, val);
+		if (ret != -EAGAIN)
+			break;
+		usleep_range(1000, 2000);
+	}
+
+	return ret;
 }
 
 static int s2mpu09_write(struct s2mpu09_regulator *reg, u8 val)
 {
 	const struct acpm_pmic_ops *ops = &reg->acpm->ops.pmic_ops;
+	int ret, i;
 
-	return ops->write_reg(reg->acpm, S2MPU09_PMIC_CHAN,
-			      S2MPU09_PMIC_TYPE, reg->ctrl_reg, 0, val);
+	for (i = 0; i < S2MPU09_XFER_RETRIES; i++) {
+		ret = ops->write_reg(reg->acpm, S2MPU09_PMIC_CHAN,
+				     S2MPU09_PMIC_TYPE, reg->ctrl_reg, 0, val);
+		if (ret != -EAGAIN)
+			break;
+		usleep_range(1000, 2000);
+	}
+
+	return ret;
 }
 
 static int s2mpu09_update_bits(struct s2mpu09_regulator *reg, u8 mask, u8 val)
@@ -113,6 +130,15 @@ static int s2mpu09_ldo_set_voltage_sel(struct regulator_dev *rdev,
 				       unsigned int sel)
 {
 	struct s2mpu09_regulator *reg = rdev_get_drvdata(rdev);
+	u8 old;
+	int ret;
+
+	ret = s2mpu09_read(reg, &old);
+	if (ret)
+		return ret;
+
+	dev_info(rdev_get_dev(rdev), "set vsel=%u old=%#04x\n",
+		 sel, old);
 
 	return s2mpu09_update_bits(reg, S2MPU09_LDO_VSEL_MASK, sel);
 }
