@@ -17,6 +17,7 @@
 #include <linux/firmware.h>
 #include <linux/skbuff.h>
 #include "exynos9610-wlbt.h"
+#include "exynos9610-abox-bt.h"
 
 #if IS_ENABLED(CONFIG_BT)
 #include <net/bluetooth/bluetooth.h>
@@ -228,6 +229,7 @@ struct wlbt_bt {
 	u32 bsmhcp_ref;
 	u32 config_ref;
 	u32 config_len;
+	u32 abox_ref;
 	u64 addr;
 	bool started;
 	unsigned long tx_used[BITS_TO_LONGS(BSMHCP_ACL_TX_BUFFERS)];
@@ -515,6 +517,15 @@ static int wlbt_bt_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		err = bt_send_cmd(bt, skb);
 	} else if (hci_skb_pkt_type(skb) == HCI_ACLDATA_PKT) {
 		err = bt_send_acl(bt, skb, &credit);
+	} else if (hci_skb_pkt_type(skb) == HCI_SCODATA_PKT) {
+		/*
+		 * The SCO audio path is the ABOX shared-memory interface, not
+		 * the BSMHCP rings (the vendor protocol has no SCO ring).  The
+		 * host still has to accept the packet so that the HCI core and
+		 * BlueZ can drive the synchronous link; drop the samples here.
+		 */
+		kfree_skb(skb);
+		err = 0;
 	} else {
 		err = -EOPNOTSUPP;
 	}
@@ -707,6 +718,7 @@ static int wlbt_bt_start(struct wlbt_bt *bt)
 	struct exynos_wlbt *w = bt->w;
 	struct bsmhcp_header __iomem *hdr;
 	struct bhcs __iomem *bhcs;
+	struct scsc_bt_audio_abox __iomem *abox;
 	u32 hdr_off;
 	u8 frame[7] = { MMTRANS_CHAN_ID_SERVICE_MANAGEMENT, BSMHCP_SERVICE_ID_BT,
 			 BSMHCP_SM_MSG_START_REQ };
@@ -733,7 +745,10 @@ static int wlbt_bt_start(struct wlbt_bt *bt)
 	if (!bt->bsmhcp_ref)
 		bt->bsmhcp_ref = wlbt_heap_alloc_aligned(w, sizeof(struct bsmhcp_protocol),
 						  BSMHCP_ALIGNMENT);
-	if (!bt->bhcs_ref || !bt->bsmhcp_ref) {
+	if (!bt->abox_ref)
+		bt->abox_ref = wlbt_heap_alloc_aligned(w,
+					sizeof(struct scsc_bt_audio_abox), 4096);
+	if (!bt->bhcs_ref || !bt->bsmhcp_ref || !bt->abox_ref) {
 		err = -ENOMEM;
 		goto out;
 	}
@@ -771,6 +786,29 @@ static int wlbt_bt_start(struct wlbt_bt *bt)
 	hdr->cmd_evt_buffer_size = cpu_to_le32(BSMHCP_CMD_EVT_BUFFER_SIZE);
 	hdr->acl_tx_buffers = cpu_to_le32(BSMHCP_ACL_TX_BUFFERS);
 	hdr->firmware_control = 0;
+
+	/* The BT firmware finds this through the BSMHCP header.  The ABOX driver
+	 * maps the same buffer into the ABOX SysMMU at IOVA_BLUETOOTH.
+	 */
+	abox = w->dram + bt->abox_ref;
+	memset_io(abox, 0, sizeof(*abox));
+	abox->magic_value = cpu_to_le32(SCSC_BT_AUDIO_ABOX_MAGIC_VALUE);
+	abox->version_major = cpu_to_le16(SCSC_BT_AUDIO_ABOX_VERSION_MAJOR);
+	abox->version_minor = cpu_to_le16(SCSC_BT_AUDIO_ABOX_VERSION_MINOR);
+	abox->abox_to_bt_streaming_if_0_size = cpu_to_le32(SCSC_BT_AUDIO_ABOX_IF_0_SIZE);
+	abox->abox_to_bt_streaming_if_1_size = cpu_to_le32(SCSC_BT_AUDIO_ABOX_IF_1_SIZE);
+	abox->abox_to_bt_streaming_if_1_offset = cpu_to_le32(SCSC_BT_AUDIO_ABOX_IF_0_SIZE);
+	abox->bt_to_abox_streaming_if_0_size = cpu_to_le32(SCSC_BT_AUDIO_ABOX_IF_0_SIZE);
+	abox->bt_to_abox_streaming_if_1_size = cpu_to_le32(SCSC_BT_AUDIO_ABOX_IF_1_SIZE);
+	abox->bt_to_abox_streaming_if_1_offset = cpu_to_le32(SCSC_BT_AUDIO_ABOX_IF_0_SIZE);
+	hdr->abox_offset = cpu_to_le32(bt->abox_ref);
+	hdr->abox_length = cpu_to_le32(sizeof(struct scsc_bt_audio_abox));
+	wmb();
+
+	if (exynos9610_abox_bt_register(w->mem_base + bt->abox_ref,
+					sizeof(struct scsc_bt_audio_abox),
+					bt->abox_ref))
+		dev_warn(w->dev, "ABOX BT SCO buffer not registered\n");
 
 	bitmap_zero(bt->tx_used, BSMHCP_ACL_TX_BUFFERS);
 	memset(bt->l2cap_remaining, 0, sizeof(bt->l2cap_remaining));
@@ -941,6 +979,17 @@ struct wlbt_bt *wlbt_bt_init(struct exynos_wlbt *w)
 	bt->hdev->acl_pkts = BSMHCP_ACL_TX_BUFFERS;
 	bt->hdev->le_mtu = 251;
 	bt->hdev->le_pkts = BSMHCP_ACL_TX_BUFFERS;
+
+	/*
+	 * The peer reports no SCO buffers because SCO audio never crosses
+	 * BSMHCP.  Advertise a normal eSCO buffer set so the HCI core can
+	 * negotiate the synchronous link; wlbt_bt_hci_send() drops the
+	 * samples and the ABOX moves them between the codec and the BT
+	 * firmware.
+	 */
+	bt->hdev->sco_mtu = 64;
+	bt->hdev->sco_pkts = 8;
+	hci_set_quirk(bt->hdev, HCI_QUIRK_FIXUP_BUFFER_SIZE);
 	SET_HCIDEV_DEV(bt->hdev, w->dev);
 	hci_set_drvdata(bt->hdev, bt);
 

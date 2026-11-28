@@ -261,6 +261,26 @@
 		};
 
 		/*
+		 * ABOX firmware DRAM.  The ABOX CPU sees this through its
+		 * SysMMU at IOVA 0x80000000; the identity mapping is set up by
+		 * the ABOX driver before the firmware is started.
+		 */
+		abox_fw: abox-fw@80000000 {
+			reg = <0x0 0x80000000 0x1200000>;
+			no-map;
+		};
+
+		/*
+		 * VSS shared memory used by the ABOX firmware.  Its physical
+		 * base matches the downstream shmem node (0xf0000000 + 0x7900000)
+		 * and must not be handed out to the Linux allocator.
+		 */
+		vss_reserved: vss@f7900000 {
+			reg = <0x0 0xf7900000 0x700000>;
+			no-map;
+		};
+
+		/*
 		 * Contiguous pool for the display driver's GEM buffers.  The DPU
 		 * IDMA channel takes plain 32-bit physical addresses, so scanout
 		 * buffers have to be contiguous.  A 1080x2400 XRGB8888 frame is
@@ -500,29 +520,90 @@
 };
 
 /*
- * Thermal zone.  The TMU block carries several sensing points across the
- * BIG, LITTLE, G3D and ISP channels; the driver reports the hottest of the
- * live ones, so a single zone covers the whole SoC.  Per-channel zones need
- * the channel/sensing point mapping, which is not established yet.
+ * Thermal zones.  The vendor TMU channel map is G3D=0, LITTLE=1, BIG=2,
+ * ISP=3.  GPU load drives point 0 hardest and CPU load drives point 2, so
+ * the G3D and BIG points are used below; point 1 does not decode cleanly on
+ * this board and is left out.  "hottest" is the driver's aggregate of all
+ * trimmed points.
  *
- * There is no cooling device (CPU DVFS is firmware owned and does not answer
- * mainline), so passive trips only document intent; the critical trip is the
- * one that acts, and it performs an orderly shutdown at the vendor default of
- * 115 C.  The decode behind it was validated against the fuel gauge.
+ * CPU DVFS is driven by the mainline exynos9610-cpuclk driver, so the CPU
+ * cooling maps below constrain the cpufreq policies.  The GPU is a real
+ * devfreq cooling device, so its zone follows the vendor G3D trip and
+ * frequency-cap table.
  */
 / {
 	thermal-zones {
 		/*
-		 * Extra sensing points, deliberately WITHOUT trip points: a zone
-		 * with no trips can only report, never act, so a wrong decode
-		 * cannot shut the device down.  Sensor ids: 0-7 are the eight
-		 * packed 9-bit codes (two per register), 8 is the driver's
-		 * synthetic "hottest trimmed point" id.  Add trips only after
-		 * the decode has been checked on hardware.
+		 * The G3D zone.  Its trips and lower cooling states follow the
+		 * vendor table: 80/88/95/100/105 C cap the GPU at roughly
+		 * 764/572/455/338/260 MHz, 110 C is hot and 115 C is the
+		 * critical shutdown.
 		 */
-		package-thermal {
-			polling-delay = <1000>;
-			thermal-sensors = <&tmu 2>;
+		gpu-thermal {
+			polling-delay = <500>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&tmu 0>;
+
+			trips {
+				gpu_alert0: gpu-alert-0 {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				gpu_alert1: gpu-alert-1 {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				gpu_alert2: gpu-alert-2 {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				gpu_alert3: gpu-alert-3 {
+					temperature = <100000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				gpu_alert4: gpu-alert-4 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				gpu_hot: gpu-hot {
+					temperature = <110000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+				gpu_crit: gpu-critical {
+					temperature = <115000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				gpu_map0 {
+					trip = <&gpu_alert0>;
+					cooling-device = <&gpu 3 THERMAL_NO_LIMIT>;
+				};
+				gpu_map1 {
+					trip = <&gpu_alert1>;
+					cooling-device = <&gpu 5 THERMAL_NO_LIMIT>;
+				};
+				gpu_map2 {
+					trip = <&gpu_alert2>;
+					cooling-device = <&gpu 7 THERMAL_NO_LIMIT>;
+				};
+				gpu_map3 {
+					trip = <&gpu_alert3>;
+					cooling-device = <&gpu 9 THERMAL_NO_LIMIT>;
+				};
+				gpu_map4 {
+					trip = <&gpu_alert4>;
+					cooling-device = <&gpu 10 THERMAL_NO_LIMIT>;
+				};
+			};
 		};
 
 		hottest-thermal {
@@ -531,11 +612,12 @@
 		};
 
 		/*
-		 * The CPU cluster throttling zone.  Without cooling maps a zone
-		 * can only report, which is how the device ran until now: an
-		 * all-core load at the boot operating points settles at 50 C, but
-		 * the top operating points reach 111 C in 12 s and the platform
-		 * shuts down.
+		 * The CPU cluster throttling zone, now fed from the BIG sensing
+		 * point (vendor channel 2) instead of the G3D point.  Without
+		 * cooling maps a zone can only report, which is how the device ran
+		 * until now: an all-core load at the boot operating points settles
+		 * at 50 C, but the top operating points reach 111 C in 12 s and the
+		 * platform shuts down.
 		 *
 		 * Each trip forces a minimum cooling state instead of relying on
 		 * step_wise stepping one state per poll: that governor only steps
@@ -547,7 +629,7 @@
 		soc-thermal {
 			polling-delay = <500>;
 			polling-delay-passive = <500>;
-			thermal-sensors = <&tmu 0>;
+			thermal-sensors = <&tmu 2>;
 
 			trips {
 				cpu_alert0: cpu-alert-0 {
@@ -754,4 +836,111 @@
  */
 &cpuclk0 {
 	samsung,rail-floor-uv = <650000>;
+};
+
+/*
+ * GPU DVFS.  These are this chip's own G3D ASV voltages, read live from the
+ * running vendor kernel:
+ *
+ *   /sys/devices/platform/11500000.mali/asv_table
+ *
+ * The vendor kernel picks the table from the chip's ASV group, so these are
+ * calibrated values for this A51 rather than placeholders.
+ */
+/ {
+	gpu_opp_table: opp-table-gpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-1053000000 {
+			opp-hz = /bits/ 64 <1053000000>;
+			opp-microvolt = <993750>;
+		};
+		opp-949000000 {
+			opp-hz = /bits/ 64 <949000000>;
+			opp-microvolt = <900000>;
+		};
+		opp-839000000 {
+			opp-hz = /bits/ 64 <839000000>;
+			opp-microvolt = <818750>;
+		};
+		opp-764000000 {
+			opp-hz = /bits/ 64 <764000000>;
+			opp-microvolt = <775000>;
+		};
+		opp-683000000 {
+			opp-hz = /bits/ 64 <683000000>;
+			opp-microvolt = <737500>;
+		};
+		opp-572000000 {
+			opp-hz = /bits/ 64 <572000000>;
+			opp-microvolt = <687500>;
+		};
+		opp-546000000 {
+			opp-hz = /bits/ 64 <546000000>;
+			opp-microvolt = <681250>;
+		};
+		opp-455000000 {
+			opp-hz = /bits/ 64 <455000000>;
+			opp-microvolt = <643750>;
+		};
+		opp-385000000 {
+			opp-hz = /bits/ 64 <385000000>;
+			opp-microvolt = <618750>;
+		};
+		opp-338000000 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <606250>;
+		};
+		opp-260000000 {
+			opp-hz = /bits/ 64 <260000000>;
+			opp-microvolt = <581250>;
+		};
+	};
+};
+
+&gpu {
+	mali-supply = <&buck5_reg>;
+	operating-points-v2 = <&gpu_opp_table>;
+	#cooling-cells = <2>;
+};
+
+/*
+ * Audio DSP power and bring-up.  The vendor sound card is built around the
+ * ABOX DSP, and the DISPAUD domain that contains it is off at handover.
+ * Keep this board-local until the full ASoC card exists.
+ */
+/ {
+	pd_dispaud: power-domain@11864000 {
+		compatible = "samsung,exynos9610-dispaud-pd";
+		reg = <0x0 0x11864000 0x20>;
+		#power-domain-cells = <0>;
+		status = "okay";
+	};
+
+	abox: abox@14a50000 {
+		compatible = "samsung,exynos9610-abox";
+		reg = <0x0 0x14a50000 0x10000>,
+		      <0x0 0x14980000 0x8000>,
+		      <0x0 0x12100000 0x8000>,
+		      <0x0 0x14b00000 0x35000>,
+		      <0x0 0x14af1000 0x1000>,
+		      <0x0 0x14af2000 0x1004>;
+		reg-names = "sfr", "cmu", "top", "sram", "gicd", "gicc";
+		interrupts = <GIC_SPI 198 IRQ_TYPE_EDGE_RISING>;
+		power-domains = <&pd_dispaud>;
+		iommus = <&sysmmu_abox>;
+		samsung,abox-bootargs = "init=ab0x vss=1";
+		samsung,abox-bootargs-offset = <0x22e00>;
+		status = "okay";
+	};
+
+	sysmmu_abox: sysmmu@14920000 {
+		compatible = "samsung,exynos9610-sysmmu", "samsung,exynos-sysmmu";
+		reg = <0x0 0x14920000 0x9000>;
+		interrupts = <GIC_SPI 216 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&pd_dispaud>;
+		#iommu-cells = <0>;
+		status = "okay";
+	};
 };

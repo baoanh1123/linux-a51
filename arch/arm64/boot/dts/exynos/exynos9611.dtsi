@@ -102,8 +102,11 @@
 			samsung,pmic-readout-probe;
 
 			/*
-			 * CPU DVFS is firmware owned: channel 5 carries the
-			 * {id, rate, command, arg} requests.  Vendor node:
+			 * The vendor CPU DVFS mailbox carries {id, rate,
+			 * command, arg} requests on channel 5.  Mainline does
+			 * not use it: exynos9610-cpuclk programs the cluster
+			 * PLLs directly because the firmware does not answer
+			 * DVFS requests.  Vendor node:
 			 * DOWNSTREAM_READONLY/arch/arm64/boot/dts/exynos/
 			 * exynos9610.dts:688-690.
 			 */
@@ -170,6 +173,19 @@
 						regulator-max-microvolt = <3375000>;
 						regulator-always-on;
 					};
+
+					/*
+					 * vdd_g3d: always-on in the PMIC, so it has no
+					 * enable control here.  The GPU OPP table in the
+					 * board DTS owns the voltage from probe onwards.
+					 */
+					buck5_reg: BUCK5 {
+						regulator-name = "vdd_g3d";
+						regulator-min-microvolt = <500000>;
+						regulator-max-microvolt = <1200000>;
+						regulator-ramp-delay = <12000>;
+						regulator-always-on;
+					};
 				};
 			};
 		};
@@ -234,11 +250,12 @@
 
 
 	/*
-	 * CPU cluster clocks and PLLs.  The ACPM firmware owns CPU DVFS on this
-	 * SoC but never services the DVFS channel, so the clusters stay at the
-	 * rate the boot chain programmed them to (1053 MHz LITTLE, 1456 MHz
-	 * big).  This node lets the AP take the clocks back; the driver only
-	 * ever moves down from the boot rate so the boot voltage still holds.
+	 * CPU cluster clocks and PLLs.  The ACPM firmware nominally owns CPU
+	 * DVFS on this SoC but never services the DVFS channel, so the clusters
+	 * stay at the rate the boot chain programmed them to (1053 MHz LITTLE,
+	 * 1456 MHz big).  This node lets the AP take the clocks back and scale
+	 * both clusters through their PLLs; the CPU rails are raised through the
+	 * S2MPU09 BUCK2/BUCK3 registers over ACPM.
 	 *
 	 * CMU_CPUCL0/1 bases and PLL/VCO limits:
 	 * DOWNSTREAM_READONLY/drivers/soc/samsung/cal-if/exynos9610/
@@ -1370,10 +1387,19 @@
 	 * boot loader: pd-g3d sits at PMU+0x4060 and the G3D CMU gates are not
 	 * modelled yet, so a fixed clock reports the nominal rate until they are.
 	 */
-	gpu_clk: gpu-clock {
-		compatible = "fixed-clock";
+	/*
+	 * PLL_G3D and its bus mux.  The boot loader leaves both at 260 MHz, and
+	 * the rate is cached rather than read back because the G3D power domain
+	 * may still be off when this driver probes.  See
+	 * drivers/clk/samsung/clk-exynos9610-g3d.c.
+	 */
+	gpu_clk: gpu-clock-controller@11430000 {
+		compatible = "samsung,exynos9610-g3d-clock";
+		reg = <0x0 0x11430000 0x4000>;
 		#clock-cells = <0>;
-		clock-frequency = <1053000000>;
+		clock-frequency = <260000000>;
+		clock-output-names = "g3d";
+		power-domains = <&pd_g3d>;
 	};
 
 	gpu: gpu@11500000 {

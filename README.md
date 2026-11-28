@@ -5,7 +5,9 @@ It boots into a full GPU-composited desktop: the kernel owns the display
 controller, the MIPI link and the AMOLED panel, the Mali-G72 runs under
 panfrost, and touchscreen, thermal sensors and the charger are all driven by
 mainline drivers.  Wi-Fi station mode works as well, including WPA3, and
-the same block now carries a working Bluetooth HCI transport.
+the same block now carries a working Bluetooth HCI transport.  The ABOX
+audio DSP boots under its SysMMU and accepts BT SCO enable requests, but
+there is no host sound card yet.
 
 ![Weston desktop with Xwayland, htop and a Wayland terminal](screenshots/a51-desktop.png)
 
@@ -40,36 +42,49 @@ Working:
 - **Display** - DECON/IDMA/DPP scanout, DSIM host and D-PHY, panel bridge,
   brightness, DPMS, s2idle. 60 fps with vblank-driven page flips.
 - **GPU** - panfrost on the Mali-G72, with a g3d power domain that gates the
-  GPU through the vendor PMU sequences and TZPC SMC.
+  GPU through the vendor PMU sequences and TZPC SMC, and an 11-point
+  DVFS ladder from 260 to 1053 MHz backed by the BUCK5 `vdd_g3d` rail.
+  The OPP voltages are this chip's calibrated G3D ASV values, read from the
+  vendor kernel's `asv_table` (260 MHz at 581.25 mV, 1053 MHz at 993.75 mV).
+  The GPU is also a devfreq cooling device, using the vendor 80-115 C trip
+  ladder to cap it at 764, 572, 455, 338 and 260 MHz.
+- **CPU DVFS** - both clusters scale through the mainline `exynos9610-cpuclk`
+  driver (403-1742 MHz LITTLE, 936-2314 MHz big, `schedutil`), with the
+  cluster PLLs and S2MPU09 BUCK2/BUCK3 rails programmed over ACPM.
 - **Touchscreen and keys** - mss100 multi-touch, power and volume keys.
-- **Thermal** - Exynos 9610 TMU with eFuse trim calibration, three zones.
+- **Thermal** - Exynos 9610 TMU with eFuse trim calibration; separate GPU,
+  CPU-cluster and aggregate zones, with `step_wise` cooling.
 - **Charger** - input current limit, fast-charge current, float voltage and a
   charge-stop threshold with hysteresis.
 - **USB** - DWC3 peripheral mode, used here as an ECM gadget (the root
   filesystem runs over it).
-- **Storage** - microSD in non-UHS 50 MHz high-speed mode, UFS.
+- **Storage** - microSD in SDR104 (100 MHz, 4-bit, 1.8 V), UFS.
 - **Wi-Fi** - station mode on 2.4 and 5 GHz, WPA2-PSK and WPA3-SAE, DHCP,
   and a join at boot with a saved connection.  ~90 Mbps on the LAN,
   ~47 Mbps down and 36-42 Mbps up to the internet.
 - **Bluetooth** - BSMHCP HCI transport, LE and BR/EDR discovery, LE
   advertising, LE Secure Connections pairing and bonds, and ACL data.
   BlueZ powers the adapter at boot; no manual `hciconfig` step is needed.
+- **ABOX bring-up** - the DISPAUD power domain, CMU_DISPAUD PLL and bus
+  clocks, the ABOX Cortex-A7 firmware, GIC/IPC mailbox and the ABOX
+  SysMMU.  Firmware, private, SFR and VSS windows are mapped; WLBT's BT
+  SCO buffer is mapped at IOVA `0xb0000000` and SCO enable succeeds in
+  both directions.  There is no PCM/RDMA/WDMA path or ALSA card yet.
 - **Desktops** - Weston with Xwayland, Sway, Phosh and KDE Plasma Mobile all
   render on the panel.
 
 Not supported yet:
 
-- **CPU frequency scaling** - the ACPM firmware does not service the DVFS
-  channel, so the cores stay at their boot rate. This is the main reason heavy
-  workloads feel slow.
 - **CPU idle / deep sleep** - needs the PMUCAL core power down/up sequences;
   only s2idle works.
-- **GPU DVFS** - no OPP table and no `mali-supply`, so the GPU clock is fixed.
 - **USB host / OTG** - the controller is fixed to peripheral mode. The boost
   and MUIC switching are in place, the role switch is not wired up yet.
-- Audio (ABOX), cameras, modem and NFC - untouched subsystems.  Bluetooth
-  SCO/HFP audio and AVDTP coexistence detection are not implemented; A2DP
-  playback over the ACL transport works when a media session is running.
+- **Audio (ABOX PCM)** - the DSP boots and BT SCO can be enabled, but the
+  PCM/RDMA/WDMA path, UAIF/codec routing and a host ALSA card are not
+  implemented.  Bluetooth SCO/HFP audio and AVDTP coexistence detection
+  are therefore not functional; A2DP playback over the ACL transport works
+  when a media session is running.
+- Cameras, modem and NFC - untouched subsystems.
 
 ## Wi-Fi
 
@@ -155,25 +170,17 @@ to the HCI core; ACL TX buffers are reclaimed from the BSMHCP free ring and
 turned into Number Of Completed Packets credits.
 
 The firmware file is `mx140/mx140_bt.hcf` and must be next to the Wi-Fi
-firmware.  `CONFIG_BT=m`, `CONFIG_BT_BREDR=y` and `CONFIG_BT_LE=y` are
-enabled; `exynos9610_wlbt` then depends on `bluetooth.ko`,
-`ecdh_generic.ko` and `ecc.ko`.  All are installed in the rootfs module
-tree, and `/etc/modules-load.d/wlbt.conf` loads the transport at boot.
+firmware.  The Bluetooth core is built in (`CONFIG_BT=y`,
+`CONFIG_BT_BREDR=y`, `CONFIG_BT_LE=y`, `CONFIG_BT_LE_L2CAP_ECRED=y`), and
+`/etc/modules-load.d/wlbt.conf` loads `exynos9610_wlbt.ko` at boot.
 
-Secure Connections also needs the default DRBG.  The kernel builds
-`CONFIG_CRYPTO_RNG_DEFAULT`, `CONFIG_CRYPTO_DRBG` and
-`CONFIG_CRYPTO_JITTERENTROPY` as modules, so `drbg.ko` has to be installed
-and loaded as well:
-
-```sh
-cp crypto/drbg.ko /lib/modules/$(uname -r)/kernel/crypto/
-depmod -a
-printf 'drbg\n' > /etc/modules-load.d/bluetooth-crypto.conf
-```
-
-Without `drbg.ko`, the controller completes legacy LE pairing but
-`generate_ecdh_keys()` fails, the phone never sends its P-256 public key,
-and the host logs `Pairing Failed` with reason `Unspecified (0x08)`.
+Secure Connections also needs the default DRBG and the ECDH helpers.  The
+current kernel builds `CONFIG_CRYPTO_RNG_DEFAULT`, `CONFIG_CRYPTO_DRBG`,
+`CONFIG_CRYPTO_JITTERENTROPY`, `CONFIG_CRYPTO_ECDH` and `CONFIG_CRYPTO_ECC`
+in, so no extra module is needed.  On an older build where these are
+modules, install and load `drbg.ko`; without it `generate_ecdh_keys()`
+fails, the phone never sends its P-256 public key, and the host logs
+`Pairing Failed` with reason `Unspecified (0x08)`.
 
 The address is read at probe time from `mx140/bt_addr`, an ASCII file copied
 from the Android `efs` partition (`/bluetooth/bt_addr`).  The SM-A515F file
@@ -227,15 +234,84 @@ Verified on the SM-A515F:
 | reboot, host LE link, 40 GATT reads | 40 responses; address, bond and HCI startup persist |
 | three `hciconfig hci0 down` / `up` cycles | adapter returns to `UP RUNNING` each time |
 | reboot with WPA3 AP | Bluetooth and Wi-Fi both come up hands-free |
+| cold boot, ABOX firmware | `ABOX boot done`, firmware version `0x1` |
+| ABOX SysMMU | version `0x7040000f`, control `0x5` |
+| BT SCO enable/disable, speaker and microphone | `ret=0` in both directions |
+
+### ABOX and Bluetooth SCO
+
+`exynos9610-abox.ko` is the first audio block to come up, but it is still a
+bring-up driver, not a sound card.  It powers the DISPAUD domain, programs
+`PLL_AUD` and the CMU_DISPAUD bus/CPU muxes, brings up the ABOX GIC and IPC
+mailbox, and starts the Cortex-A7 firmware from:
+
+```sh
+/lib/firmware/calliope_sram.bin
+/lib/firmware/calliope_dram.bin
+```
+
+The firmware DRAM is the 18 MiB `abox-fw@80000000` reservation.  The ABOX
+SysMMU at `0x14920000` is attached before the firmware starts, with these
+windows:
+
+| IOVA | physical | purpose |
+| --- | --- | --- |
+| `0x80000000` | `0x80000000` | firmware DRAM, 18 MiB |
+| `0xe0000000` | scattered order-0 pages | 8 MiB private buffer |
+| `0x10000000` | SFR page | register window |
+| `0xa0000000` | `0xf7900000` | VSS, 7 MiB |
+| `0xb0000000` | WLBT MIF buffer | BT SCO, page-aligned `0x4100` bytes |
+
+The VSS window matches the downstream `shmem@f0000000` node
+(`cp_size = 0x7900000`, `vss_size = 0x700000`) and is reserved `no-map`.
+The firmware runs with `init=ab0x vss=1`; without the mapping it faults at
+`0xa0670000` during boot.
+
+WLBT allocates the `scsc_bt_audio_abox` buffer in its MIF block and
+registers it with the ABOX driver.  The driver maps it at `0xb0000000` and
+sends `ABOX_BT_SCO_ENABLE` (`0xd0`) with `param1 = enable`,
+`param2 = IOVA`, and `param3 = direction` (`0` speaker, `1` microphone).
+The bring-up control is a module parameter:
+
+```sh
+echo "0 1" > /sys/module/exynos9610_abox/parameters/bt_sco  # speaker on
+echo "1 1" > /sys/module/exynos9610_abox/parameters/bt_sco  # microphone on
+echo "0 0" > /sys/module/exynos9610_abox/parameters/bt_sco  # speaker off
+echo "1 0" > /sys/module/exynos9610_abox/parameters/bt_sco  # microphone off
+```
+
+Both directions return `ret=0`; the log reads:
+
+```text
+BT SCO spk on: iova=0xb0000000 ret=0
+BT SCO mic on: iova=0xb0000000 ret=0
+```
+
+The driver stops after SCO enable.  There is no PCM/RDMA/WDMA task and no
+ALSA card, so HFP/SCO audio is not audible yet.  The HCI transport drops
+`HCI_SCODATA_PKT` because this platform carries SCO samples through the
+ABOX shared-memory interface, not the BSMHCP rings.
+
+WLBT carries a `softdep ... pre: exynos9610_abox`, so the DSP is up before
+the Bluetooth service starts.  ABOX itself needs:
+
+```sh
+# /etc/modprobe.d/abox.conf
+options exynos9610_abox abox_boot=1 abox_verbose=1
+```
+
+`abox_boot=1` downloads and starts the firmware.  `abox_verbose=1` logs
+every IPC message and is useful while bringing up the PCM path.
 
 Limitations:
 
 - A2DP sink/source are registered at boot and a host stream reaches the
-  phone's `bluez_input` node, but there is no ABOX/audio hardware yet, so it
-  plays into `Dummy Output`.  SCO/HFP audio, AVDTP coexistence detection and
+  phone's `bluez_input` node, but there is no ABOX PCM/ALSA path yet, so it
+  plays into `Dummy Output`.  HFP/SCO audio, AVDTP coexistence detection and
   vendor-specific HCI commands are not implemented.
-- LE Secure Connections requires `drbg.ko`; legacy LE pairing works without
-  it, but SC fails before the phone sends its public key.
+- LE Secure Connections needs the DRBG/ECDH helpers; the current kernel has
+  them built in.  Legacy LE pairing works without them, but SC fails before
+  the phone sends its public key.
 - `l2ping` stops with `Connection reset by peer` after four or five echoes in
   either direction.  A long GATT session is used for ACL credit coverage
   instead; the reset appears to be in the L2CAP echo path, not the HCI rings.
@@ -245,7 +321,7 @@ Limitations:
 ```sh
 export CROSS_COMPILE=aarch64-linux-gnu-
 make ARCH=arm64 exynos9611_a51_defconfig
-make ARCH=arm64 -j$(nproc) Image dtbs modules
+make ARCH=arm64 -j2 Image dtbs modules
 ```
 
 The device tree is `arch/arm64/boot/dts/exynos/exynos9611-a51.dts`; the shared
@@ -275,9 +351,13 @@ Some parts of this SoC are fenced off by secure firmware, and the drivers
 reflect what could be verified on hardware rather than what the vendor kernel
 does:
 
-- Power domains, DVFS and CPU idle go through the ACPM firmware interface on a
-  shared mailbox; the mailbox and ACPM transports are ported, but the firmware
-  only services the channels it already knows about.
+- Power domains, CPU DVFS and CPU idle use the ACPM firmware interface on a
+  shared mailbox; the mailbox and ACPM transports are ported.  The GPU clock is
+  programmed directly because the firmware does not service the GPU DVFS
+  channel, while the CPU rails still go through the ACPM PMIC path.
+- The ABOX SysMMU has no mainline clock provider yet.  Its DISPAUD gate is
+  opened by the power-domain driver before the IOMMU driver reads the
+  version, so `exynos-iommu` accepts the missing clocks for this compatible.
 - The display pipeline is driven by frame-done interrupts rather than the
   panel's tearing effect, which the panel never emits on this board.
 - Shadow register updates are posted asynchronously. Waiting for the pipe to

@@ -109,6 +109,7 @@ config EXYNOS9610_WLBT
 	tristate "Exynos 9610 SCSC/WLBT Wi-Fi and Bluetooth transport"
 	depends on ARCH_EXYNOS || COMPILE_TEST
 	depends on ARM64
+	depends on EXYNOS9610_ABOX
 	help
 	  Power up the Samsung SCSC ("mx140") WiFi/Bluetooth subsystem, load
 	  its firmware and drive its Wi-Fi transport over the HIP4 queues: a
@@ -123,3 +124,17 @@ config EXYNOS9610_WLBT
 	  The Galaxy A51 has no SDIO and no PCIe WiFi, so this block is the
 	  only route to a built-in wireless interface.  Say M unless you are
 	  working on that port.
+
+config EXYNOS9610_DISPAUD_PD
+	bool "Exynos 9610 DISPAUD power domain"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	help
+	  Power up the audio DSP power domain at boot.  CMU_DISPAUD, the ABOX
+	  registers and the ABOX SRAM are unreachable while the domain is off.
+
+config EXYNOS9610_ABOX
+	tristate "Exynos 9610 ABOX bring-up"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	help
+	  Program the audio PLL and bus clocks and probe the ABOX DSP block.
+	  This is a bring-up driver, not a sound card yet.

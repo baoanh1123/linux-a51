@@ -19,3 +19,5 @@ obj-$(CONFIG_EXYNOS9610_G3D_PD)		+= exynos9610-g3d-pd.o
 obj-$(CONFIG_EXYNOS9610_WLBT)		+= exynos9610-wlbt.o
 exynos9610-wlbt-y := wlbt-core.o wlbt-hip4.o wlbt-mlme.o wlbt-debug.o wlbt-net.o wlbt-bt.o
 CFLAGS_wlbt-debug.o := -Os
+obj-$(CONFIG_EXYNOS9610_DISPAUD_PD)	+= exynos9610-dispaud-pd.o
+obj-$(CONFIG_EXYNOS9610_ABOX)		+= exynos9610-abox.o

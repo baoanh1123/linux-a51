@@ -1583,6 +1583,8 @@ static struct platform_driver wlbt_driver = {
 };
 module_platform_driver(wlbt_driver);
 
+/* The Bluetooth service only reports START_CFM once the ABOX is running. */
+MODULE_SOFTDEP("pre: exynos9610_abox");
 MODULE_DESCRIPTION("Samsung Exynos 9610 SCSC/WLBT power and boot handshake");
 MODULE_LICENSE("GPL");
 

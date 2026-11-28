@@ -76,6 +76,14 @@ config EXYNOS_ARM64_COMMON_CLK
 	bool "Samsung Exynos ARMv8-family clock controller support" if COMPILE_TEST
 	depends on COMMON_CLK_SAMSUNG
 
+config EXYNOS9610_G3D_CLK
+	bool "Samsung Exynos9610 G3D clock control"
+	depends on COMMON_CLK_SAMSUNG
+	default y if ARCH_EXYNOS
+	help
+	  Support for the Mali-G72 G3D PLL and bus mux on Exynos9610.
+	  This lets the GPU devfreq governor change the GPU clock rate.
+
 config EXYNOS_AUDSS_CLK_CON
 	tristate "Samsung Exynos AUDSS clock controller support"
 	depends on COMMON_CLK_SAMSUNG

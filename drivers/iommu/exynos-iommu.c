@@ -763,7 +763,13 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
 	if (IS_ERR(data->pclk))
 		return PTR_ERR(data->pclk);
 
-	if (!data->clk && (!data->aclk || !data->pclk)) {
+	/*
+	 * The Exynos9610 ABOX SysMMU has no mainline clock provider yet; its
+	 * DISPAUD gate is opened by the exynos9610-dispaud-pd driver before
+	 * this device probes.
+	 */
+	if (!data->clk && (!data->aclk || !data->pclk) &&
+	    !of_device_is_compatible(dev->of_node, "samsung,exynos9610-sysmmu")) {
 		dev_err(dev, "Failed to get device clock(s)!\n");
 		return -ENOSYS;
 	}
